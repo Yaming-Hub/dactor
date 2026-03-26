@@ -6,6 +6,124 @@
 
 ---
 
+## 0. Design Principle: Superset with Graceful Degradation
+
+### Inclusion Rule
+
+**dactor abstracts the superset of capabilities supported by 2 or more actor
+frameworks.** If a behavior is common to at least two of the surveyed
+frameworks, dactor models it as a first-class trait or type. Individual adapters
+that don't natively support a capability have two options:
+
+1. **Adapter-layer implementation** — the adapter implements the capability
+   using custom logic (e.g., ractor doesn't have bounded mailboxes, but the
+   adapter can wrap a bounded channel).
+2. **`NotSupported` error** — the adapter returns `Err(NotSupported)` at
+   runtime, signaling the caller that this capability is unavailable with the
+   chosen backend.
+
+This ensures the **core API is rich and forward-looking** while each adapter
+remains honest about what it can deliver.
+
+### Capability Inclusion Matrix
+
+The table below counts how many of the 6 surveyed frameworks support each
+capability. **≥ 2** means it qualifies for inclusion in dactor.
+
+| Capability | Erlang | Akka | Ractor | Kameo | Actix | Coerce | Count | Include? |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Tell (fire-and-forget) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | **6** | ✅ |
+| Ask (request-reply) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | **6** | ✅ |
+| Typed messages | — | ✓ | ✓ | ✓ | ✓ | ✓ | **5** | ✅ |
+| Actor identity (ID) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | **6** | ✅ |
+| Lifecycle hooks | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | **6** | ✅ |
+| Supervision | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | **6** | ✅ |
+| DeathWatch / monitoring | ✓ | ✓ | ✓ | ✓ | — | — | **4** | ✅ |
+| Timers (send_after/interval) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | **6** | ✅ |
+| Processing groups | ✓ | ✓ | ✓ | — | — | ✓ | **4** | ✅ |
+| Actor registry (named lookup) | ✓ | ✓ | ✓ | — | ✓ | ✓ | **5** | ✅ (v0.4) |
+| Mailbox configuration | — | ✓ | — | ✓ | ✓ | — | **3** | ✅ |
+| Interceptors / middleware | — | ✓ | — | — | ✓ | ✓ | **3** | ✅ |
+| Message envelope / metadata | ✓ | ✓ | — | — | — | — | **2** | ✅ |
+| Cluster events | ✓ | ✓ | ✓ | ✓ | — | ✓ | **5** | ✅ |
+| Distribution (remote actors) | ✓ | ✓ | ✓ | ✓ | — | ✓ | **5** | ✅ (future) |
+| Clock abstraction | ✓ | ✓ | — | — | — | — | **2** | ✅ |
+| Hot code upgrade | ✓ | — | — | — | — | — | **1** | ❌ |
+
+### `NotSupported` Error
+
+All trait methods that might not be supported by every adapter return a
+`Result` type. A new error variant is introduced:
+
+```rust
+/// Error indicating that the adapter does not support this operation.
+#[derive(Debug, Clone)]
+pub struct NotSupportedError {
+    /// Name of the operation that is not supported.
+    pub operation: &'static str,
+    /// Name of the adapter/runtime that doesn't support it.
+    pub adapter: &'static str,
+    /// Optional detail message.
+    pub detail: Option<String>,
+}
+
+impl fmt::Display for NotSupportedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} is not supported by {}", self.operation, self.adapter)?;
+        if let Some(ref detail) = self.detail {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for NotSupportedError {}
+```
+
+A unified error enum encompasses all runtime errors:
+
+```rust
+/// Unified error type for all ActorRuntime operations.
+#[derive(Debug)]
+pub enum RuntimeError {
+    /// The actor's mailbox is closed or the send failed.
+    Send(ActorSendError),
+    /// Processing group operation failed.
+    Group(GroupError),
+    /// Cluster event operation failed.
+    Cluster(ClusterError),
+    /// The requested operation is not supported by this adapter.
+    NotSupported(NotSupportedError),
+}
+```
+
+### Adapter Support Matrix (Planned)
+
+| Capability | dactor-ractor | dactor-kameo | Strategy |
+|---|:---:|:---:|---|
+| `tell()` | ✅ native | ✅ native | — |
+| `tell_envelope()` | ✅ adapter | ✅ adapter | Unwrap envelope, run interceptors, forward body |
+| `ask()` | ✅ native (`call`) | ✅ native (`ask`) | Map to framework's request-reply |
+| `ActorRef::id()` | ✅ native | ✅ native | Map from framework's ID type |
+| `ActorRef::is_alive()` | ✅ native | ✅ native | Check actor cell liveness |
+| Lifecycle hooks | ✅ native | ✅ native | Map to `pre_start`/`post_stop` and `on_start`/`on_stop` |
+| Supervision | ✅ native | ✅ native (`on_link_died`) | Map to framework's supervision model |
+| `watch()` / `unwatch()` | ✅ native | ✅ native (linking) | Map to framework's monitoring API |
+| `MailboxConfig::Bounded` | ⚙️ adapter | ✅ native (`spawn_bounded`) | ractor: wrap with bounded channel |
+| `MailboxConfig::Unbounded` | ✅ native | ✅ native | — |
+| `OverflowStrategy::Block` | ⚙️ adapter | ✅ native | ractor: bounded channel blocks |
+| `OverflowStrategy::DropOldest` | ❌ `NotSupported` | ❌ `NotSupported` | Neither framework supports natively |
+| Interceptors (global) | ✅ adapter | ✅ adapter | Interceptor chain runs in adapter before dispatch |
+| Interceptors (per-actor) | ✅ adapter | ✅ adapter | Stored in SpawnConfig, run per message |
+| Processing groups | ✅ adapter | ✅ adapter | Already implemented in v0.1 |
+| `add_interceptor()` | ✅ adapter | ✅ adapter | Store in `Arc<Mutex<Vec>>` on runtime |
+| Cluster events | ✅ adapter | ✅ adapter | Already implemented in v0.1 |
+
+**Legend:** ✅ native = framework provides direct API; ⚙️ adapter = implemented
+with custom adapter logic; ❌ `NotSupported` = returns error at runtime.
+
+---
+
 ## 1. Research Summary: Common Behaviors Across Actor Frameworks
 
 | Concept | Erlang/OTP | Akka (JVM) | Ractor (Rust) | Kameo (Rust) | Actix (Rust) | Coerce (Rust) |
@@ -30,9 +148,10 @@
 2. **Most frameworks** also support ask (request-reply) — we should abstract it.
 3. **All production frameworks** have lifecycle hooks — we need `on_start`/`on_stop`.
 4. **Supervision** is universal in Erlang, Akka, ractor, kameo — we should model it.
-5. **Message envelopes** with headers exist in Akka and distributed messaging — no Rust framework does this natively yet (opportunity for dactor).
-6. **Interceptors/middleware** exist in Akka (`Behaviors.intercept`) and web frameworks — we should add a message pipeline.
+5. **Message envelopes** with headers exist in Erlang and Akka (2 frameworks) — qualifies for inclusion under the superset rule.
+6. **Interceptors/middleware** exist in Akka, Actix, and Coerce (3 frameworks) — qualifies for inclusion.
 7. **Test support behind feature flags** is standard practice in Rust crates.
+8. **Superset rule applied:** every capability above is supported by ≥ 2 frameworks (see §0). Adapters return `NotSupported` for features they can't provide.
 
 ---
 
@@ -224,10 +343,14 @@ pub trait ActorRef<M: Send + 'static>: Clone + Send + Sync + 'static {
     fn tell(&self, msg: M) -> Result<(), ActorSendError>;
 
     /// Fire-and-forget with an envelope (headers + body).
-    fn tell_envelope(&self, envelope: Envelope<M>) -> Result<(), ActorSendError>;
+    /// Adapters that don't support envelopes may ignore headers and
+    /// forward only the body, or return `NotSupported` if the envelope
+    /// cannot be delivered at all.
+    fn tell_envelope(&self, envelope: Envelope<M>) -> Result<(), RuntimeError>;
 
     /// Check if the actor is still alive.
-    fn is_alive(&self) -> bool;
+    /// Returns `Err(NotSupported)` if the adapter cannot determine liveness.
+    fn is_alive(&self) -> Result<bool, NotSupportedError>;
 }
 ```
 
@@ -244,13 +367,19 @@ support it can omit the implementation:
 
 ```rust
 /// Extension trait for request-reply messaging.
+///
+/// Adapters that support ask natively (ractor `call`, kameo `ask`)
+/// implement this trait. Adapters that don't support it should provide
+/// a blanket implementation returning `NotSupported`.
 pub trait AskRef<M, R>: ActorRef<M>
 where
     M: Send + 'static,
     R: Send + 'static,
 {
     /// Send a message and await a reply.
-    fn ask(&self, msg: M) -> Result<tokio::sync::oneshot::Receiver<R>, ActorSendError>;
+    /// Returns `Err(RuntimeError::NotSupported)` if the adapter doesn't
+    /// support request-reply messaging.
+    fn ask(&self, msg: M) -> Result<tokio::sync::oneshot::Receiver<R>, RuntimeError>;
 }
 ```
 
@@ -330,18 +459,20 @@ pub trait ActorRuntime: Send + Sync + 'static {
 
     /// Watch an actor. When it terminates, the watcher receives a
     /// `ChildTerminated` notification via its message handler.
+    /// Returns `Err(NotSupported)` if the adapter doesn't support death watch.
     fn watch<M: Send + 'static>(
         &self,
         watcher: &Self::Ref<M>,
         target: ActorId,
-    ) -> Result<(), ActorSendError>;
+    ) -> Result<(), RuntimeError>;
 
     /// Stop watching an actor.
+    /// Returns `Err(NotSupported)` if the adapter doesn't support death watch.
     fn unwatch<M: Send + 'static>(
         &self,
         watcher: &Self::Ref<M>,
         target: ActorId,
-    ) -> Result<(), ActorSendError>;
+    ) -> Result<(), RuntimeError>;
 }
 ```
 
@@ -464,9 +595,11 @@ pub trait ActorRuntime: Send + Sync + 'static {
     fn spawn<M, H>(&self, name: &str, handler: H) -> Self::Ref<M>
     where M: Send + 'static, H: FnMut(M) + Send + 'static;
 
+    /// Spawn with per-actor configuration (mailbox, interceptors).
+    /// Returns `Err(NotSupported)` for config options the adapter can't honor.
     fn spawn_with_config<M, H>(
         &self, name: &str, config: SpawnConfig, handler: H,
-    ) -> Self::Ref<M>
+    ) -> Result<Self::Ref<M>, RuntimeError>
     where M: Send + 'static, H: FnMut(M) + Send + 'static;
 
     // ── Timers ──────────────────────────────────────────
@@ -481,25 +614,65 @@ pub trait ActorRuntime: Send + Sync + 'static {
     // ── Processing Groups ───────────────────────────────
     fn join_group<M: Send + 'static>(
         &self, group: &str, actor: &Self::Ref<M>,
-    ) -> Result<(), GroupError>;
+    ) -> Result<(), RuntimeError>;
 
     fn leave_group<M: Send + 'static>(
         &self, group: &str, actor: &Self::Ref<M>,
-    ) -> Result<(), GroupError>;
+    ) -> Result<(), RuntimeError>;
 
     fn broadcast_group<M: Clone + Send + 'static>(
         &self, group: &str, msg: M,
-    ) -> Result<(), GroupError>;
+    ) -> Result<(), RuntimeError>;
 
     fn get_group_members<M: Send + 'static>(
         &self, group: &str,
-    ) -> Result<Vec<Self::Ref<M>>, GroupError>;
+    ) -> Result<Vec<Self::Ref<M>>, RuntimeError>;
+
+    // ── Supervision / DeathWatch ────────────────────────
+    /// Watch an actor for termination.
+    /// Returns `Err(NotSupported)` if the adapter doesn't support it.
+    fn watch<M: Send + 'static>(
+        &self, watcher: &Self::Ref<M>, target: ActorId,
+    ) -> Result<(), RuntimeError>;
+
+    fn unwatch<M: Send + 'static>(
+        &self, watcher: &Self::Ref<M>, target: ActorId,
+    ) -> Result<(), RuntimeError>;
 
     // ── Cluster ─────────────────────────────────────────
     fn cluster_events(&self) -> &Self::Events;
 
     // ── Global Interceptors ─────────────────────────────
-    fn add_interceptor(&self, interceptor: Box<dyn Interceptor>);
+    /// Register a global interceptor applied to all actors.
+    /// Returns `Err(NotSupported)` if the adapter doesn't support interceptors.
+    fn add_interceptor(&self, interceptor: Box<dyn Interceptor>) -> Result<(), RuntimeError>;
+}
+```
+
+### 3.11 Default Implementations via `RuntimeError::NotSupported`
+
+Capabilities that are universally available (tell, spawn, timers) never return
+`NotSupported`. Capabilities that may not be available in every adapter
+(watch, ask, certain mailbox configs) return `Result<_, RuntimeError>`.
+
+Adapters have three strategies for each method:
+
+| Strategy | When to use | Example |
+|---|---|---|
+| **Native mapping** | The underlying framework directly supports the operation | ractor `call()` → dactor `ask()` |
+| **Adapter-layer shim** | The framework lacks the API but the adapter can emulate it | ractor bounded mailbox via wrapper channel |
+| **`NotSupported`** | The feature genuinely can't be provided | `OverflowStrategy::DropOldest` on ractor |
+
+```rust
+// Example: adapter that doesn't support watch
+fn watch<M: Send + 'static>(
+    &self, _watcher: &Self::Ref<M>, _target: ActorId,
+) -> Result<(), RuntimeError> {
+    Err(RuntimeError::NotSupported(NotSupportedError {
+        operation: "watch",
+        adapter: "dactor-example",
+        detail: Some("underlying framework has no death watch API".into()),
+    }))
 }
 ```
 
@@ -557,6 +730,8 @@ dactor/src/
 | `test_support` always compiled | Feature-gated | Same as above. |
 | No `ActorId` | `ActorRef::id()` required | Adapters must implement. |
 | `NodeId` in `types::node` | `cluster::NodeId` | Module moved, re-exported from root. |
+| `GroupError` return type | `RuntimeError` return type | Wrap existing errors in `RuntimeError::Group(...)`. |
+| — | `NotSupportedError` / `RuntimeError` | New error types. Unsupported ops return `Err(NotSupported)`. |
 | — | `Envelope<M>`, `Headers` | New types, `tell()` accepts both `M` and `Envelope<M>`. |
 | — | `Interceptor` pipeline | New opt-in feature, no breakage. |
 | — | `SpawnConfig` / `MailboxConfig` | New, with defaults matching v0.1 behavior. |
@@ -566,27 +741,57 @@ dactor/src/
 
 ## 6. Adapter Impact
 
+### Strategy Key
+
+- ✅ **Native** — direct 1:1 mapping to framework API
+- ⚙️ **Adapter shim** — implemented in adapter layer with custom logic
+- ❌ **`NotSupported`** — returns `RuntimeError::NotSupported` at runtime
+
 ### dactor-ractor
 
-| Feature | Implementation |
-|---------|---------------|
-| `ActorRef::id()` | Map to `ractor::ActorRef::get_id()` → `ActorId` |
-| `tell_envelope()` | Unwrap envelope, pass `body` to ractor `cast()`, apply interceptors |
-| `is_alive()` | Check if ractor actor cell is alive |
-| `MailboxConfig` | ractor uses unbounded; bounded would need a wrapper channel |
-| `Interceptor` | Run interceptor chain before calling ractor `cast()` |
-| `ActorLifecycle` | Map to ractor's `pre_start` / `post_stop` callbacks |
+| Feature | Strategy | Implementation |
+|---------|:---:|---|
+| `tell()` | ✅ | `ractor::ActorRef::cast()` |
+| `tell_envelope()` | ⚙️ | Run interceptor chain on headers, forward `body` to `cast()` |
+| `ask()` | ✅ | `ractor::ActorRef::call()` |
+| `ActorRef::id()` | ✅ | Map `ractor::ActorRef::get_id()` → `ActorId` |
+| `ActorRef::is_alive()` | ✅ | Check ractor actor cell liveness |
+| Lifecycle hooks | ✅ | Map to ractor `pre_start` / `post_stop` |
+| Supervision | ✅ | Map to ractor's parent-child supervision |
+| `watch()` / `unwatch()` | ✅ | Map to ractor's supervisor notification system |
+| `MailboxConfig::Unbounded` | ✅ | Default ractor behavior |
+| `MailboxConfig::Bounded` | ⚙️ | Wrap with bounded `tokio::sync::mpsc` channel |
+| `OverflowStrategy::Block` | ⚙️ | Bounded channel naturally blocks sender |
+| `OverflowStrategy::RejectWithError` | ⚙️ | `try_send()` on bounded channel |
+| `OverflowStrategy::DropNewest` | ⚙️ | `try_send()`, discard on error |
+| `OverflowStrategy::DropOldest` | ❌ | Returns `NotSupported` — no efficient way to evict from front |
+| Interceptors (global) | ⚙️ | `Arc<Mutex<Vec<Box<dyn Interceptor>>>>` on runtime, run before `cast()` |
+| Interceptors (per-actor) | ⚙️ | Store in actor wrapper, run per message |
+| Processing groups | ⚙️ | Already implemented in v0.1 (type-erased registry) |
+| Cluster events | ⚙️ | Already implemented in v0.1 (`RactorClusterEvents`) |
 
 ### dactor-kameo
 
-| Feature | Implementation |
-|---------|---------------|
-| `ActorRef::id()` | Map from `kameo::actor::ActorId` → `ActorId` |
-| `tell_envelope()` | Unwrap envelope, pass `body` to kameo `tell().try_send()` |
-| `is_alive()` | Check kameo actor ref validity |
-| `MailboxConfig` | kameo natively supports bounded (`spawn_bounded`) and unbounded |
-| `Interceptor` | Run interceptor chain before calling kameo `tell()` |
-| `ActorLifecycle` | Map to kameo's `on_start` / `on_stop` |
+| Feature | Strategy | Implementation |
+|---------|:---:|---|
+| `tell()` | ✅ | `kameo::ActorRef::tell().try_send()` |
+| `tell_envelope()` | ⚙️ | Run interceptor chain on headers, forward `body` to `tell()` |
+| `ask()` | ✅ | `kameo::ActorRef::ask()` |
+| `ActorRef::id()` | ✅ | Map `kameo::actor::ActorId` → `ActorId` |
+| `ActorRef::is_alive()` | ✅ | Check kameo actor ref validity |
+| Lifecycle hooks | ✅ | Map to kameo `on_start` / `on_stop` |
+| Supervision | ✅ | Map to kameo `on_link_died` linking model |
+| `watch()` / `unwatch()` | ✅ | Map to kameo actor linking |
+| `MailboxConfig::Unbounded` | ✅ | `kameo::actor::Spawn::spawn()` |
+| `MailboxConfig::Bounded` | ✅ | `kameo::actor::Spawn::spawn_bounded(capacity)` |
+| `OverflowStrategy::Block` | ✅ | kameo bounded mailbox default behavior |
+| `OverflowStrategy::RejectWithError` | ✅ | `try_send()` returns error when full |
+| `OverflowStrategy::DropNewest` | ⚙️ | `try_send()`, silently discard on error |
+| `OverflowStrategy::DropOldest` | ❌ | Returns `NotSupported` — kameo doesn't expose queue eviction |
+| Interceptors (global) | ⚙️ | `Arc<Mutex<Vec<Box<dyn Interceptor>>>>` on runtime |
+| Interceptors (per-actor) | ⚙️ | Store in actor wrapper, run per message |
+| Processing groups | ⚙️ | Already implemented in v0.1 (type-erased registry) |
+| Cluster events | ⚙️ | Already implemented in v0.1 (`KameoClusterEvents`) |
 
 ---
 
@@ -659,6 +864,10 @@ test-support = ["tokio/test-util"]
 
 3. **Should `ActorLifecycle` be a separate trait or methods on the handler?** → **Proposed: separate trait.** Simple actors use closures (no lifecycle); stateful actors implement `ActorLifecycle`.
 
-4. **Should dactor provide a `Registry` (named actor lookup)?** → **Deferred to v0.4.** Adapters already have their own registry mechanisms.
+4. **Should dactor provide a `Registry` (named actor lookup)?** → **Deferred to v0.4.** 5 of 6 frameworks support it (qualifies under superset rule), but adapters already have their own registry mechanisms. Design to be informed by adapter experience.
 
 5. **How to handle `serde` for `NodeId`?** → **Make it a feature.** `NodeId` gets `Serialize/Deserialize` only with `features = ["serde"]`.
+
+6. **Should `NotSupported` be a compile-time or runtime error?** → **Runtime.** Rust's trait system with GATs can't express "this adapter supports method X" at the type level without fragmenting the trait hierarchy. A single `ActorRuntime` trait with `Result<_, RuntimeError>` is simpler and more ergonomic. Adapters document their support matrix.
+
+7. **What's the threshold for adapter-level shims vs NotSupported?** → **Effort and correctness.** If the adapter can implement the feature correctly with reasonable overhead (e.g., bounded channel wrapper for ractor), use a shim. If the emulation would be incorrect, surprising, or prohibitively expensive (e.g., DropOldest requires draining a queue), return `NotSupported`.
