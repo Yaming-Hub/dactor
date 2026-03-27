@@ -100,6 +100,9 @@ pub enum RuntimeError {
     /// For `tell()` this is silently swallowed (same as Drop).
     /// For `ask()` this is returned as an error to the caller.
     Rejected { reason: String },
+    /// Error returned by an actor handler (local or deserialized from remote).
+    /// See §3.14 for the full `ActorError` model.
+    Actor(ActorError),
 }
 ```
 
@@ -403,9 +406,9 @@ pub enum Outcome {
     Success,
 
     /// The handler panicked or returned an error.
+    /// Carries the full structured `ActorError` (see §3.14).
     HandlerError {
-        /// Human-readable error description.
-        error: String,
+        error: ActorError,
     },
 
     /// Stream completed normally — the actor dropped the `StreamSender`
@@ -461,16 +464,30 @@ runtime.spawn_with_config("my-actor", config, handler);
 ### 3.3 ActorRef & ActorId
 
 **Rationale:** Every framework gives actors identity. Without an ID, you can't
-implement supervision, death watch, logging, or debugging.
+implement supervision, death watch, logging, or debugging. In a distributed
+system, IDs must be **globally unique** across all nodes without requiring
+a central coordinator.
 
 ```rust
-/// Unique identifier for an actor within a runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ActorId(pub u64);
+/// Globally unique identifier for an actor across all nodes in a cluster.
+///
+/// Combines the `NodeId` of the node that spawned the actor with a
+/// node-local sequence number. This guarantees uniqueness without
+/// requiring a central coordinator — each node independently assigns
+/// local IDs and the `(node, local)` pair is globally unique.
+///
+/// For single-node deployments, `node` defaults to `NodeId(0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ActorId {
+    /// The node that spawned this actor.
+    pub node: NodeId,
+    /// Node-local monotonically increasing sequence number.
+    pub local: u64,
+}
 
 impl fmt::Display for ActorId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Actor({})", self.0)
+        write!(f, "Actor({}/{})", self.node.0, self.local)
     }
 }
 
@@ -1408,6 +1425,255 @@ bincode = "1"          # default codec
 | **Clock** | `TestClock` per runtime | `TestClock` per node + coordinated `advance_time()` + clock skew |
 | **Inspection** | N/A | In-flight count, dropped count, corrupted count, `flush()` |
 | **Use case** | Unit testing single actors | Integration testing cluster behavior, chaos testing |
+
+### 3.14 Error Model for Remote Actor Calls
+
+**Problem:** When a caller makes a remote `ask()` and the actor fails, what
+error can be sent back? Rust's `dyn Error` is **not serializable** — it
+contains vtable pointers and type IDs that are meaningless across processes.
+Returning a raw `String` loses structure. We need a serializable, structured
+error type that gives callers enough information to handle failures
+programmatically.
+
+**Design inspiration:**
+- **gRPC** `Status` — code + message + structured details (protobuf `Any`)
+- **Erlang** — `{error, Reason}` where Reason is any serializable term
+- **Akka** — `StatusReply` with `Status.Failure(exception)` (JVM-serializable)
+
+**Approach:** Define `ActorError` — a structured, serializable error type
+that carries a category code (for programmatic handling), a human-readable
+message (for logging), optional structured details (for debugging), and an
+optional error chain (as strings, since the original error objects can't
+cross the wire).
+
+```rust
+use serde::{Serialize, Deserialize};
+
+/// A structured, serializable error returned by actor handlers.
+///
+/// This is the error type that crosses node boundaries. It replaces
+/// `Box<dyn Error>` in the remote case. Local calls can convert from
+/// any `impl Error` via `From` impls.
+///
+/// Inspired by gRPC's Status model (code + message + details).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorError {
+    /// Machine-readable error category for programmatic handling.
+    pub code: ErrorCode,
+
+    /// Human-readable error message (for logging / user display).
+    pub message: String,
+
+    /// Optional structured details — serializable key-value pairs
+    /// for debugging, retry hints, validation errors, etc.
+    /// Kept as `Vec` rather than `HashMap` to preserve insertion order
+    /// and allow repeated keys.
+    pub details: Vec<ErrorDetail>,
+
+    /// Error chain — string representations of the causal chain
+    /// (`source()` chain in Rust). The original error objects can't
+    /// be serialized, but their Display strings can.
+    /// Index 0 is the immediate cause, index N is the root cause.
+    pub chain: Vec<String>,
+}
+
+/// Machine-readable error category, modeled after gRPC status codes
+/// but tailored for actor systems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ErrorCode {
+    /// The actor's handler returned an error or panicked.
+    /// Analogous to gRPC `INTERNAL`.
+    Internal,
+
+    /// The message was invalid or the actor rejected it on
+    /// business-logic grounds.
+    /// Analogous to gRPC `INVALID_ARGUMENT`.
+    InvalidArgument,
+
+    /// The actor could not be found or has stopped.
+    /// Analogous to gRPC `NOT_FOUND`.
+    ActorNotFound,
+
+    /// The actor is alive but not ready to process messages
+    /// (e.g., still initializing, shutting down).
+    /// Analogous to gRPC `UNAVAILABLE`.
+    Unavailable,
+
+    /// The operation timed out (e.g., ask timeout).
+    /// Analogous to gRPC `DEADLINE_EXCEEDED`.
+    Timeout,
+
+    /// The caller is not authorized to send this message.
+    /// Analogous to gRPC `PERMISSION_DENIED`.
+    PermissionDenied,
+
+    /// A precondition for the operation was not met
+    /// (e.g., state machine in wrong state).
+    /// Analogous to gRPC `FAILED_PRECONDITION`.
+    FailedPrecondition,
+
+    /// The actor or system is overloaded (e.g., mailbox full,
+    /// rate limit exceeded).
+    /// Analogous to gRPC `RESOURCE_EXHAUSTED`.
+    ResourceExhausted,
+
+    /// The operation is not implemented by this actor or adapter.
+    /// Analogous to gRPC `UNIMPLEMENTED`.
+    Unimplemented,
+
+    /// Catch-all for errors that don't fit other categories.
+    /// Analogous to gRPC `UNKNOWN`.
+    Unknown,
+}
+
+/// A single key-value detail attached to an `ActorError`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    pub key: String,
+    pub value: String,
+}
+```
+
+**How errors flow in different scenarios:**
+
+```
+Local ask() — same process:
+┌────────┐     ┌─────────┐
+│ Caller │────►│  Actor   │  handler returns Result<Reply, ActorError>
+│        │◄────│          │  or handler panics → converted to ActorError
+│ gets:  │     │          │    code: Internal
+│ Err(   │     │          │    message: panic message
+│  Actor │     │          │    chain: ["panicked at ..."]
+│  Error)│     └─────────┘
+└────────┘
+
+Remote ask() — cross-node via dactor-mock or real network:
+┌────────┐     ┌──────────┐  serialize   ┌──────────┐     ┌─────────┐
+│ Caller │────►│ Adapter  │────────────►│ Network  │────►│  Actor  │
+│        │     │ (local)  │             │          │     │ (remote)│
+│        │     │          │◄────────────│          │◄────│         │
+│ gets:  │◄────│ deser.   │  ActorError │          │     │ returns │
+│ Err(   │     │ ActorErr │  as bytes   │          │     │ ActorErr│
+│  Actor │     └──────────┘             └──────────┘     └─────────┘
+│  Error)│
+└────────┘
+   ↑ Same ActorError type, fully deserialized — code, message, details, chain intact
+```
+
+**Conversion from standard Rust errors:**
+
+```rust
+impl ActorError {
+    /// Create from any `impl std::error::Error`, capturing the
+    /// source chain as strings.
+    pub fn from_error(code: ErrorCode, err: impl std::error::Error) -> Self {
+        let mut chain = Vec::new();
+        let message = err.to_string();
+        let mut source = err.source();
+        while let Some(cause) = source {
+            chain.push(cause.to_string());
+            source = cause.source();
+        }
+        Self {
+            code,
+            message,
+            details: Vec::new(),
+            chain,
+        }
+    }
+
+    /// Create a simple error with just a code and message.
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details: Vec::new(),
+            chain: Vec::new(),
+        }
+    }
+
+    /// Add a structured detail (builder pattern).
+    pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.details.push(ErrorDetail { key: key.into(), value: value.into() });
+        self
+    }
+}
+```
+
+**Usage in actor handlers:**
+
+```rust
+#[async_trait]
+impl Handler<TransferFunds> for BankAccount {
+    async fn handle(&mut self, msg: TransferFunds, _ctx: &mut ActorContext)
+        -> Result<Receipt, ActorError>
+    {
+        if msg.amount > self.balance {
+            return Err(ActorError::new(ErrorCode::FailedPrecondition, "insufficient funds")
+                .with_detail("balance", self.balance.to_string())
+                .with_detail("requested", msg.amount.to_string()));
+        }
+        // ... process transfer
+        Ok(Receipt { id: "tx-123".into() })
+    }
+}
+```
+
+**Caller side:**
+
+```rust
+match account.ask(TransferFunds { amount: 1000 }).await {
+    Ok(receipt) => println!("Transfer succeeded: {}", receipt.id),
+    Err(RuntimeError::Actor(err)) => {
+        // Programmatic handling based on code:
+        match err.code {
+            ErrorCode::FailedPrecondition => {
+                let balance = err.details.iter()
+                    .find(|d| d.key == "balance")
+                    .map(|d| &d.value);
+                eprintln!("Insufficient funds (balance: {:?}): {}", balance, err.message);
+            }
+            ErrorCode::Timeout => eprintln!("Request timed out, retrying..."),
+            _ => eprintln!("Unexpected error: {}", err.message),
+        }
+        // Full chain for debugging:
+        for (i, cause) in err.chain.iter().enumerate() {
+            eprintln!("  caused by [{}]: {}", i, cause);
+        }
+    }
+    Err(other) => eprintln!("Runtime error: {}", other),
+}
+```
+
+**Updated `RuntimeError` enum:**
+
+The `RuntimeError` enum gains an `Actor` variant for handler-returned errors:
+
+```rust
+pub enum RuntimeError {
+    Send(ActorSendError),
+    Group(GroupError),
+    Cluster(ClusterError),
+    NotSupported(NotSupportedError),
+    Rejected { reason: String },
+    /// Error returned by an actor handler (local or deserialized from remote).
+    Actor(ActorError),
+}
+```
+
+**Relationship to `Outcome::HandlerError`:**
+
+The `Outcome::HandlerError` passed to interceptors' `on_complete` now carries
+the full `ActorError` rather than a plain string:
+
+```rust
+pub enum Outcome {
+    Success,
+    HandlerError { error: ActorError },
+    StreamCompleted { items_emitted: u64 },
+    StreamCancelled { items_emitted: u64 },
+}
+```
 
 ---
 
