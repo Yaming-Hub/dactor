@@ -96,6 +96,10 @@ pub enum RuntimeError {
     Cluster(ClusterError),
     /// The requested operation is not supported by this adapter.
     NotSupported(NotSupportedError),
+    /// A message was rejected by an interceptor before reaching the actor.
+    /// For `tell()` this is silently swallowed (same as Drop).
+    /// For `ask()` this is returned as an error to the caller.
+    Rejected { reason: String },
 }
 ```
 
@@ -303,9 +307,30 @@ metrics, tracing, auth) without modifying actor code.
 pub enum Disposition {
     /// Continue to the next interceptor / deliver the message.
     Continue,
-    /// Drop the message silently (e.g., rate-limiting, auth failure).
+    /// Drop the message silently. For `tell()`, the sender sees `Ok(())`
+    /// — fire-and-forget has no error feedback. For `ask()`, the reply
+    /// channel is dropped so the sender's `.await` yields a channel error.
     Drop,
+    /// Reject the message with a reason. Semantics differ by send mode:
+    /// - `tell()`: behaves like `Drop` (fire-and-forget has no error path)
+    /// - `ask()`: sender receives `Err(RuntimeError::Rejected { reason })`
+    ///   immediately — giving a clear, actionable error (e.g., "auth
+    ///   failed", "rate limit exceeded", "invalid payload")
+    Reject(String),
 }
+
+/// The `RuntimeError` enum gains a new variant for rejected messages:
+///
+/// ```rust
+/// pub enum RuntimeError {
+///     Send(ActorSendError),
+///     Group(GroupError),
+///     Cluster(ClusterError),
+///     NotSupported(NotSupportedError),
+///     /// A message was rejected by an interceptor before reaching the actor.
+///     Rejected { reason: String },
+/// }
+/// ```
 
 /// An interceptor that can observe or modify messages in transit.
 ///
