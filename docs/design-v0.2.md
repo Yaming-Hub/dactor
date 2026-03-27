@@ -48,6 +48,7 @@ capability. **≥ 2** means it qualifies for inclusion in dactor.
 | Cluster events | ✓ | ✓ | ✓ | ✓ | — | ✓ | **5** | ✅ |
 | Distribution (remote actors) | ✓ | ✓ | ✓ | ✓ | — | ✓ | **5** | ✅ (future) |
 | Clock abstraction | ✓ | ✓ | — | — | — | — | **2** | ✅ |
+| Streaming responses | ✓ | ✓ | — | — | — | — | **2** | ✅ |
 | Hot code upgrade | ✓ | — | — | — | — | — | **1** | ❌ |
 
 ### `NotSupported` Error
@@ -117,6 +118,7 @@ pub enum RuntimeError {
 | Interceptors (per-actor) | ✅ adapter | ✅ adapter | Stored in SpawnConfig, run per message |
 | Processing groups | ✅ adapter | ✅ adapter | Already implemented in v0.1 |
 | `add_interceptor()` | ✅ adapter | ✅ adapter | Store in `Arc<Mutex<Vec>>` on runtime |
+| `stream()` | ⚙️ adapter | ⚙️ adapter | Channel-based: actor sends items via `mpsc::Sender`, caller gets `StreamRef` |
 | Cluster events | ✅ adapter | ✅ adapter | Already implemented in v0.1 |
 
 **Legend:** ✅ native = framework provides direct API; ⚙️ adapter = implemented
@@ -141,6 +143,7 @@ with custom adapter logic; ❌ `NotSupported` = returns error at runtime.
 | **Mailbox config** | Per-process (unbounded) | Bounded/custom | Unbounded | Bounded (default) | Bounded | Unbounded |
 | **Distribution** | Native (Erlang nodes) | Akka Cluster/Remoting | `ractor_cluster` | libp2p / Kademlia | — | Cluster, remote actors |
 | **Clock/time** | `erlang:monotonic_time` | Scheduler | — | — | — | — |
+| **Streaming responses** | Multi-part `gen_server` reply | Akka Streams `Source` | — | — | — | — |
 
 ### Key Takeaways
 
@@ -152,6 +155,7 @@ with custom adapter logic; ❌ `NotSupported` = returns error at runtime.
 6. **Interceptors/middleware** exist in Akka, Actix, and Coerce (3 frameworks) — qualifies for inclusion.
 7. **Test support behind feature flags** is standard practice in Rust crates.
 8. **Superset rule applied:** every capability above is supported by ≥ 2 frameworks (see §0). Adapters return `NotSupported` for features they can't provide.
+9. **Streaming responses** exist in Erlang (multi-part `gen_server` replies) and Akka (Akka Streams `Source`) — qualifies under the superset rule. Combined with the ubiquity of gRPC server-streaming and Rust's async `Stream` trait, this is a high-value addition.
 
 ---
 
@@ -383,7 +387,182 @@ where
 }
 ```
 
-### 3.5 Actor Lifecycle
+### 3.5 Streaming (Request-Stream)
+
+**Rationale:** Erlang supports multi-part `gen_server` replies where a server
+sends chunked results back to the caller over time. Akka has first-class
+support via Akka Streams `Source`, tightly integrated with actors. gRPC server
+streaming is the dominant RPC pattern for streaming data. In Rust, the async
+`Stream` trait (`futures_core::Stream`) is the standard abstraction, and
+`tokio::sync::mpsc` channels convert naturally into streams via
+`tokio_stream::wrappers::ReceiverStream`.
+
+dactor should provide a `stream()` method on actor references that sends a
+request to an actor and returns an async stream of response items. This enables
+use cases like:
+
+- Paginated data retrieval
+- Real-time event feeds / subscriptions
+- Long-running computation with progressive results
+- Fan-out aggregation with incremental delivery
+
+**Core types:**
+
+```rust
+use std::pin::Pin;
+use futures_core::Stream;
+
+/// A pinned, boxed, Send-safe async stream of items.
+/// This is the return type from `StreamRef::stream()` — the caller
+/// consumes it with `while let Some(item) = stream.next().await`.
+pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
+
+/// A sender handle given to the actor's stream handler.
+/// The actor pushes items into this sender; the caller receives them
+/// as an async stream on the other end.
+///
+/// Backed by a bounded `mpsc` channel for backpressure.
+pub struct StreamSender<T: Send + 'static> {
+    inner: tokio::sync::mpsc::Sender<T>,
+}
+
+impl<T: Send + 'static> StreamSender<T> {
+    /// Send an item to the stream consumer.
+    /// Returns `Err` if the consumer has dropped the stream.
+    pub async fn send(&self, item: T) -> Result<(), StreamSendError> {
+        self.inner.send(item).await
+            .map_err(|_| StreamSendError::ConsumerDropped)
+    }
+
+    /// Try to send without blocking. Returns `Err` if the channel is
+    /// full or the consumer has dropped.
+    pub fn try_send(&self, item: T) -> Result<(), StreamSendError> {
+        self.inner.try_send(item)
+            .map_err(|e| match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) =>
+                    StreamSendError::Full,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) =>
+                    StreamSendError::ConsumerDropped,
+            })
+    }
+
+    /// Check if the consumer is still listening.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+#[derive(Debug)]
+pub enum StreamSendError {
+    /// The consumer dropped the stream (no longer reading).
+    ConsumerDropped,
+    /// The channel buffer is full (backpressure).
+    Full,
+}
+```
+
+**Extension trait on `ActorRef`:**
+
+```rust
+/// Extension trait for request-stream messaging.
+///
+/// The caller sends a request message and receives a stream of response
+/// items. The actor's handler receives the message together with a
+/// `StreamSender<R>` and pushes items into it.
+///
+/// Adapters implement this using a bounded `mpsc` channel: the adapter
+/// creates the channel, wraps the `Receiver` into a `BoxStream`, and
+/// passes the `Sender` (as `StreamSender<R>`) to the actor alongside
+/// the request message.
+pub trait StreamRef<M, R>: ActorRef<M>
+where
+    M: Send + 'static,
+    R: Send + 'static,
+{
+    /// Send a request and receive a stream of responses.
+    ///
+    /// `buffer` controls the channel capacity (backpressure). A typical
+    /// default is 16 or 32.
+    ///
+    /// Returns `Err(RuntimeError::NotSupported)` if the adapter doesn't
+    /// support streaming.
+    fn stream(
+        &self,
+        msg: M,
+        buffer: usize,
+    ) -> Result<BoxStream<R>, RuntimeError>;
+}
+```
+
+**How it works (adapter implementation pattern):**
+
+```
+Caller                       Adapter Layer                     Actor
+  │                               │                              │
+  │  stream(request, buf=16)      │                              │
+  │──────────────────────────────►│                              │
+  │                               │  create mpsc(16)             │
+  │                               │  tx = StreamSender(sender)   │
+  │                               │  rx = ReceiverStream(recv)   │
+  │                               │                              │
+  │                               │  deliver (request, tx)       │
+  │                               │─────────────────────────────►│
+  │◄─ return BoxStream(rx)        │                              │
+  │                               │                              │
+  │  .next().await ◄──────────────│◄── tx.send(item_1) ─────────│
+  │  .next().await ◄──────────────│◄── tx.send(item_2) ─────────│
+  │  .next().await ◄──────────────│◄── tx.send(item_3) ─────────│
+  │  None (stream ends) ◄────────│◄── drop(tx) ─────────────────│
+```
+
+**Backpressure:** The bounded channel naturally provides backpressure. If the
+caller is slow to consume, the actor's `tx.send().await` will suspend until
+the caller reads an item, preventing unbounded memory growth.
+
+**Cancellation:** When the caller drops the `BoxStream`, the `Receiver` is
+dropped, closing the channel. The actor's next `tx.send()` returns
+`StreamSendError::ConsumerDropped`, signaling it to stop producing.
+
+**Example usage (caller side):**
+
+```rust
+use dactor::{ActorRuntime, StreamRef};
+use tokio_stream::StreamExt;
+
+async fn get_logs(runtime: &impl ActorRuntime, actor: &impl StreamRef<GetLogs, LogEntry>) {
+    let mut stream = actor.stream(GetLogs { since: yesterday() }, 32).unwrap();
+
+    while let Some(entry) = stream.next().await {
+        println!("{}: {}", entry.timestamp, entry.message);
+    }
+}
+```
+
+**Example usage (actor handler side):**
+
+```rust
+// The actor receives a tuple of (request, StreamSender)
+// when dispatched via stream(). The adapter wraps the handler.
+async fn handle_get_logs(request: GetLogs, tx: StreamSender<LogEntry>) {
+    for entry in database.query_logs(request.since).await {
+        if tx.send(entry).await.is_err() {
+            break; // consumer dropped the stream
+        }
+    }
+    // dropping tx closes the stream on the caller side
+}
+```
+
+**Relationship to Ask:** `ask()` is request → single reply. `stream()` is
+request → multiple replies. Both are modeled as separate extension traits
+(`AskRef` and `StreamRef`) so that adapters can implement either, both, or
+neither independently.
+
+**Dependencies:** The core crate adds `futures-core` (for the `Stream` trait)
+and `tokio-stream` (for `ReceiverStream`) as dependencies, both lightweight
+and standard in the async Rust ecosystem.
+
+### 3.6 Actor Lifecycle
 
 **Rationale:** Erlang has `init/terminate`, Akka has `preStart/postStop`,
 ractor has `pre_start/post_stop`, kameo has `on_start/on_stop`.
@@ -417,7 +596,7 @@ pub enum ErrorAction {
 }
 ```
 
-### 3.6 Supervision
+### 3.7 Supervision
 
 **Rationale:** Erlang supervisors, Akka supervision strategies, ractor
 parent-child supervision, kameo `on_link_died`.
@@ -476,7 +655,7 @@ pub trait ActorRuntime: Send + Sync + 'static {
 }
 ```
 
-### 3.7 Mailbox Configuration
+### 3.8 Mailbox Configuration
 
 **Rationale:** kameo defaults to bounded, ractor to unbounded. The abstraction
 should let users choose.
@@ -513,7 +692,7 @@ impl Default for MailboxConfig {
 }
 ```
 
-### 3.8 Spawn Configuration
+### 3.9 Spawn Configuration
 
 Collect all per-actor settings into a config struct:
 
@@ -558,7 +737,7 @@ pub trait ActorRuntime: Send + Sync + 'static {
 }
 ```
 
-### 3.9 Feature-Gated Test Support
+### 3.10 Feature-Gated Test Support
 
 **Rationale:** `TestClock`, `TestRuntime`, `TestClusterEvents` are test
 utilities. They should not be compiled into production binaries.
@@ -583,7 +762,7 @@ Downstream crates use:
 dactor = { version = "0.2", features = ["test-support"] }
 ```
 
-### 3.10 Revised `ActorRuntime` Trait (Complete)
+### 3.11 Revised `ActorRuntime` Trait (Complete)
 
 ```rust
 pub trait ActorRuntime: Send + Sync + 'static {
@@ -649,7 +828,7 @@ pub trait ActorRuntime: Send + Sync + 'static {
 }
 ```
 
-### 3.11 Default Implementations via `RuntimeError::NotSupported`
+### 3.12 Default Implementations via `RuntimeError::NotSupported`
 
 Capabilities that are universally available (tell, spawn, timers) never return
 `NotSupported`. Capabilities that may not be available in every adapter
@@ -708,11 +887,12 @@ dactor/src/
 ├── interceptor.rs       ← Interceptor trait, Disposition
 ├── lifecycle.rs         ← ActorLifecycle, ErrorAction
 ├── supervision.rs       ← SupervisionStrategy, SupervisionAction, ChildTerminated
+├── stream.rs            ← StreamRef, StreamSender, BoxStream, StreamSendError
 ├── clock.rs             ← Clock, SystemClock (NO TestClock)
 ├── cluster.rs           ← ClusterEvents, ClusterEvent, NodeId, SubscriptionId
 ├── timer.rs             ← TimerHandle
 ├── mailbox.rs           ← MailboxConfig, OverflowStrategy
-├── errors.rs            ← ActorSendError, GroupError, ClusterError
+├── errors.rs            ← ActorSendError, GroupError, ClusterError, RuntimeError
 └── test_support/        ← #[cfg(feature = "test-support")]
     ├── mod.rs
     ├── test_runtime.rs  ← TestRuntime, TestActorRef, TestClusterEvents
@@ -736,6 +916,7 @@ dactor/src/
 | — | `Interceptor` pipeline | New opt-in feature, no breakage. |
 | — | `SpawnConfig` / `MailboxConfig` | New, with defaults matching v0.1 behavior. |
 | — | `ActorLifecycle` | New opt-in trait. |
+| — | `StreamRef<M, R>` / `BoxStream<R>` | New streaming trait. Adapters implement via channel shim. |
 
 ---
 
@@ -768,6 +949,7 @@ dactor/src/
 | Interceptors (global) | ⚙️ | `Arc<Mutex<Vec<Box<dyn Interceptor>>>>` on runtime, run before `cast()` |
 | Interceptors (per-actor) | ⚙️ | Store in actor wrapper, run per message |
 | Processing groups | ⚙️ | Already implemented in v0.1 (type-erased registry) |
+| `stream()` | ⚙️ | Create `mpsc` channel, pass `StreamSender` to actor with request, return `ReceiverStream` |
 | Cluster events | ⚙️ | Already implemented in v0.1 (`RactorClusterEvents`) |
 
 ### dactor-kameo
@@ -791,6 +973,7 @@ dactor/src/
 | Interceptors (global) | ⚙️ | `Arc<Mutex<Vec<Box<dyn Interceptor>>>>` on runtime |
 | Interceptors (per-actor) | ⚙️ | Store in actor wrapper, run per message |
 | Processing groups | ⚙️ | Already implemented in v0.1 (type-erased registry) |
+| `stream()` | ⚙️ | Create `mpsc` channel, pass `StreamSender` to actor with request, return `ReceiverStream` |
 | Cluster events | ⚙️ | Already implemented in v0.1 (`KameoClusterEvents`) |
 
 ---
@@ -809,6 +992,8 @@ tracing = "0.1"
 [dependencies]
 tokio = { version = "1", features = ["time", "sync", "rt"] }  # drop macros
 tracing = "0.1"
+futures-core = "0.3"      # Stream trait (used by StreamRef)
+tokio-stream = "0.1"      # ReceiverStream wrapper
 
 [dependencies.serde]
 version = "1"
@@ -849,10 +1034,12 @@ test-support = ["tokio/test-util"]
 4. Built-in strategies: `OneForOne`, `OneForAll`, `RestForOne`
 5. Add `ErrorAction::Escalate` flow
 
-### Phase 4 — Ask Pattern (v0.3.1)
+### Phase 4 — Ask Pattern & Streaming (v0.3.1)
 1. Add `AskRef<M, R>` trait
-2. Implement for adapters that support it
-3. Add timeout support
+2. Add `StreamRef<M, R>` trait, `StreamSender<R>`, `BoxStream<R>`
+3. Implement for adapters (channel-based shim)
+4. Add timeout support for ask
+5. Add `futures-core` and `tokio-stream` dependencies
 
 ---
 
@@ -871,3 +1058,5 @@ test-support = ["tokio/test-util"]
 6. **Should `NotSupported` be a compile-time or runtime error?** → **Runtime.** Rust's trait system with GATs can't express "this adapter supports method X" at the type level without fragmenting the trait hierarchy. A single `ActorRuntime` trait with `Result<_, RuntimeError>` is simpler and more ergonomic. Adapters document their support matrix.
 
 7. **What's the threshold for adapter-level shims vs NotSupported?** → **Effort and correctness.** If the adapter can implement the feature correctly with reasonable overhead (e.g., bounded channel wrapper for ractor), use a shim. If the emulation would be incorrect, surprising, or prohibitively expensive (e.g., DropOldest requires draining a queue), return `NotSupported`.
+
+8. **Should `stream()` support bidirectional streaming?** → **Deferred.** Start with request-stream (one request, many responses). Bidirectional streaming (many-to-many) can be added later as a separate `BidiStreamRef` trait if there is demand. The channel-based approach naturally extends to this.
