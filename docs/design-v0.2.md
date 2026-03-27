@@ -2379,6 +2379,140 @@ async fn main() {
 }
 ```
 
+**Remote actor call example:**
+
+Messages used for remote calls must implement `Serialize + Deserialize` so
+they can cross node boundaries. The caller uses the same `tell()` / `ask()`
+API — the adapter handles serialization transparently. Errors from the
+remote actor arrive as structured `ActorError` (see §3.14).
+
+```rust
+use dactor::prelude::*;
+use serde::{Serialize, Deserialize};
+
+// ── Messages must be serializable for remote calls ─────────
+
+#[derive(Serialize, Deserialize)]
+struct TransferFunds {
+    from_account: String,
+    to_account: String,
+    amount: u64,
+}
+impl Message for TransferFunds {
+    type Reply = Result<Receipt, ActorError>;
+}
+
+#[derive(Serialize, Deserialize)]
+struct Receipt {
+    transaction_id: String,
+    new_balance: u64,
+}
+
+// ── Actor lives on a remote node ────────────────────────────
+
+struct BankAccount {
+    account_id: String,
+    balance: u64,
+}
+
+impl Actor for BankAccount {}
+
+#[async_trait]
+impl Handler<TransferFunds> for BankAccount {
+    async fn handle(
+        &mut self,
+        msg: TransferFunds,
+        _ctx: &mut ActorContext,
+    ) -> Result<Receipt, ActorError> {
+        if msg.amount > self.balance {
+            return Err(
+                ActorError::new(ErrorCode::FailedPrecondition, "insufficient funds")
+                    .with_detail("balance", self.balance.to_string())
+                    .with_detail("requested", msg.amount.to_string()),
+            );
+        }
+        self.balance -= msg.amount;
+        Ok(Receipt {
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            new_balance: self.balance,
+        })
+    }
+}
+
+// ── Caller on a different node ──────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    let runtime = dactor_ractor::RactorRuntime::new();
+
+    // Obtain a reference to an actor on a remote node.
+    // The ActorRef<BankAccount> is location-transparent — the caller
+    // doesn't know or care whether the actor is local or remote.
+    let remote_account: ActorRef<BankAccount> = runtime
+        .lookup("bank-account-alice")       // registry lookup
+        .await
+        .expect("actor not found");
+
+    // Remote ask — message is serialized, sent over the network,
+    // deserialized on the remote node, handled by BankAccount,
+    // reply is serialized back and deserialized on the caller side.
+    match remote_account.ask(TransferFunds {
+        from_account: "alice".into(),
+        to_account: "bob".into(),
+        amount: 500,
+    }).await {
+        Ok(Ok(receipt)) => {
+            println!("Transfer succeeded: tx={}, balance={}",
+                receipt.transaction_id, receipt.new_balance);
+        }
+        Ok(Err(actor_err)) => {
+            // Structured error from the remote actor (deserialized)
+            eprintln!("Transfer failed: [{}] {}",
+                actor_err.code, actor_err.message);
+            for detail in &actor_err.details {
+                eprintln!("  {}: {}", detail.key, detail.value);
+            }
+        }
+        Err(runtime_err) => {
+            // Infrastructure error (network, timeout, serialization, etc.)
+            eprintln!("Runtime error: {}", runtime_err);
+        }
+    }
+}
+```
+
+**What happens under the hood for a remote `ask()`:**
+
+```
+Caller Node                                              Remote Node
+┌─────────────┐                                    ┌──────────────────┐
+│ ask(Transfer │                                    │   BankAccount    │
+│   Funds)     │                                    │   actor handler  │
+└──────┬──────┘                                    └────────┬─────────┘
+       │  1. serialize(TransferFunds)                       │
+       │  2. send bytes + reply channel ID                  │
+       │─────────────────────────────────────────────────►  │
+       │                                                    │  3. deserialize(TransferFunds)
+       │                                                    │  4. run interceptor chain
+       │                                                    │  5. handler(&mut self, msg)
+       │                                                    │  6. returns Result<Receipt, ActorError>
+       │  8. deserialize reply                              │
+       │  ◄─────────────────────────────────────────────────│  7. serialize reply
+       │  9. return to caller                               │
+       ▼                                                    │
+  Ok(receipt) or                                            │
+  Ok(ActorError) or                                         │
+  Err(RuntimeError)                                         │
+```
+
+**Three layers of errors the caller may see:**
+
+| Layer | Type | Example | When |
+|---|---|---|---|
+| **Business error** | `ActorError` (inside `Ok`) | Insufficient funds, validation failure | Handler returns `Err(ActorError)` — this is application-level, serialized cleanly |
+| **Runtime error** | `RuntimeError::Actor(ActorError)` | Handler panicked, unhandled exception | Handler panics — adapter captures and wraps as `ActorError` |
+| **Infrastructure error** | `RuntimeError::Send` / `NotSupported` | Network timeout, node down, serialization failure | Message never reached the actor or reply was lost |
+
 **Impact on adapters:**
 
 | Adapter | Mapping |
