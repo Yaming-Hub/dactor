@@ -319,19 +319,6 @@ pub enum Disposition {
     Reject(String),
 }
 
-/// The `RuntimeError` enum gains a new variant for rejected messages:
-///
-/// ```rust
-/// pub enum RuntimeError {
-///     Send(ActorSendError),
-///     Group(GroupError),
-///     Cluster(ClusterError),
-///     NotSupported(NotSupportedError),
-///     /// A message was rejected by an interceptor before reaching the actor.
-///     Rejected { reason: String },
-/// }
-/// ```
-
 /// An interceptor that can observe or modify messages in transit.
 ///
 /// Interceptors form an ordered pipeline. Each interceptor sees the
