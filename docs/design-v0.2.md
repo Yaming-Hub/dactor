@@ -211,7 +211,7 @@ dactor/
 │   ├── actor.rs           → ActorRef, ActorId, ActorRuntime trait
 │   ├── message.rs         → Envelope<M>, MessageHeaders, Header trait
 │   ├── interceptor.rs     → Interceptor trait, InterceptorChain
-│   ├── lifecycle.rs       → ActorLifecycle hooks
+│   ├── lifecycle.rs       → ErrorAction enum
 │   ├── supervision.rs     → Supervisor trait, SupervisionStrategy
 │   ├── clock.rs           → Clock, SystemClock (production only)
 │   ├── cluster.rs         → ClusterEvents, ClusterEvent, NodeId
@@ -719,19 +719,28 @@ and standard in the async Rust ecosystem.
 **Rationale:** Erlang has `init/terminate`, Akka has `preStart/postStop`,
 ractor has `pre_start/post_stop`, kameo has `on_start/on_stop`.
 
+Lifecycle hooks are **methods on the `Actor` trait itself** (not a separate
+trait). Since the API decision (§10.6) adopts the Kameo/Coerce pattern where
+the actor struct implements `Actor`, lifecycle hooks live naturally alongside
+the actor's state. All hooks have default no-op implementations, so simple
+actors can ignore them entirely.
+
 ```rust
-/// Lifecycle hooks for an actor. All methods have default no-op
-/// implementations so that simple actors can ignore them.
-pub trait ActorLifecycle: Send + 'static {
+/// The core actor trait. Implemented by the user's actor struct.
+/// State lives in `self`. Lifecycle hooks have default no-ops.
+pub trait Actor: Send + 'static {
     /// Called after the actor is spawned, before it processes any messages.
+    /// Use for initialization, resource acquisition, subscriptions, etc.
     fn on_start(&mut self) {}
 
-    /// Called when the actor is stopping (graceful shutdown).
+    /// Called when the actor is stopping (graceful shutdown or supervision).
+    /// Use for cleanup, resource release, flushing buffers, etc.
     fn on_stop(&mut self) {}
 
-    /// Called when the actor's handler panics or returns an error.
+    /// Called when a handler panics or returns an `ActorError`.
     /// Return an `ErrorAction` to control what happens next.
-    fn on_error(&mut self, _error: Box<dyn std::error::Error + Send>) -> ErrorAction {
+    /// The default is `Stop` — the actor terminates on error.
+    fn on_error(&mut self, _error: &ActorError) -> ErrorAction {
         ErrorAction::Stop
     }
 }
@@ -740,11 +749,42 @@ pub enum ErrorAction {
     /// Resume processing the next message (Erlang: continue).
     Resume,
     /// Restart the actor (Erlang: restart, Akka: Restart).
+    /// The runtime calls `on_stop()` then re-creates the actor and
+    /// calls `on_start()`.
     Restart,
     /// Stop the actor (Erlang: shutdown).
     Stop,
     /// Escalate to the supervisor (Akka: Escalate).
     Escalate,
+}
+```
+
+**Example:**
+
+```rust
+struct DatabaseWorker {
+    conn: Option<DbConnection>,
+}
+
+impl Actor for DatabaseWorker {
+    fn on_start(&mut self) {
+        self.conn = Some(DbConnection::connect("postgres://..."));
+        tracing::info!("DatabaseWorker connected");
+    }
+
+    fn on_stop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            conn.close();
+        }
+        tracing::info!("DatabaseWorker disconnected");
+    }
+
+    fn on_error(&mut self, error: &ActorError) -> ErrorAction {
+        match error.code {
+            ErrorCode::Unavailable => ErrorAction::Restart,  // reconnect
+            _ => ErrorAction::Stop,
+        }
+    }
 }
 ```
 
@@ -1705,7 +1745,7 @@ dactor/src/
 ├── actor.rs             ← ActorRef, ActorId, ActorRuntime, SpawnConfig
 ├── message.rs           ← Envelope, Headers, HeaderValue, built-in headers
 ├── interceptor.rs       ← Interceptor trait, Disposition
-├── lifecycle.rs         ← ActorLifecycle, ErrorAction
+├── lifecycle.rs         ← ErrorAction (lifecycle hooks live on Actor trait)
 ├── supervision.rs       ← SupervisionStrategy, SupervisionAction, ChildTerminated
 ├── stream.rs            ← StreamRef, StreamSender, BoxStream, StreamSendError
 ├── clock.rs             ← Clock, SystemClock (NO TestClock)
@@ -1735,7 +1775,7 @@ dactor/src/
 | — | `Envelope<M>`, `Headers` | New types, `tell()` accepts both `M` and `Envelope<M>`. |
 | — | `Interceptor` pipeline | New opt-in feature, no breakage. |
 | — | `SpawnConfig` / `MailboxConfig` | New, with defaults matching v0.1 behavior. |
-| — | `ActorLifecycle` | New opt-in trait. |
+| — | Lifecycle hooks on `Actor` trait | Actor struct implements `on_start`/`on_stop`/`on_error` with default no-ops. |
 | — | `StreamRef<M, R>` / `BoxStream<R>` | New streaming trait. Adapters implement via channel shim. |
 
 ---
@@ -1865,7 +1905,7 @@ test-support = ["tokio/test-util"]
 8. Clean up `serde` dependency (make optional)
 
 ### Phase 2 — Lifecycle & Config (v0.2.1)
-1. Add `ActorLifecycle` trait (`on_start`, `on_stop`, `on_error`)
+1. Lifecycle hooks on `Actor` trait (`on_start`, `on_stop`, `on_error`)
 2. Add `MailboxConfig` and `OverflowStrategy`
 3. Add `SpawnConfig` for per-actor configuration
 4. Add `spawn_with_config()` to `ActorRuntime`
@@ -1905,7 +1945,7 @@ test-support = ["tokio/test-util"]
 
 2. **Should interceptors be per-runtime or per-actor?** → **Proposed: both.** Global interceptors via `runtime.add_interceptor()`, per-actor via `SpawnConfig`.
 
-3. **Should `ActorLifecycle` be a separate trait or methods on the handler?** → **Proposed: separate trait.** Simple actors use closures (no lifecycle); stateful actors implement `ActorLifecycle`.
+3. **Should lifecycle hooks be a separate trait or methods on Actor?** → **Resolved: methods on `Actor` trait.** Since we adopted the Kameo/Coerce pattern (§10.6) where the actor struct implements `Actor`, lifecycle hooks belong directly on that trait with default no-op implementations. No separate `ActorLifecycle` trait needed.
 
 4. **Should dactor provide a `Registry` (named actor lookup)?** → **Deferred to v0.4.** 5 of 6 frameworks support it (qualifies under superset rule), but adapters already have their own registry mechanisms. Design to be informed by adapter experience.
 
