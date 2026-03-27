@@ -100,29 +100,33 @@ pub enum RuntimeError {
 
 ### Adapter Support Matrix (Planned)
 
-| Capability | dactor-ractor | dactor-kameo | Strategy |
-|---|:---:|:---:|---|
-| `tell()` | ✅ native | ✅ native | — |
-| `tell_envelope()` | ✅ adapter | ✅ adapter | Unwrap envelope, run interceptors, forward body |
-| `ask()` | ✅ native (`call`) | ✅ native (`ask`) | Map to framework's request-reply |
-| `ActorRef::id()` | ✅ native | ✅ native | Map from framework's ID type |
-| `ActorRef::is_alive()` | ✅ native | ✅ native | Check actor cell liveness |
-| Lifecycle hooks | ✅ native | ✅ native | Map to `pre_start`/`post_stop` and `on_start`/`on_stop` |
-| Supervision | ✅ native | ✅ native (`on_link_died`) | Map to framework's supervision model |
-| `watch()` / `unwatch()` | ✅ native | ✅ native (linking) | Map to framework's monitoring API |
-| `MailboxConfig::Bounded` | ⚙️ adapter | ✅ native (`spawn_bounded`) | ractor: wrap with bounded channel |
-| `MailboxConfig::Unbounded` | ✅ native | ✅ native | — |
-| `OverflowStrategy::Block` | ⚙️ adapter | ✅ native | ractor: bounded channel blocks |
-| `OverflowStrategy::DropOldest` | ❌ `NotSupported` | ❌ `NotSupported` | Neither framework supports natively |
-| Interceptors (global) | ✅ adapter | ✅ adapter | Interceptor chain runs in adapter before dispatch |
-| Interceptors (per-actor) | ✅ adapter | ✅ adapter | Stored in SpawnConfig, run per message |
-| Processing groups | ✅ adapter | ✅ adapter | Already implemented in v0.1 |
-| `add_interceptor()` | ✅ adapter | ✅ adapter | Store in `Arc<Mutex<Vec>>` on runtime |
-| `stream()` | ⚙️ adapter | ⚙️ adapter | Channel-based: actor sends items via `mpsc::Sender`, caller gets `StreamRef` |
-| Cluster events | ✅ adapter | ✅ adapter | Already implemented in v0.1 |
+For each feature and each adapter, there are exactly three possibilities:
 
-**Legend:** ✅ native = framework provides direct API; ⚙️ adapter = implemented
-with custom adapter logic; ❌ `NotSupported` = returns error at runtime.
+- ✅ **Library Native** — the underlying actor library (ractor / kameo) directly supports this feature; the adapter maps to the library's API
+- ⚙️ **Adapter Implemented** — the library does *not* support this feature, but the adapter crate implements it with custom logic
+- ❌ **Not Supported** — the feature cannot be provided; returns `RuntimeError::NotSupported` at runtime
+
+| Capability | dactor-ractor | dactor-kameo | Notes |
+|---|:---:|:---:|---|
+| `tell()` | ✅ Library | ✅ Library | ractor `cast()` / kameo `tell().try_send()` |
+| `tell_envelope()` | ⚙️ Adapter | ⚙️ Adapter | Neither library has envelopes; adapter unwraps, runs interceptors, forwards body |
+| `ask()` | ✅ Library | ✅ Library | ractor `call()` / kameo `ask()` |
+| `stream()` | ⚙️ Adapter | ⚙️ Adapter | Neither library has streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor |
+| `ActorRef::id()` | ✅ Library | ✅ Library | ractor `get_id()` / kameo `id()` |
+| `ActorRef::is_alive()` | ✅ Library | ✅ Library | Check actor cell / ref validity |
+| Lifecycle hooks | ✅ Library | ✅ Library | ractor `pre_start`/`post_stop` / kameo `on_start`/`on_stop` |
+| Supervision | ✅ Library | ✅ Library | ractor parent-child / kameo `on_link_died` |
+| `watch()` / `unwatch()` | ✅ Library | ✅ Library | ractor supervisor notifications / kameo actor linking |
+| `MailboxConfig::Unbounded` | ✅ Library | ✅ Library | Default for both |
+| `MailboxConfig::Bounded` | ⚙️ Adapter | ✅ Library | ractor: adapter wraps with bounded `tokio::sync::mpsc`; kameo: `spawn_bounded()` |
+| `OverflowStrategy::Block` | ⚙️ Adapter | ✅ Library | ractor: bounded channel blocks; kameo: native bounded behavior |
+| `OverflowStrategy::RejectWithError` | ⚙️ Adapter | ✅ Library | ractor: `try_send()` on adapter channel; kameo: `try_send()` native |
+| `OverflowStrategy::DropNewest` | ⚙️ Adapter | ⚙️ Adapter | Both: `try_send()`, silently discard on full |
+| `OverflowStrategy::DropOldest` | ❌ Not Supported | ❌ Not Supported | Neither library exposes queue eviction |
+| Interceptors (global) | ⚙️ Adapter | ⚙️ Adapter | Neither library has interceptors; adapter runs chain before dispatch |
+| Interceptors (per-actor) | ⚙️ Adapter | ⚙️ Adapter | Stored in actor wrapper by adapter, run per message |
+| Processing groups | ⚙️ Adapter | ⚙️ Adapter | Neither library has groups; adapter maintains type-erased registry |
+| Cluster events | ⚙️ Adapter | ⚙️ Adapter | Neither library has unified cluster events; adapter provides callback system |
 
 ---
 
@@ -924,57 +928,59 @@ dactor/src/
 
 ### Strategy Key
 
-- ✅ **Native** — direct 1:1 mapping to framework API
-- ⚙️ **Adapter shim** — implemented in adapter layer with custom logic
-- ❌ **`NotSupported`** — returns `RuntimeError::NotSupported` at runtime
+For each feature and each adapter, there are exactly three possibilities:
+
+- ✅ **Library Native** — the underlying actor library directly supports this; the adapter maps to the library's API
+- ⚙️ **Adapter Implemented** — the library does *not* support this; the adapter crate implements it with custom logic
+- ❌ **Not Supported** — returns `RuntimeError::NotSupported` at runtime
 
 ### dactor-ractor
 
-| Feature | Strategy | Implementation |
+| Feature | Strategy | Implementation Detail |
 |---------|:---:|---|
-| `tell()` | ✅ | `ractor::ActorRef::cast()` |
-| `tell_envelope()` | ⚙️ | Run interceptor chain on headers, forward `body` to `cast()` |
-| `ask()` | ✅ | `ractor::ActorRef::call()` |
-| `ActorRef::id()` | ✅ | Map `ractor::ActorRef::get_id()` → `ActorId` |
-| `ActorRef::is_alive()` | ✅ | Check ractor actor cell liveness |
-| Lifecycle hooks | ✅ | Map to ractor `pre_start` / `post_stop` |
-| Supervision | ✅ | Map to ractor's parent-child supervision |
-| `watch()` / `unwatch()` | ✅ | Map to ractor's supervisor notification system |
-| `MailboxConfig::Unbounded` | ✅ | Default ractor behavior |
-| `MailboxConfig::Bounded` | ⚙️ | Wrap with bounded `tokio::sync::mpsc` channel |
-| `OverflowStrategy::Block` | ⚙️ | Bounded channel naturally blocks sender |
-| `OverflowStrategy::RejectWithError` | ⚙️ | `try_send()` on bounded channel |
-| `OverflowStrategy::DropNewest` | ⚙️ | `try_send()`, discard on error |
-| `OverflowStrategy::DropOldest` | ❌ | Returns `NotSupported` — no efficient way to evict from front |
-| Interceptors (global) | ⚙️ | `Arc<Mutex<Vec<Box<dyn Interceptor>>>>` on runtime, run before `cast()` |
-| Interceptors (per-actor) | ⚙️ | Store in actor wrapper, run per message |
-| Processing groups | ⚙️ | Already implemented in v0.1 (type-erased registry) |
-| `stream()` | ⚙️ | Create `mpsc` channel, pass `StreamSender` to actor with request, return `ReceiverStream` |
-| Cluster events | ⚙️ | Already implemented in v0.1 (`RactorClusterEvents`) |
+| `tell()` | ✅ Library | `ractor::ActorRef::cast()` |
+| `tell_envelope()` | ⚙️ Adapter | ractor has no envelope concept; adapter runs interceptor chain on headers, forwards `body` to `cast()` |
+| `ask()` | ✅ Library | `ractor::ActorRef::call()` |
+| `stream()` | ⚙️ Adapter | ractor has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
+| `ActorRef::id()` | ✅ Library | `ractor::ActorRef::get_id()` → `ActorId` |
+| `ActorRef::is_alive()` | ✅ Library | Check ractor actor cell liveness |
+| Lifecycle hooks | ✅ Library | ractor `pre_start` / `post_stop` callbacks |
+| Supervision | ✅ Library | ractor's parent-child supervision model |
+| `watch()` / `unwatch()` | ✅ Library | ractor's supervisor notification system |
+| `MailboxConfig::Unbounded` | ✅ Library | Default ractor behavior |
+| `MailboxConfig::Bounded` | ⚙️ Adapter | ractor only has unbounded mailboxes; adapter wraps with bounded `tokio::sync::mpsc` channel |
+| `OverflowStrategy::Block` | ⚙️ Adapter | ractor has no overflow control; adapter uses bounded channel which naturally blocks sender |
+| `OverflowStrategy::RejectWithError` | ⚙️ Adapter | ractor has no overflow control; adapter uses `try_send()` on bounded channel |
+| `OverflowStrategy::DropNewest` | ⚙️ Adapter | ractor has no overflow control; adapter uses `try_send()`, silently discards on error |
+| `OverflowStrategy::DropOldest` | ❌ Not Supported | ractor has no queue eviction; no efficient way to implement in adapter |
+| Interceptors (global) | ⚙️ Adapter | ractor has no interceptors; adapter stores in `Arc<Mutex<Vec>>`, runs chain before `cast()` |
+| Interceptors (per-actor) | ⚙️ Adapter | ractor has no interceptors; adapter stores in actor wrapper, runs per message |
+| Processing groups | ⚙️ Adapter | ractor has no processing groups; adapter maintains type-erased registry (implemented in v0.1) |
+| Cluster events | ⚙️ Adapter | ractor has no unified cluster events; adapter provides `RactorClusterEvents` callback system (implemented in v0.1) |
 
 ### dactor-kameo
 
-| Feature | Strategy | Implementation |
+| Feature | Strategy | Implementation Detail |
 |---------|:---:|---|
-| `tell()` | ✅ | `kameo::ActorRef::tell().try_send()` |
-| `tell_envelope()` | ⚙️ | Run interceptor chain on headers, forward `body` to `tell()` |
-| `ask()` | ✅ | `kameo::ActorRef::ask()` |
-| `ActorRef::id()` | ✅ | Map `kameo::actor::ActorId` → `ActorId` |
-| `ActorRef::is_alive()` | ✅ | Check kameo actor ref validity |
-| Lifecycle hooks | ✅ | Map to kameo `on_start` / `on_stop` |
-| Supervision | ✅ | Map to kameo `on_link_died` linking model |
-| `watch()` / `unwatch()` | ✅ | Map to kameo actor linking |
-| `MailboxConfig::Unbounded` | ✅ | `kameo::actor::Spawn::spawn()` |
-| `MailboxConfig::Bounded` | ✅ | `kameo::actor::Spawn::spawn_bounded(capacity)` |
-| `OverflowStrategy::Block` | ✅ | kameo bounded mailbox default behavior |
-| `OverflowStrategy::RejectWithError` | ✅ | `try_send()` returns error when full |
-| `OverflowStrategy::DropNewest` | ⚙️ | `try_send()`, silently discard on error |
-| `OverflowStrategy::DropOldest` | ❌ | Returns `NotSupported` — kameo doesn't expose queue eviction |
-| Interceptors (global) | ⚙️ | `Arc<Mutex<Vec<Box<dyn Interceptor>>>>` on runtime |
-| Interceptors (per-actor) | ⚙️ | Store in actor wrapper, run per message |
-| Processing groups | ⚙️ | Already implemented in v0.1 (type-erased registry) |
-| `stream()` | ⚙️ | Create `mpsc` channel, pass `StreamSender` to actor with request, return `ReceiverStream` |
-| Cluster events | ⚙️ | Already implemented in v0.1 (`KameoClusterEvents`) |
+| `tell()` | ✅ Library | `kameo::ActorRef::tell().try_send()` |
+| `tell_envelope()` | ⚙️ Adapter | kameo has no envelope concept; adapter runs interceptor chain on headers, forwards `body` to `tell()` |
+| `ask()` | ✅ Library | `kameo::ActorRef::ask()` |
+| `stream()` | ⚙️ Adapter | kameo has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
+| `ActorRef::id()` | ✅ Library | `kameo::actor::ActorId` → `ActorId` |
+| `ActorRef::is_alive()` | ✅ Library | Check kameo actor ref validity |
+| Lifecycle hooks | ✅ Library | kameo `on_start` / `on_stop` hooks |
+| Supervision | ✅ Library | kameo `on_link_died` actor linking model |
+| `watch()` / `unwatch()` | ✅ Library | kameo actor linking API |
+| `MailboxConfig::Unbounded` | ✅ Library | `kameo::actor::Spawn::spawn()` |
+| `MailboxConfig::Bounded` | ✅ Library | `kameo::actor::Spawn::spawn_bounded(capacity)` |
+| `OverflowStrategy::Block` | ✅ Library | kameo bounded mailbox default behavior (blocks sender) |
+| `OverflowStrategy::RejectWithError` | ✅ Library | kameo `try_send()` returns error when mailbox full |
+| `OverflowStrategy::DropNewest` | ⚙️ Adapter | kameo has no drop-newest policy; adapter uses `try_send()`, silently discards on error |
+| `OverflowStrategy::DropOldest` | ❌ Not Supported | kameo doesn't expose queue eviction; no efficient way to implement in adapter |
+| Interceptors (global) | ⚙️ Adapter | kameo has no interceptors; adapter stores in `Arc<Mutex<Vec>>`, runs chain before `tell()` |
+| Interceptors (per-actor) | ⚙️ Adapter | kameo has no interceptors; adapter stores in actor wrapper, runs per message |
+| Processing groups | ⚙️ Adapter | kameo has no processing groups; adapter maintains type-erased registry (implemented in v0.1) |
+| Cluster events | ⚙️ Adapter | kameo has no unified cluster events; adapter provides `KameoClusterEvents` callback system (implemented in v0.1) |
 
 ---
 
