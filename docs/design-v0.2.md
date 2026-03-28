@@ -1,12 +1,53 @@
 # dactor v0.2 — Design Document
 
-> **Goal:** Refactor dactor from a minimal trait extraction into a professional,
-> production-grade abstract actor framework, informed by Erlang/OTP, Akka,
-> ractor, kameo, Actix, and Coerce.
+> An abstract framework for distributed actors in Rust, providing a unified
+> API across ractor, kameo, and coerce backends.
+
+## 1. Introduction
+
+**dactor** is a framework-agnostic actor abstraction for Rust. It defines
+core traits for actor spawning, message delivery, supervision, streaming,
+and cluster membership — without coupling to any specific actor framework.
+Concrete backends (ractor, kameo, coerce) are plugged in via adapter crates.
+
+```mermaid
+graph TB
+    subgraph "Application Code"
+        App[Your Actors & Messages]
+    end
+    subgraph "dactor (core crate)"
+        Actor[Actor / Message / Handler traits]
+        Envelope[Envelope & Headers]
+        Interceptor[Interceptor Pipeline]
+        Supervision[Supervision & Watch]
+        Stream[Streaming & Ask]
+        Metrics[Observability]
+    end
+    subgraph "Adapter Crates"
+        R[dactor-ractor]
+        K[dactor-kameo]
+        C[dactor-coerce]
+        M[dactor-mock]
+    end
+    subgraph "Underlying Libraries"
+        RL[ractor]
+        KL[kameo]
+        CL[coerce-rs]
+    end
+    App --> Actor
+    Actor --> R & K & C & M
+    R --> RL
+    K --> KL
+    C --> CL
+```
+
+**Goal:** Refactor dactor from a minimal trait extraction into a professional,
+production-grade abstract actor framework, informed by Erlang/OTP, Akka,
+ractor, kameo, Actix, and Coerce.
 
 ---
 
-## 0. Design Principle: Superset with Graceful Degradation
+## 2. Design Principles
 
 ### Inclusion Rule
 
@@ -106,40 +147,26 @@ pub enum RuntimeError {
 }
 ```
 
-### Adapter Support Matrix (Planned)
+### RuntimeCapabilities Introspection
 
-For each feature and each adapter, there are exactly three possibilities:
+Callers can pre-flight requirements at startup via `ActorRuntime::capabilities()`:
 
-- ✅ **Library Native** — the underlying actor library (ractor / kameo / coerce) directly supports this feature; the adapter maps to the library's API
-- ⚙️ **Adapter Implemented** — the library does *not* support this feature, but the adapter crate implements it with custom logic
-- ❌ **Not Supported** — the feature cannot be provided; returns `RuntimeError::NotSupported` at runtime
-
-| Capability | dactor-ractor | dactor-kameo | dactor-coerce | Notes |
-|---|:---:|:---:|:---:|---|
-| `tell()` | ✅ Library | ✅ Library | ✅ Library | ractor `cast()` / kameo `tell().try_send()` / coerce `notify()` |
-| `tell_envelope()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has envelopes; adapter unwraps, runs interceptors, forwards body |
-| `ask()` | ✅ Library | ✅ Library | ✅ Library | ractor `call()` / kameo `ask()` / coerce `send()` |
-| `stream()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has streaming; adapter creates `mpsc` channel shim |
-| `ActorRef::id()` | ✅ Library | ✅ Library | ✅ Library | Each library provides actor identity |
-| `ActorRef::is_alive()` | ✅ Library | ✅ Library | ✅ Library | Check actor cell / ref validity |
-| Lifecycle hooks | ✅ Library | ✅ Library | ✅ Library | ractor `pre_start`/`post_stop` / kameo `on_start`/`on_stop` / coerce lifecycle events |
-| Supervision | ✅ Library | ✅ Library | ✅ Library | ractor parent-child / kameo `on_link_died` / coerce child restart |
-| `watch()` / `unwatch()` | ✅ Library | ✅ Library | ✅ Library | ractor supervisor notifications / kameo linking / coerce supervision |
-| `MailboxConfig::Unbounded` | ✅ Library | ✅ Library | ✅ Library | Default for all three |
-| `MailboxConfig::Bounded` | ⚙️ Adapter | ✅ Library | ❌ Not Supported | ractor: adapter wraps with bounded channel; kameo: `spawn_bounded()`; coerce: unbounded only |
-| `OverflowStrategy::Block` | ⚙️ Adapter | ✅ Library | ❌ Not Supported | coerce: no bounded mailbox |
-| `OverflowStrategy::RejectWithError` | ⚙️ Adapter | ✅ Library | ❌ Not Supported | coerce: no bounded mailbox |
-| `OverflowStrategy::DropNewest` | ⚙️ Adapter | ⚙️ Adapter | ❌ Not Supported | coerce: no bounded mailbox |
-| `OverflowStrategy::DropOldest` | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | No library exposes queue eviction |
-| Priority mailbox | ⚙️ Adapter | ✅ Library | ❌ Not Supported | ractor: BinaryHeap wrapper; kameo: custom mailbox; coerce: no priority support |
-| Interceptors (global) | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has generic interceptors; adapter runs chain before dispatch |
-| Interceptors (per-actor) | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | Stored in actor wrapper by adapter, run per message |
-| Processing groups | ✅ Library | ⚙️ Adapter | ✅ Library | ractor: native `pg` module; kameo: adapter registry; coerce: sharding/pub-sub |
-| Cluster events | ⚙️ Adapter | ⚙️ Adapter | ✅ Library | ractor/kameo: adapter callback system; coerce: native cluster membership |
+```rust
+/// Describes which optional capabilities a runtime adapter supports.
+/// Returned by `ActorRuntime::capabilities()`.
+#[derive(Debug, Clone)]
+pub struct RuntimeCapabilities {
+    pub ask: bool,
+    pub stream: bool,
+    pub watch: bool,
+    pub bounded_mailbox: bool,
+    pub priority_mailbox: bool,
+    pub interceptors: bool,
+}
 
 ---
 
-## 1. Research Summary: Common Behaviors Across Actor Frameworks
+## 3. Research Summary: Common Behaviors Across Actor Frameworks
 
 | Concept | Erlang/OTP | Akka (JVM) | Ractor (Rust) | Kameo (Rust) | Actix (Rust) | Coerce (Rust) |
 |---|---|---|---|---|---|---|
@@ -173,58 +200,433 @@ For each feature and each adapter, there are exactly three possibilities:
 
 ---
 
-## 2. Current dactor Architecture (v0.1)
+---
 
+## 4. Core API Design
+
+dactor adopts the **Kameo/Coerce pattern** as its primary consumer interface:
+`ActorRef<A>` is typed to the actor struct (not the message), each message
+type gets its own `Handler<M>` impl, and reply types are checked at compile
+time.
+
+```mermaid
+classDiagram
+    class Actor {
+        <<trait>>
+        +on_start(&mut self)
+        +on_stop(&mut self)
+        +on_error(&mut self, &ActorError) ErrorAction
+    }
+    class Message {
+        <<trait>>
+        +type Reply
+    }
+    class Handler~M: Message~ {
+        <<trait>>
+        +handle(&mut self, M, &mut ActorContext) M::Reply
+    }
+    class ActorRef~A: Actor~ {
+        +id() ActorId
+        +tell(M)
+        +ask(M) M::Reply
+        +ask_timeout(M, Duration) M::Reply
+        +is_alive() bool
+    }
+    class ActorRuntime {
+        <<trait>>
+        +spawn(name, actor) ActorRef~A~
+        +spawn_with_config(name, actor, config) ActorRef~A~
+        +send_after(target, delay, msg)
+        +send_interval(target, interval, msg)
+        +watch(watcher, target)
+        +capabilities() RuntimeCapabilities
+    }
+    Actor <|-- Handler: requires
+    Handler ..> Message: handles
+    ActorRef --> Actor: references
+    ActorRuntime --> ActorRef: creates
 ```
-dactor/
-├── traits/
-│   ├── runtime.rs    → ActorRuntime, ActorRef<M>, ClusterEvents, TimerHandle
-│   └── clock.rs      → Clock, SystemClock, TestClock
-├── types/
-│   └── node.rs       → NodeId
-└── test_support/
-    ├── test_runtime.rs → TestRuntime, TestActorRef, TestClusterEvents
-    └── test_clock.rs   → re-export of TestClock
+
+### 4.1 Actor Trait & Lifecycle
+
+**Rationale:** Erlang has `init/terminate`, Akka has `preStart/postStop`,
+ractor has `pre_start/post_stop`, kameo has `on_start/on_stop`.
+
+Lifecycle hooks are **methods on the `Actor` trait itself** (not a separate
+trait). Since the API decision (§10.6) adopts the Kameo/Coerce pattern where
+the actor struct implements `Actor`, lifecycle hooks live naturally alongside
+the actor's state. All hooks have default no-op implementations, so simple
+actors can ignore them entirely.
+
+```rust
+/// The core actor trait. Implemented by the user's actor struct.
+/// State lives in `self`. Lifecycle hooks have default no-ops.
+pub trait Actor: Send + 'static {
+    /// Called after the actor is spawned, before it processes any messages.
+    /// Use for initialization, resource acquisition, subscriptions, etc.
+    fn on_start(&mut self) {}
+
+    /// Called when the actor is stopping (graceful shutdown or supervision).
+    /// Use for cleanup, resource release, flushing buffers, etc.
+    fn on_stop(&mut self) {}
+
+    /// Called when a handler panics or returns an `ActorError`.
+    /// Return an `ErrorAction` to control what happens next.
+    /// The default is `Stop` — the actor terminates on error.
+    fn on_error(&mut self, _error: &ActorError) -> ErrorAction {
+        ErrorAction::Stop
+    }
+}
+
+pub enum ErrorAction {
+    /// Resume processing the next message (Erlang: continue).
+    Resume,
+    /// Restart the actor (Erlang: restart, Akka: Restart).
+    /// The runtime calls `on_stop()` then re-creates the actor and
+    /// calls `on_start()`.
+    Restart,
+    /// Stop the actor (Erlang: shutdown).
+    Stop,
+    /// Escalate to the supervisor (Akka: Escalate).
+    Escalate,
+}
 ```
 
-### Problems
+**Example:**
 
-1. **`TestClock` lives in `traits/clock.rs`** — test utilities mixed with production code
-2. **No feature gate** on test_support — always compiled
-3. **Messages are plain `M`** — no metadata, no tracing context, no correlation
-4. **No interceptor pipeline** — can't inject logging, metrics, or context propagation
-5. **Only fire-and-forget** — no ask/reply pattern
-6. **No lifecycle hooks** — actors are just closures with no start/stop semantics
-7. **No supervision** — no way to monitor or restart actors
-8. **No actor identity** — actors have no ID, can't be compared or addressed by name
-9. **No mailbox configuration** — adapter decides (ractor=unbounded, kameo=bounded)
-10. **`NodeId` uses `serde`** — unnecessary dependency for the core crate unless needed
+```rust
+struct DatabaseWorker {
+    conn: Option<DbConnection>,
+}
+
+impl Actor for DatabaseWorker {
+    fn on_start(&mut self) {
+        self.conn = Some(DbConnection::connect("postgres://..."));
+        tracing::info!("DatabaseWorker connected");
+    }
+
+    fn on_stop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            conn.close();
+        }
+        tracing::info!("DatabaseWorker disconnected");
+    }
+
+    fn on_error(&mut self, error: &ActorError) -> ErrorAction {
+        match error.code {
+            ErrorCode::Unavailable => ErrorAction::Restart,  // reconnect
+            _ => ErrorAction::Stop,
+        }
+    }
+}
+```
+
+### 4.2 Message Trait
+
+```rust
+/// Defines a message type and its reply. Implemented on the MESSAGE,
+/// not on the actor. This decouples message definition from handling
+/// (Coerce style) and allows the same message to be handled by
+/// different actors.
+pub trait Message: Send + 'static {
+    /// The reply type for this message. Use `()` for fire-and-forget.
+    type Reply: Send + 'static;
+}
+```
+
+### 4.3 Handler Trait
+
+```rust
+/// Implemented by an actor for each message type it can handle.
+/// One impl per (Actor, Message) pair.
+#[async_trait::async_trait]
+pub trait Handler<M: Message>: Actor {
+    /// Handle the message and return a reply.
+    async fn handle(&mut self, msg: M, ctx: &mut ActorContext) -> M::Reply;
+}
+```
+
+### 4.4 ActorRef & ActorId
+
+**Rationale:** Every framework gives actors identity. Without an ID, you can't
+implement supervision, death watch, logging, or debugging. In a distributed
+system, IDs must be **globally unique** across all nodes without requiring
+a central coordinator.
+
+```rust
+/// Globally unique identifier for an actor across all nodes in a cluster.
+///
+/// Combines the `NodeId` of the node that spawned the actor with a
+/// node-local sequence number. This guarantees uniqueness without
+/// requiring a central coordinator — each node independently assigns
+/// local IDs and the `(node, local)` pair is globally unique.
+///
+/// For single-node deployments, `node` defaults to `NodeId(0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ActorId {
+    /// The node that spawned this actor.
+    pub node: NodeId,
+    /// Node-local monotonically increasing sequence number.
+    pub local: u64,
+}
+
+impl fmt::Display for ActorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Actor({}/{})", self.node.0, self.local)
+    }
+}
+
+pub trait ActorRef<M: Send + 'static>: Clone + Send + Sync + 'static {
+    /// The actor's unique identity.
+    fn id(&self) -> ActorId;
+
+    /// Fire-and-forget: deliver a raw message.
+    fn tell(&self, msg: M) -> Result<(), ActorSendError>;
+
+    /// Fire-and-forget with an envelope (headers + body).
+    /// Adapters that don't support envelopes may ignore headers and
+    /// forward only the body, or return `NotSupported` if the envelope
+    /// cannot be delivered at all.
+    fn tell_envelope(&self, envelope: Envelope<M>) -> Result<(), RuntimeError>;
+
+    /// Check if the actor is still alive.
+    /// Returns `Err(NotSupported)` if the adapter cannot determine liveness.
+    fn is_alive(&self) -> Result<bool, NotSupportedError>;
+}
+```
+
+> **Note:** `send()` is renamed to `tell()` to align with Erlang/Akka/kameo
+> terminology. A deprecated `send()` alias can ease migration.
+
+### 4.5 ActorRuntime Trait
+
+```rust
+pub trait ActorRuntime: Send + Sync + 'static {
+    type Ref<M: Send + 'static>: ActorRef<M>;
+    type Events: ClusterEvents;
+    type Timer: TimerHandle;
+
+    // ── Spawning ────────────────────────────────────────
+    fn spawn<M, H>(&self, name: &str, handler: H) -> Self::Ref<M>
+    where M: Send + 'static, H: FnMut(M) + Send + 'static;
+
+    /// Spawn with per-actor configuration (mailbox, interceptors).
+    /// Returns `Err(NotSupported)` for config options the adapter can't honor.
+    fn spawn_with_config<M, H>(
+        &self, name: &str, config: SpawnConfig, handler: H,
+    ) -> Result<Self::Ref<M>, RuntimeError>
+    where M: Send + 'static, H: FnMut(M) + Send + 'static;
+
+    // ── Timers ──────────────────────────────────────────
+    fn send_interval<M: Clone + Send + 'static>(
+        &self, target: &Self::Ref<M>, interval: Duration, msg: M,
+    ) -> Self::Timer;
+
+    fn send_after<M: Send + 'static>(
+        &self, target: &Self::Ref<M>, delay: Duration, msg: M,
+    ) -> Self::Timer;
+
+    // ── Processing Groups ───────────────────────────────
+    fn join_group<M: Send + 'static>(
+        &self, group: &str, actor: &Self::Ref<M>,
+    ) -> Result<(), RuntimeError>;
+
+    fn leave_group<M: Send + 'static>(
+        &self, group: &str, actor: &Self::Ref<M>,
+    ) -> Result<(), RuntimeError>;
+
+    fn broadcast_group<M: Clone + Send + 'static>(
+        &self, group: &str, msg: M,
+    ) -> Result<(), RuntimeError>;
+
+    fn get_group_members<M: Send + 'static>(
+        &self, group: &str,
+    ) -> Result<Vec<Self::Ref<M>>, RuntimeError>;
+
+    // ── Supervision / DeathWatch ────────────────────────
+    /// Watch an actor for termination.
+    /// Returns `Err(NotSupported)` if the adapter doesn't support it.
+    fn watch<M: Send + 'static>(
+        &self, watcher: &Self::Ref<M>, target: ActorId,
+    ) -> Result<(), RuntimeError>;
+
+    fn unwatch<M: Send + 'static>(
+        &self, watcher: &Self::Ref<M>, target: ActorId,
+    ) -> Result<(), RuntimeError>;
+
+    // ── Cluster ─────────────────────────────────────────
+    fn cluster_events(&self) -> &Self::Events;
+
+    // ── Global Interceptors ─────────────────────────────
+    /// Register a global interceptor applied to all actors.
+    /// Returns `Err(NotSupported)` if the adapter doesn't support interceptors.
+    fn add_interceptor(&self, interceptor: Box<dyn Interceptor>) -> Result<(), RuntimeError>;
+
+    // ── Capability Introspection ────────────────────────
+    /// Query which capabilities this runtime supports.
+    /// Callers can pre-flight requirements at startup rather than
+    /// discovering `NotSupported` errors mid-flight.
+    fn capabilities(&self) -> RuntimeCapabilities;
+}
+
+/// Describes which optional capabilities a runtime adapter supports.
+/// Returned by `ActorRuntime::capabilities()`.
+#[derive(Debug, Clone)]
+pub struct RuntimeCapabilities {
+    pub ask: bool,
+    pub stream: bool,
+    pub watch: bool,
+    pub bounded_mailbox: bool,
+    pub priority_mailbox: bool,
+    pub interceptors: bool,
+}
+```
+
+### 4.6 ActorContext
+
+```rust
+/// Context passed to handlers, providing access to the actor's identity,
+/// message metadata, and runtime operations.
+pub struct ActorContext {
+    /// The headers from the incoming message envelope.
+    pub headers: Headers,
+    /// The actor's own unique identity.
+    pub actor_id: ActorId,
+    /// The name the actor was spawned with.
+    pub actor_name: String,
+    /// How the message was sent (Tell, Ask, Stream).
+    pub send_mode: SendMode,
+}
+
+impl ActorContext {
+    /// Spawn a child actor (delegates to the runtime).
+    pub fn spawn<A: Actor>(&self, name: &str, actor: A) -> ActorRef<A> { ... }
+
+    /// Schedule a one-shot message to an actor.
+    pub fn send_after<A, M>(&self, target: &ActorRef<A>, delay: Duration, msg: M)
+    where A: Handler<M>, M: Message<Reply = ()> { ... }
+
+    /// Schedule a recurring message to an actor.
+    pub fn send_interval<A, M>(&self, target: &ActorRef<A>, interval: Duration, msg: M)
+    where A: Handler<M>, M: Message<Reply = ()> + Clone { ... }
+}
+```
+
+### 4.7 SpawnConfig
+
+Collect all per-actor settings into a config struct:
+
+```rust
+pub struct SpawnConfig {
+    pub mailbox: MailboxConfig,
+    pub interceptors: Vec<Box<dyn Interceptor>>,
+}
+
+impl Default for SpawnConfig {
+    fn default() -> Self {
+        Self {
+            mailbox: MailboxConfig::default(),
+            interceptors: Vec::new(),
+        }
+    }
+}
+```
+
+Updated `ActorRuntime::spawn`:
+
+```rust
+pub trait ActorRuntime: Send + Sync + 'static {
+    // Simple spawn (backward-compatible)
+    fn spawn<M, H>(&self, name: &str, handler: H) -> Self::Ref<M>
+    where
+        M: Send + 'static,
+        H: FnMut(M) + Send + 'static;
+
+    // Spawn with configuration
+    fn spawn_with_config<M, H>(
+        &self,
+        name: &str,
+        config: SpawnConfig,
+        handler: H,
+    ) -> Self::Ref<M>
+    where
+        M: Send + 'static,
+        H: FnMut(M) + Send + 'static;
+
+    // ... timers, groups, cluster events ...
+}
+```
+
+### 4.8 Complete Example
+
+```rust
+use dactor::prelude::*;
+
+// ── Define the actor ────────────────────────────────────────
+struct Counter { count: u64 }
+
+impl Actor for Counter {
+    fn on_start(&mut self) {
+        println!("Counter started at {}", self.count);
+    }
+}
+
+// ── Define messages ─────────────────────────────────────────
+struct Increment(u64);
+impl Message for Increment { type Reply = (); }
+
+struct GetCount;
+impl Message for GetCount { type Reply = u64; }
+
+struct Reset;
+impl Message for Reset { type Reply = u64; }  // returns old count
+
+// ── Implement handlers ─────────────────────────────────────
+#[async_trait]
+impl Handler<Increment> for Counter {
+    async fn handle(&mut self, msg: Increment, _ctx: &mut ActorContext) {
+        self.count += msg.0;
+    }
+}
+
+#[async_trait]
+impl Handler<GetCount> for Counter {
+    async fn handle(&mut self, _msg: GetCount, _ctx: &mut ActorContext) -> u64 {
+        self.count
+    }
+}
+
+#[async_trait]
+impl Handler<Reset> for Counter {
+    async fn handle(&mut self, _msg: Reset, _ctx: &mut ActorContext) -> u64 {
+        let old = self.count;
+        self.count = 0;
+        old
+    }
+}
+
+// ── Usage ───────────────────────────────────────────────────
+#[tokio::main]
+async fn main() {
+    let runtime = dactor_ractor::RactorRuntime::new();
+    let counter: ActorRef<Counter> = runtime.spawn("counter", Counter { count: 0 });
+
+    counter.tell(Increment(5)).unwrap();          // fire-and-forget
+    counter.tell(Increment(3)).unwrap();
+
+    let count = counter.ask(GetCount).await.unwrap();  // returns u64
+    assert_eq!(count, 8);
+
+    let old = counter.ask(Reset).await.unwrap();       // returns u64
+    assert_eq!(old, 8);
+}
+```
 
 ---
 
-## 3. Proposed Architecture (v0.2)
+## 5. Message System
 
-```
-dactor/
-├── src/
-│   ├── lib.rs
-│   ├── actor.rs           → ActorRef, ActorId, ActorRuntime trait
-│   ├── message.rs         → Envelope<M>, MessageHeaders, Header trait
-│   ├── interceptor.rs     → Interceptor trait, InterceptorChain
-│   ├── lifecycle.rs       → ErrorAction enum
-│   ├── supervision.rs     → Supervisor trait, SupervisionStrategy
-│   ├── clock.rs           → Clock, SystemClock (production only)
-│   ├── cluster.rs         → ClusterEvents, ClusterEvent, NodeId
-│   ├── timer.rs           → TimerHandle
-│   ├── mailbox.rs         → MailboxConfig
-│   └── errors.rs          → All error types
-├── src/test_support/      → behind #[cfg(feature = "test-support")]
-│   ├── mod.rs
-│   ├── test_runtime.rs
-│   └── test_clock.rs
-```
-
-### 3.1 Message Envelope
+### 5.1 Envelope & Headers
 
 **Rationale:** Every distributed system eventually needs message metadata — trace
 IDs, correlation IDs, deadlines, security context. Baking this into the
@@ -299,7 +701,24 @@ impl Interceptor for TracingInterceptor {
 }
 ```
 
-### 3.2 Interceptor Pipeline
+```mermaid
+sequenceDiagram
+    participant S as Sender
+    participant I1 as Interceptor 1
+    participant I2 as Interceptor 2
+    participant A as Actor Handler
+    
+    S->>I1: on_receive(ctx, headers)
+    I1->>I2: Continue → on_receive(ctx, headers)
+    I2->>A: Continue → deliver message
+    A->>A: handle(msg, ctx)
+    A->>I2: on_complete(ctx, outcome)
+    I2->>I1: on_complete(ctx, outcome)
+    
+    Note over S,A: If any interceptor returns Drop/Reject,<br/>the message never reaches the handler.
+```
+
+### 5.2 Interceptor Pipeline
 
 **Rationale:** Akka has `Behaviors.intercept`, HTTP frameworks have middleware.
 An interceptor pipeline lets users add cross-cutting concerns (logging,
@@ -465,59 +884,110 @@ runtime.add_interceptor(LoggingInterceptor);
 runtime.spawn_with_config("my-actor", config, handler);
 ```
 
-### 3.3 ActorRef & ActorId
+### 5.3 Dead Letter Handling
 
-**Rationale:** Every framework gives actors identity. Without an ID, you can't
-implement supervision, death watch, logging, or debugging. In a distributed
-system, IDs must be **globally unique** across all nodes without requiring
-a central coordinator.
+**Problem:** Messages can be lost in several ways: actor stopped before
+consuming them, mailbox overflow with `DropNewest`/`DropOldest`, interceptor
+`Drop`/`Reject`, network failure. What happens to these messages?
+
+**Design:** dactor provides a configurable dead letter sink. Lost messages
+are forwarded to a `DeadLetterHandler` which can log, count, alert, or
+store them for debugging.
 
 ```rust
-/// Globally unique identifier for an actor across all nodes in a cluster.
-///
-/// Combines the `NodeId` of the node that spawned the actor with a
-/// node-local sequence number. This guarantees uniqueness without
-/// requiring a central coordinator — each node independently assigns
-/// local IDs and the `(node, local)` pair is globally unique.
-///
-/// For single-node deployments, `node` defaults to `NodeId(0)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ActorId {
-    /// The node that spawned this actor.
-    pub node: NodeId,
-    /// Node-local monotonically increasing sequence number.
-    pub local: u64,
+/// A handler for messages that could not be delivered.
+pub trait DeadLetterHandler: Send + Sync + 'static {
+    /// Called when a message is lost. The message body is type-erased
+    /// (serialized to bytes if possible, otherwise `None`).
+    fn on_dead_letter(&self, event: DeadLetterEvent);
 }
 
-impl fmt::Display for ActorId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Actor({}/{})", self.node.0, self.local)
-    }
+/// Describes a message that was not delivered.
+#[derive(Debug)]
+pub struct DeadLetterEvent {
+    /// Why the message was not delivered.
+    pub reason: DeadLetterReason,
+    /// The target actor (may no longer exist).
+    pub target_actor: ActorId,
+    /// The target actor's name.
+    pub target_name: String,
+    /// The Rust type name of the message.
+    pub message_type: &'static str,
+    /// Headers from the envelope (if available).
+    pub headers: Option<Headers>,
 }
 
-pub trait ActorRef<M: Send + 'static>: Clone + Send + Sync + 'static {
-    /// The actor's unique identity.
-    fn id(&self) -> ActorId;
-
-    /// Fire-and-forget: deliver a raw message.
-    fn tell(&self, msg: M) -> Result<(), ActorSendError>;
-
-    /// Fire-and-forget with an envelope (headers + body).
-    /// Adapters that don't support envelopes may ignore headers and
-    /// forward only the body, or return `NotSupported` if the envelope
-    /// cannot be delivered at all.
-    fn tell_envelope(&self, envelope: Envelope<M>) -> Result<(), RuntimeError>;
-
-    /// Check if the actor is still alive.
-    /// Returns `Err(NotSupported)` if the adapter cannot determine liveness.
-    fn is_alive(&self) -> Result<bool, NotSupportedError>;
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DeadLetterReason {
+    /// The target actor has stopped.
+    ActorStopped,
+    /// The mailbox was full and the overflow strategy discarded the message.
+    MailboxOverflow,
+    /// An interceptor dropped the message.
+    InterceptorDrop,
+    /// An interceptor rejected the message.
+    InterceptorReject { reason: String },
+    /// Network delivery failed (remote actor unreachable).
+    NetworkFailure { detail: String },
 }
 ```
 
-> **Note:** `send()` is renamed to `tell()` to align with Erlang/Akka/kameo
-> terminology. A deprecated `send()` alias can ease migration.
+**Registration:**
 
-### 3.4 Ask Pattern (Request-Reply)
+```rust
+impl ActorRuntime {
+    /// Set the dead letter handler. Only one handler is active at a time.
+    /// Default: `LoggingDeadLetterHandler` which logs at WARN level.
+    fn set_dead_letter_handler(&self, handler: Box<dyn DeadLetterHandler>);
+}
+```
+
+**Built-in handlers:**
+
+```rust
+/// Logs dead letters at WARN level (default).
+pub struct LoggingDeadLetterHandler;
+
+/// Counts dead letters and exposes metrics.
+pub struct CountingDeadLetterHandler { /* AtomicU64 counters */ }
+
+/// Discards dead letters silently (for tests or high-throughput systems).
+pub struct NullDeadLetterHandler;
+```
+
+---
+
+## 6. Communication Patterns
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Actor
+
+    rect rgb(200, 230, 200)
+        Note over Caller,Actor: Tell (fire-and-forget)
+        Caller->>Actor: tell(msg)
+        Note right of Actor: No reply
+    end
+
+    rect rgb(200, 210, 240)
+        Note over Caller,Actor: Ask (request-reply)
+        Caller->>Actor: ask(msg)
+        Actor-->>Caller: Reply (M::Reply)
+    end
+
+    rect rgb(240, 220, 200)
+        Note over Caller,Actor: Stream (request-stream)
+        Caller->>Actor: stream(msg, buffer)
+        Actor-->>Caller: item 1
+        Actor-->>Caller: item 2
+        Actor-->>Caller: item N
+        Actor-->>Caller: stream ends (drop sender)
+    end
+```
+
+### 6.1 Ask Pattern (Request-Reply)
 
 **Rationale:** ractor, kameo, Akka, and Actix all support ask. Not having it
 forces users to implement reply channels manually.
@@ -543,7 +1013,7 @@ where
 }
 ```
 
-### 3.5 Streaming (Request-Stream)
+### 6.2 Streaming (Request-Stream)
 
 **Rationale:** Erlang supports multi-part `gen_server` replies where a server
 sends chunked results back to the caller over time. Akka has first-class
@@ -719,81 +1189,25 @@ neither independently.
 and `tokio-stream` (for `ReceiverStream`) as dependencies, both lightweight
 and standard in the async Rust ecosystem.
 
-### 3.6 Actor Lifecycle
+---
 
-**Rationale:** Erlang has `init/terminate`, Akka has `preStart/postStop`,
-ractor has `pre_start/post_stop`, kameo has `on_start/on_stop`.
+## 7. Actor Lifecycle & Supervision
 
-Lifecycle hooks are **methods on the `Actor` trait itself** (not a separate
-trait). Since the API decision (§10.6) adopts the Kameo/Coerce pattern where
-the actor struct implements `Actor`, lifecycle hooks live naturally alongside
-the actor's state. All hooks have default no-op implementations, so simple
-actors can ignore them entirely.
-
-```rust
-/// The core actor trait. Implemented by the user's actor struct.
-/// State lives in `self`. Lifecycle hooks have default no-ops.
-pub trait Actor: Send + 'static {
-    /// Called after the actor is spawned, before it processes any messages.
-    /// Use for initialization, resource acquisition, subscriptions, etc.
-    fn on_start(&mut self) {}
-
-    /// Called when the actor is stopping (graceful shutdown or supervision).
-    /// Use for cleanup, resource release, flushing buffers, etc.
-    fn on_stop(&mut self) {}
-
-    /// Called when a handler panics or returns an `ActorError`.
-    /// Return an `ErrorAction` to control what happens next.
-    /// The default is `Stop` — the actor terminates on error.
-    fn on_error(&mut self, _error: &ActorError) -> ErrorAction {
-        ErrorAction::Stop
-    }
-}
-
-pub enum ErrorAction {
-    /// Resume processing the next message (Erlang: continue).
-    Resume,
-    /// Restart the actor (Erlang: restart, Akka: Restart).
-    /// The runtime calls `on_stop()` then re-creates the actor and
-    /// calls `on_start()`.
-    Restart,
-    /// Stop the actor (Erlang: shutdown).
-    Stop,
-    /// Escalate to the supervisor (Akka: Escalate).
-    Escalate,
-}
+```mermaid
+stateDiagram-v2
+    [*] --> Spawned: runtime.spawn()
+    Spawned --> Running: on_start()
+    Running --> Running: handle messages
+    Running --> Error: handler error/panic
+    Error --> Running: ErrorAction::Resume
+    Error --> Spawned: ErrorAction::Restart
+    Error --> Stopped: ErrorAction::Stop
+    Error --> Parent: ErrorAction::Escalate
+    Running --> Stopped: shutdown / supervision
+    Stopped --> [*]: on_stop()
 ```
 
-**Example:**
-
-```rust
-struct DatabaseWorker {
-    conn: Option<DbConnection>,
-}
-
-impl Actor for DatabaseWorker {
-    fn on_start(&mut self) {
-        self.conn = Some(DbConnection::connect("postgres://..."));
-        tracing::info!("DatabaseWorker connected");
-    }
-
-    fn on_stop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            conn.close();
-        }
-        tracing::info!("DatabaseWorker disconnected");
-    }
-
-    fn on_error(&mut self, error: &ActorError) -> ErrorAction {
-        match error.code {
-            ErrorCode::Unavailable => ErrorAction::Restart,  // reconnect
-            _ => ErrorAction::Stop,
-        }
-    }
-}
-```
-
-### 3.7 Supervision
+### 7.1 Supervision Strategies
 
 **Rationale:** Erlang supervisors, Akka supervision strategies, ractor
 parent-child supervision, kameo `on_link_died`.
@@ -852,7 +1266,61 @@ pub trait ActorRuntime: Send + Sync + 'static {
 }
 ```
 
-### 3.8 Mailbox Configuration
+### 7.2 Watch / DeathWatch
+
+**Problem:** When an actor calls `watch(target)`, how does it receive the
+`ChildTerminated` notification? Does the runtime inject a synthetic message,
+or must the actor explicitly implement a handler for it?
+
+**Decision:** The actor must implement `Handler<ChildTerminated>`. This is
+explicit, type-safe, and consistent with the Handler pattern — no magic
+injection.
+
+```rust
+/// Notification delivered when a watched actor terminates.
+/// Actors that call `watch()` must implement `Handler<ChildTerminated>`
+/// to receive these notifications.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildTerminated {
+    pub child_id: ActorId,
+    pub child_name: String,
+    /// `None` for graceful shutdown, `Some(reason)` for failure.
+    pub reason: Option<String>,
+}
+
+impl Message for ChildTerminated {
+    type Reply = ();
+}
+```
+
+**Usage:**
+
+```rust
+struct Supervisor {
+    children: Vec<ActorId>,
+}
+
+impl Actor for Supervisor {}
+
+#[async_trait]
+impl Handler<ChildTerminated> for Supervisor {
+    async fn handle(&mut self, msg: ChildTerminated, ctx: &mut ActorContext) {
+        tracing::warn!(child = %msg.child_id, reason = ?msg.reason, "child died");
+        self.children.retain(|id| *id != msg.child_id);
+        // Optionally restart the child
+    }
+}
+```
+
+If an actor calls `watch()` but does **not** implement `Handler<ChildTerminated>`,
+the notification is silently dropped (same as an unhandled message). This
+avoids forcing every actor to handle termination events.
+
+---
+
+## 8. Mailbox & Scheduling
+
+### 8.1 Mailbox Configuration
 
 **Rationale:** kameo defaults to bounded, ractor to unbounded. Akka supports
 priority mailboxes natively, kameo supports custom mailboxes. The abstraction
@@ -987,52 +1455,813 @@ the right policy varies by use case. However, recommended patterns include:
 These can be implemented as interceptors or within the actor's handler logic.
 Future versions may offer built-in fairness strategies as opt-in policies.
 
-### 3.9 Spawn Configuration
+### 8.2 Message Ordering Guarantees
 
-Collect all per-actor settings into a config struct:
+Ordering is a fundamental contract that actors rely on. dactor specifies:
+
+1. **Same sender → same actor:** Messages are delivered in send order (FIFO
+   within the same priority level). This matches all 6 surveyed frameworks.
+
+2. **Different senders → same actor:** No ordering guarantee between senders.
+   Messages from sender A and sender B may interleave arbitrarily.
+
+3. **Priority mailbox:** Messages are ordered by priority first, then FIFO
+   within each priority level. A `High` message sent after a `Low` message
+   will be delivered first.
+
+4. **Timer-injected messages:** Timer messages (`send_after`, `send_interval`)
+   enter the mailbox like any other message and follow mailbox ordering rules.
+   They have `Priority::Normal` unless sent via envelope with explicit priority.
+
+5. **Handler execution:** Handlers on the same actor execute **sequentially**
+   (one at a time), never concurrently. This is the fundamental actor model
+   guarantee — no locking needed inside handlers.
+
+6. **Cross-node messages:** No ordering guarantee across nodes. Network latency,
+   retries, and partitions can reorder messages. Applications requiring
+   cross-node ordering should use sequence numbers or vector clocks.
+
+---
+
+## 9. Error Model
+
+```mermaid
+graph TB
+    subgraph "Caller receives"
+        RE[RuntimeError]
+    end
+    RE --> Send[Send Error<br/>mailbox closed]
+    RE --> NS[NotSupported<br/>adapter limitation]
+    RE --> Rej[Rejected<br/>interceptor blocked]
+    RE --> AE[Actor Error<br/>handler failed]
+    
+    AE --> Code[ErrorCode<br/>Internal / Timeout / ...]
+    AE --> Msg[message: String]
+    AE --> Det[details: Vec&lt;ErrorDetail&gt;]
+    AE --> Chain[chain: Vec&lt;String&gt;<br/>source error chain]
+```
+
+### 9.1 ActorError — Structured, Serializable Errors
+
+**Problem:** When a caller makes a remote `ask()` and the actor fails, what
+error can be sent back? Rust's `dyn Error` is **not serializable** — it
+contains vtable pointers and type IDs that are meaningless across processes.
+Returning a raw `String` loses structure. We need a serializable, structured
+error type that gives callers enough information to handle failures
+programmatically.
+
+**Design inspiration:**
+- **gRPC** `Status` — code + message + structured details (protobuf `Any`)
+- **Erlang** — `{error, Reason}` where Reason is any serializable term
+- **Akka** — `StatusReply` with `Status.Failure(exception)` (JVM-serializable)
+
+**Approach:** Define `ActorError` — a structured, serializable error type
+that carries a category code (for programmatic handling), a human-readable
+message (for logging), optional structured details (for debugging), and an
+optional error chain (as strings, since the original error objects can't
+cross the wire).
 
 ```rust
-pub struct SpawnConfig {
-    pub mailbox: MailboxConfig,
-    pub interceptors: Vec<Box<dyn Interceptor>>,
+use serde::{Serialize, Deserialize};
+
+/// A structured, serializable error returned by actor handlers.
+///
+/// This is the error type that crosses node boundaries. It replaces
+/// `Box<dyn Error>` in the remote case. Local calls can convert from
+/// any `impl Error` via `From` impls.
+///
+/// Inspired by gRPC's Status model (code + message + details).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorError {
+    /// Machine-readable error category for programmatic handling.
+    pub code: ErrorCode,
+
+    /// Human-readable error message (for logging / user display).
+    pub message: String,
+
+    /// Optional structured details — serializable key-value pairs
+    /// for debugging, retry hints, validation errors, etc.
+    /// Kept as `Vec` rather than `HashMap` to preserve insertion order
+    /// and allow repeated keys.
+    pub details: Vec<ErrorDetail>,
+
+    /// Error chain — string representations of the causal chain
+    /// (`source()` chain in Rust). The original error objects can't
+    /// be serialized, but their Display strings can.
+    /// Index 0 is the immediate cause, index N is the root cause.
+    pub chain: Vec<String>,
 }
 
-impl Default for SpawnConfig {
-    fn default() -> Self {
+/// Machine-readable error category, modeled after gRPC status codes
+/// but tailored for actor systems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ErrorCode {
+    /// The actor's handler returned an error or panicked.
+    /// Analogous to gRPC `INTERNAL`.
+    Internal,
+
+    /// The message was invalid or the actor rejected it on
+    /// business-logic grounds.
+    /// Analogous to gRPC `INVALID_ARGUMENT`.
+    InvalidArgument,
+
+    /// The actor could not be found or has stopped.
+    /// Analogous to gRPC `NOT_FOUND`.
+    ActorNotFound,
+
+    /// The actor is alive but not ready to process messages
+    /// (e.g., still initializing, shutting down).
+    /// Analogous to gRPC `UNAVAILABLE`.
+    Unavailable,
+
+    /// The operation timed out (e.g., ask timeout).
+    /// Analogous to gRPC `DEADLINE_EXCEEDED`.
+    Timeout,
+
+    /// The caller is not authorized to send this message.
+    /// Analogous to gRPC `PERMISSION_DENIED`.
+    PermissionDenied,
+
+    /// A precondition for the operation was not met
+    /// (e.g., state machine in wrong state).
+    /// Analogous to gRPC `FAILED_PRECONDITION`.
+    FailedPrecondition,
+
+    /// The actor or system is overloaded (e.g., mailbox full,
+    /// rate limit exceeded).
+    /// Analogous to gRPC `RESOURCE_EXHAUSTED`.
+    ResourceExhausted,
+
+    /// The operation is not implemented by this actor or adapter.
+    /// Analogous to gRPC `UNIMPLEMENTED`.
+    Unimplemented,
+
+    /// Catch-all for errors that don't fit other categories.
+    /// Analogous to gRPC `UNKNOWN`.
+    Unknown,
+}
+
+/// A single key-value detail attached to an `ActorError`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    pub key: String,
+    pub value: String,
+}
+```
+
+**How errors flow in different scenarios:**
+
+```
+Local ask() — same process:
+┌────────┐     ┌─────────┐
+│ Caller │────►│  Actor   │  handler returns Result<Reply, ActorError>
+│        │◄────│          │  or handler panics → converted to ActorError
+│ gets:  │     │          │    code: Internal
+│ Err(   │     │          │    message: panic message
+│  Actor │     │          │    chain: ["panicked at ..."]
+│  Error)│     └─────────┘
+└────────┘
+
+Remote ask() — cross-node via dactor-mock or real network:
+┌────────┐     ┌──────────┐  serialize   ┌──────────┐     ┌─────────┐
+│ Caller │────►│ Adapter  │────────────►│ Network  │────►│  Actor  │
+│        │     │ (local)  │             │          │     │ (remote)│
+│        │     │          │◄────────────│          │◄────│         │
+│ gets:  │◄────│ deser.   │  ActorError │          │     │ returns │
+│ Err(   │     │ ActorErr │  as bytes   │          │     │ ActorErr│
+│  Actor │     └──────────┘             └──────────┘     └─────────┘
+│  Error)│
+└────────┘
+   ↑ Same ActorError type, fully deserialized — code, message, details, chain intact
+```
+
+**Conversion from standard Rust errors:**
+
+```rust
+impl ActorError {
+    /// Create from any `impl std::error::Error`, capturing the
+    /// source chain as strings.
+    pub fn from_error(code: ErrorCode, err: impl std::error::Error) -> Self {
+        let mut chain = Vec::new();
+        let message = err.to_string();
+        let mut source = err.source();
+        while let Some(cause) = source {
+            chain.push(cause.to_string());
+            source = cause.source();
+        }
         Self {
-            mailbox: MailboxConfig::default(),
-            interceptors: Vec::new(),
+            code,
+            message,
+            details: Vec::new(),
+            chain,
+        }
+    }
+
+    /// Create a simple error with just a code and message.
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details: Vec::new(),
+            chain: Vec::new(),
+        }
+    }
+
+    /// Add a structured detail (builder pattern).
+    pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.details.push(ErrorDetail { key: key.into(), value: value.into() });
+        self
+    }
+}
+```
+
+**Usage in actor handlers:**
+
+```rust
+#[async_trait]
+impl Handler<TransferFunds> for BankAccount {
+    async fn handle(&mut self, msg: TransferFunds, _ctx: &mut ActorContext)
+        -> Result<Receipt, ActorError>
+    {
+        if msg.amount > self.balance {
+            return Err(ActorError::new(ErrorCode::FailedPrecondition, "insufficient funds")
+                .with_detail("balance", self.balance.to_string())
+                .with_detail("requested", msg.amount.to_string()));
+        }
+        // ... process transfer
+        Ok(Receipt { id: "tx-123".into() })
+    }
+}
+```
+
+**Caller side:**
+
+```rust
+match account.ask(TransferFunds { amount: 1000 }).await {
+    Ok(receipt) => println!("Transfer succeeded: {}", receipt.id),
+    Err(RuntimeError::Actor(err)) => {
+        // Programmatic handling based on code:
+        match err.code {
+            ErrorCode::FailedPrecondition => {
+                let balance = err.details.iter()
+                    .find(|d| d.key == "balance")
+                    .map(|d| &d.value);
+                eprintln!("Insufficient funds (balance: {:?}): {}", balance, err.message);
+            }
+            ErrorCode::Timeout => eprintln!("Request timed out, retrying..."),
+            _ => eprintln!("Unexpected error: {}", err.message),
+        }
+        // Full chain for debugging:
+        for (i, cause) in err.chain.iter().enumerate() {
+            eprintln!("  caused by [{}]: {}", i, cause);
+        }
+    }
+    Err(other) => eprintln!("Runtime error: {}", other),
+}
+```
+
+**Updated `RuntimeError` enum:**
+
+The `RuntimeError` enum gains an `Actor` variant for handler-returned errors:
+
+```rust
+pub enum RuntimeError {
+    Send(ActorSendError),
+    Group(GroupError),
+    Cluster(ClusterError),
+    NotSupported(NotSupportedError),
+    Rejected { reason: String },
+    /// Error returned by an actor handler (local or deserialized from remote).
+    Actor(ActorError),
+}
+```
+
+**Relationship to `Outcome::HandlerError`:**
+
+The `Outcome::HandlerError` passed to interceptors' `on_complete` now carries
+the full `ActorError` rather than a plain string:
+
+```rust
+pub enum Outcome {
+    Success,
+    HandlerError { error: ActorError },
+    StreamCompleted { items_emitted: u64 },
+    StreamCancelled { items_emitted: u64 },
+}
+```
+
+### 9.2 Error Mapping per Adapter
+
+| dactor `ErrorCode` | ractor | kameo | coerce |
+|---|---|---|---|
+| `Internal` | `ActorProcessingErr` | Handler panic | Handler error |
+| `ActorNotFound` | Actor cell dead | `SendError::ActorNotRunning` | Actor not in system |
+| `Unavailable` | Spawn failure | Actor not started | Node unreachable |
+| `Timeout` | `call` timeout | `ask` timeout | `send` timeout |
+| `ResourceExhausted` | — | Mailbox full (`try_send` error) | — |
+| `InvalidArgument` | — (application-level) | — (application-level) | — (application-level) |
+| `PermissionDenied` | — (interceptor) | — (interceptor) | — (interceptor) |
+| `FailedPrecondition` | — (application-level) | — (application-level) | — (application-level) |
+| `Unimplemented` | `NotSupported` | `NotSupported` | `NotSupported` |
+| `Unknown` | Catch-all | Catch-all | Catch-all |
+
+---
+
+## 10. Remote Actors
+
+### 10.1 Serialization Contract
+
+**Problem:** When messages cross node boundaries, they must be serialized.
+Not all messages need to be serializable (local-only actors don't need it).
+The design must make this explicit without forcing serialization on all users.
+
+**Design:** A marker trait `RemoteMessage` extends `Message` with serialization
+bounds. Only messages intended for remote actors need to implement it.
+
+```rust
+/// Marker for messages that can cross node boundaries.
+/// Requires serde Serialize + Deserialize in addition to Message.
+pub trait RemoteMessage: Message + Serialize + DeserializeOwned {}
+
+/// Blanket impl: any Message that is also Serialize + DeserializeOwned
+/// automatically implements RemoteMessage.
+impl<M> RemoteMessage for M
+where
+    M: Message + Serialize + DeserializeOwned,
+{}
+```
+
+**Compile-time enforcement:** When an adapter detects a cross-node send
+(the target `ActorId.node` differs from the local node), it requires the
+message to implement `RemoteMessage`. This is enforced at the adapter's
+`tell()` / `ask()` implementation:
+
+```rust
+// Inside adapter's cross-node send path:
+fn send_remote<M: RemoteMessage>(&self, target: ActorId, msg: M) -> Result<(), RuntimeError> {
+    let bytes = bincode::serialize(&msg)
+        .map_err(|e| RuntimeError::Send(ActorSendError(format!("serialization failed: {e}"))))?;
+    self.network.deliver(target, bytes)
+}
+```
+
+**Local sends** never serialize — messages are passed by move through channels.
+This means local-only messages can contain non-serializable types (`Arc`, channels,
+closures) without any issue.
+
+**Schema evolution:** dactor does not prescribe a versioning strategy. Recommended
+approaches (all compatible with serde):
+
+| Strategy | How | When |
+|---|---|---|
+| `#[serde(default)]` | New fields get defaults on old receivers | Adding fields |
+| `#[serde(rename)]` | Field renamed without breaking old format | Renaming fields |
+| `#[serde(deny_unknown_fields)]` | Strict: reject messages with unexpected fields | Strict compatibility |
+| Protobuf / flatbuffers | Use a schema-evolution-native format via custom `MessageCodec` | Complex evolution |
+| Envelope version header | Add a `SchemaVersion(u32)` header; handler checks before processing | Explicit versioning |
+
+### 10.2 Remote Actor Call Example
+
+**Remote actor call example:**
+
+Messages used for remote calls must implement `Serialize + Deserialize` so
+they can cross node boundaries. The caller uses the same `tell()` / `ask()`
+API — the adapter handles serialization transparently. Errors from the
+remote actor arrive as structured `ActorError` (see §3.14).
+
+```rust
+use dactor::prelude::*;
+use serde::{Serialize, Deserialize};
+
+// ── Messages must be serializable for remote calls ─────────
+
+#[derive(Serialize, Deserialize)]
+struct TransferFunds {
+    from_account: String,
+    to_account: String,
+    amount: u64,
+}
+impl Message for TransferFunds {
+    type Reply = Result<Receipt, ActorError>;
+}
+
+#[derive(Serialize, Deserialize)]
+struct Receipt {
+    transaction_id: String,
+    new_balance: u64,
+}
+
+// ── Actor lives on a remote node ────────────────────────────
+
+struct BankAccount {
+    account_id: String,
+    balance: u64,
+}
+
+impl Actor for BankAccount {}
+
+#[async_trait]
+impl Handler<TransferFunds> for BankAccount {
+    async fn handle(
+        &mut self,
+        msg: TransferFunds,
+        _ctx: &mut ActorContext,
+    ) -> Result<Receipt, ActorError> {
+        if msg.amount > self.balance {
+            return Err(
+                ActorError::new(ErrorCode::FailedPrecondition, "insufficient funds")
+                    .with_detail("balance", self.balance.to_string())
+                    .with_detail("requested", msg.amount.to_string()),
+            );
+        }
+        self.balance -= msg.amount;
+        Ok(Receipt {
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            new_balance: self.balance,
+        })
+    }
+}
+
+// ── Caller on a different node ──────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    let runtime = dactor_ractor::RactorRuntime::new();
+
+    // Obtain a reference to an actor on a remote node.
+    // The ActorRef<BankAccount> is location-transparent — the caller
+    // doesn't know or care whether the actor is local or remote.
+    let remote_account: ActorRef<BankAccount> = runtime
+        .lookup("bank-account-alice")       // registry lookup
+        .await
+        .expect("actor not found");
+
+    // Remote ask — message is serialized, sent over the network,
+    // deserialized on the remote node, handled by BankAccount,
+    // reply is serialized back and deserialized on the caller side.
+    match remote_account.ask(TransferFunds {
+        from_account: "alice".into(),
+        to_account: "bob".into(),
+        amount: 500,
+    }).await {
+        Ok(Ok(receipt)) => {
+            println!("Transfer succeeded: tx={}, balance={}",
+                receipt.transaction_id, receipt.new_balance);
+        }
+        Ok(Err(actor_err)) => {
+            // Structured error from the remote actor (deserialized)
+            eprintln!("Transfer failed: [{}] {}",
+                actor_err.code, actor_err.message);
+            for detail in &actor_err.details {
+                eprintln!("  {}: {}", detail.key, detail.value);
+            }
+        }
+        Err(runtime_err) => {
+            // Infrastructure error (network, timeout, serialization, etc.)
+            eprintln!("Runtime error: {}", runtime_err);
         }
     }
 }
 ```
 
-Updated `ActorRuntime::spawn`:
+**What happens under the hood for a remote `ask()`:**
+
+```
+Caller Node                                              Remote Node
+┌─────────────┐                                    ┌──────────────────┐
+│ ask(Transfer │                                    │   BankAccount    │
+│   Funds)     │                                    │   actor handler  │
+└──────┬──────┘                                    └────────┬─────────┘
+       │  1. serialize(TransferFunds)                       │
+       │  2. send bytes + reply channel ID                  │
+       │─────────────────────────────────────────────────►  │
+       │                                                    │  3. deserialize(TransferFunds)
+       │                                                    │  4. run interceptor chain
+       │                                                    │  5. handler(&mut self, msg)
+       │                                                    │  6. returns Result<Receipt, ActorError>
+       │  8. deserialize reply                              │
+       │  ◄─────────────────────────────────────────────────│  7. serialize reply
+       │  9. return to caller                               │
+       ▼                                                    │
+  Ok(receipt) or                                            │
+  Ok(ActorError) or                                         │
+  Err(RuntimeError)                                         │
+```
+
+**Three layers of errors the caller may see:**
+
+| Layer | Type | Example | When |
+|---|---|---|---|
+| **Business error** | `ActorError` (inside `Ok`) | Insufficient funds, validation failure | Handler returns `Err(ActorError)` — this is application-level, serialized cleanly |
+| **Runtime error** | `RuntimeError::Actor(ActorError)` | Handler panicked, unhandled exception | Handler panics — adapter captures and wraps as `ActorError` |
+| **Infrastructure error** | `RuntimeError::Send` / `NotSupported` | Network timeout, node down, serialization failure | Message never reached the actor or reply was lost |
+
+---
+
+## 11. Observability
+
+### 11.1 Overview
+
+**Problem:** In production, operators need visibility into actor system health:
+which actors are busiest, which fail most, what message sizes look like, how
+long handlers take. Building this into every actor's handler code is
+error-prone and repetitive.
+
+**Design:** dactor provides observability primarily through the **interceptor
+pipeline** (§3.2). Because interceptors see every message with full context
+(`InterceptContext`), they are the natural place to collect metrics. dactor
+also provides a built-in `MetricsInterceptor` and a `RuntimeMetrics` query
+API for common operational needs.
+
+#### 11.2 Built-in `MetricsInterceptor`
+
+A ready-to-use interceptor that tracks per-actor and per-message-type
+statistics. Users register it once; it collects everything automatically.
 
 ```rust
-pub trait ActorRuntime: Send + Sync + 'static {
-    // Simple spawn (backward-compatible)
-    fn spawn<M, H>(&self, name: &str, handler: H) -> Self::Ref<M>
-    where
-        M: Send + 'static,
-        H: FnMut(M) + Send + 'static;
+/// Built-in interceptor that collects runtime-level metrics.
+/// Register via `runtime.add_interceptor(Box::new(MetricsInterceptor::new()))`.
+pub struct MetricsInterceptor {
+    inner: Arc<MetricsStore>,
+}
 
-    // Spawn with configuration
-    fn spawn_with_config<M, H>(
-        &self,
-        name: &str,
-        config: SpawnConfig,
-        handler: H,
-    ) -> Self::Ref<M>
-    where
-        M: Send + 'static,
-        H: FnMut(M) + Send + 'static;
+impl MetricsInterceptor {
+    pub fn new() -> Self { ... }
 
-    // ... timers, groups, cluster events ...
+    /// Access the collected metrics for querying.
+    pub fn metrics(&self) -> &MetricsStore { ... }
+}
+
+impl Interceptor for MetricsInterceptor {
+    fn on_receive(&self, ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+        self.inner.record_receive(ctx);
+        Disposition::Continue
+    }
+
+    fn on_complete(&self, ctx: &InterceptContext<'_>, _headers: &Headers, outcome: &Outcome) {
+        self.inner.record_complete(ctx, outcome);
+    }
+
+    fn on_stream_item(&self, ctx: &InterceptContext<'_>, _headers: &Headers, seq: u64) {
+        self.inner.record_stream_item(ctx, seq);
+    }
 }
 ```
 
-### 3.10 Feature-Gated Test Support
+#### 11.3 `MetricsStore` Query API
+
+```rust
+/// Queryable metrics collected by `MetricsInterceptor`.
+pub struct MetricsStore { /* internal concurrent maps */ }
+
+impl MetricsStore {
+    // ── Per-actor metrics ───────────────────────────────
+
+    /// Total messages received by each actor (sorted descending = busiest first).
+    pub fn busiest_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
+
+    /// Actors with the most handler errors (sorted descending = most failed first).
+    pub fn most_failed_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
+
+    /// Actors with the highest average handler latency.
+    pub fn slowest_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
+
+    /// Metrics for a specific actor.
+    pub fn actor(&self, id: ActorId) -> Option<ActorMetrics>;
+
+    // ── Per-message-type metrics ────────────────────────
+
+    /// Message types with the highest volume.
+    pub fn busiest_message_types(&self, top_n: usize) -> Vec<MessageTypeMetrics>;
+
+    // ── Global metrics ──────────────────────────────────
+
+    /// Total messages processed across all actors.
+    pub fn total_messages(&self) -> u64;
+
+    /// Total errors across all actors.
+    pub fn total_errors(&self) -> u64;
+
+    /// Reset all counters.
+    pub fn reset(&self);
+}
+
+/// Per-actor statistics.
+#[derive(Debug, Clone)]
+pub struct ActorMetrics {
+    pub actor_id: ActorId,
+    pub actor_name: String,
+    /// Total messages received (tell + ask + stream requests).
+    pub messages_received: u64,
+    /// Total handler errors.
+    pub errors: u64,
+    /// Total handler invocations that succeeded.
+    pub successes: u64,
+    /// Average handler latency.
+    pub avg_latency: Duration,
+    /// Maximum handler latency observed.
+    pub max_latency: Duration,
+    /// Total stream items emitted (if actor handles streams).
+    pub stream_items_emitted: u64,
+    /// Count of messages received per priority level.
+    pub by_priority: HashMap<Priority, u64>,
+    /// Count of remote vs local messages.
+    pub remote_messages: u64,
+    pub local_messages: u64,
+}
+
+/// Per-message-type statistics.
+#[derive(Debug, Clone)]
+pub struct MessageTypeMetrics {
+    pub message_type: String,
+    pub count: u64,
+    pub errors: u64,
+    pub avg_latency: Duration,
+}
+```
+
+#### 11.4 Custom Interceptor Examples
+
+The built-in `MetricsInterceptor` covers common needs. For specialized
+observability, users write custom interceptors:
+
+**Example: Message size tracking**
+
+```rust
+use std::mem;
+
+struct MessageSizeInterceptor {
+    sizes: Arc<Mutex<HashMap<String, Vec<usize>>>>,
+}
+
+impl Interceptor for MessageSizeInterceptor {
+    fn on_receive(&self, ctx: &InterceptContext<'_>, _headers: &mut Headers) -> Disposition {
+        // std::mem::size_of gives the stack size of the message type.
+        // For heap-allocated content, use a custom SizeOf header set by the sender.
+        let mut sizes = self.sizes.lock().unwrap();
+        sizes.entry(ctx.message_type.to_string())
+            .or_default()
+            .push(mem::size_of_val(ctx.message_type));  // illustrative
+        Disposition::Continue
+    }
+}
+
+// For accurate message size tracking with heap data, use a header:
+pub struct MessageSize(pub usize);
+impl HeaderValue for MessageSize { ... }
+
+// Sender sets it:
+let mut env = Envelope::from(my_large_message);
+env.headers.insert(MessageSize(serialized_bytes.len()));
+actor.tell_envelope(env)?;
+```
+
+**Example: Slow handler alerting**
+
+```rust
+use std::time::Instant;
+
+struct SlowHandlerInterceptor {
+    threshold: Duration,
+}
+
+impl Interceptor for SlowHandlerInterceptor {
+    fn on_receive(&self, _ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+        // Stash the start time in a header for on_complete to read.
+        headers.insert(HandlerStartTime(Instant::now()));
+        Disposition::Continue
+    }
+
+    fn on_complete(&self, ctx: &InterceptContext<'_>, headers: &Headers, outcome: &Outcome) {
+        if let Some(start) = headers.get::<HandlerStartTime>() {
+            let elapsed = start.0.elapsed();
+            if elapsed > self.threshold {
+                tracing::warn!(
+                    actor = ctx.actor_name,
+                    message = ctx.message_type,
+                    elapsed_ms = elapsed.as_millis(),
+                    "slow handler detected"
+                );
+            }
+        }
+    }
+}
+
+struct HandlerStartTime(Instant);
+impl HeaderValue for HandlerStartTime { ... }
+```
+
+**Example: Error rate circuit breaker**
+
+```rust
+struct CircuitBreakerInterceptor {
+    error_counts: Arc<DashMap<ActorId, AtomicU64>>,
+    threshold: u64,
+}
+
+impl Interceptor for CircuitBreakerInterceptor {
+    fn on_receive(&self, ctx: &InterceptContext<'_>, _headers: &mut Headers) -> Disposition {
+        let count = self.error_counts
+            .entry(ctx.actor_id)
+            .or_insert(AtomicU64::new(0));
+        if count.load(Ordering::Relaxed) >= self.threshold {
+            return Disposition::Reject(
+                format!("actor {} circuit breaker open ({} consecutive errors)",
+                    ctx.actor_name, self.threshold)
+            );
+        }
+        Disposition::Continue
+    }
+
+    fn on_complete(&self, ctx: &InterceptContext<'_>, _headers: &Headers, outcome: &Outcome) {
+        match outcome {
+            Outcome::Success => {
+                // Reset on success
+                if let Some(count) = self.error_counts.get(&ctx.actor_id) {
+                    count.store(0, Ordering::Relaxed);
+                }
+            }
+            Outcome::HandlerError { .. } => {
+                self.error_counts
+                    .entry(ctx.actor_id)
+                    .or_insert(AtomicU64::new(0))
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+**Example: OpenTelemetry tracing (via dcontext)**
+
+```rust
+use dcontext::{TraceContext, SpanContext};
+
+struct OtelInterceptor;
+
+impl Interceptor for OtelInterceptor {
+    fn on_receive(&self, ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+        // Extract trace context from headers (injected by sender)
+        let parent = headers.get::<TraceContext>();
+
+        // Create a child span for this handler invocation
+        let span = tracer::start_span(ctx.message_type)
+            .with_parent(parent)
+            .with_attribute("actor.id", ctx.actor_id.to_string())
+            .with_attribute("actor.name", ctx.actor_name)
+            .with_attribute("send.mode", format!("{:?}", ctx.send_mode))
+            .with_attribute("remote", ctx.remote)
+            .start();
+
+        // Stash the span in headers for on_complete to close it
+        headers.insert(SpanContext(span));
+        Disposition::Continue
+    }
+
+    fn on_complete(&self, _ctx: &InterceptContext<'_>, headers: &Headers, outcome: &Outcome) {
+        if let Some(span_ctx) = headers.get::<SpanContext>() {
+            match outcome {
+                Outcome::Success => span_ctx.0.set_status(StatusCode::Ok),
+                Outcome::HandlerError { error } => {
+                    span_ctx.0.set_status(StatusCode::Error);
+                    span_ctx.0.record_error(&error.message);
+                }
+                _ => {}
+            }
+            span_ctx.0.end();
+        }
+    }
+}
+```
+
+#### 11.5 Registering Multiple Interceptors
+
+Interceptors are composable. A typical production setup:
+
+```rust
+let metrics = MetricsInterceptor::new();
+let metrics_store = metrics.metrics().clone();  // for querying later
+
+runtime.add_interceptor(Box::new(OtelInterceptor))?;
+runtime.add_interceptor(Box::new(metrics))?;
+runtime.add_interceptor(Box::new(SlowHandlerInterceptor { threshold: Duration::from_secs(1) }))?;
+runtime.add_interceptor(Box::new(CircuitBreakerInterceptor::new(10)))?;
+
+// Later: query metrics
+let top_5_busiest = metrics_store.busiest_actors(5);
+let top_5_failing = metrics_store.most_failed_actors(5);
+```
+
+Interceptors execute in registration order. The pipeline is:
+`OTel → Metrics → SlowHandler → CircuitBreaker → Actor Handler → CircuitBreaker.on_complete → SlowHandler.on_complete → Metrics.on_complete → OTel.on_complete`
+
+---
+
+## 12. Testing
+
+### 12.1 Feature-Gated Test Support
 
 **Rationale:** `TestClock`, `TestRuntime`, `TestClusterEvents` are test
 utilities. They should not be compiled into production binaries.
@@ -1057,118 +2286,7 @@ Downstream crates use:
 dactor = { version = "0.2", features = ["test-support"] }
 ```
 
-### 3.11 Revised `ActorRuntime` Trait (Complete)
-
-```rust
-pub trait ActorRuntime: Send + Sync + 'static {
-    type Ref<M: Send + 'static>: ActorRef<M>;
-    type Events: ClusterEvents;
-    type Timer: TimerHandle;
-
-    // ── Spawning ────────────────────────────────────────
-    fn spawn<M, H>(&self, name: &str, handler: H) -> Self::Ref<M>
-    where M: Send + 'static, H: FnMut(M) + Send + 'static;
-
-    /// Spawn with per-actor configuration (mailbox, interceptors).
-    /// Returns `Err(NotSupported)` for config options the adapter can't honor.
-    fn spawn_with_config<M, H>(
-        &self, name: &str, config: SpawnConfig, handler: H,
-    ) -> Result<Self::Ref<M>, RuntimeError>
-    where M: Send + 'static, H: FnMut(M) + Send + 'static;
-
-    // ── Timers ──────────────────────────────────────────
-    fn send_interval<M: Clone + Send + 'static>(
-        &self, target: &Self::Ref<M>, interval: Duration, msg: M,
-    ) -> Self::Timer;
-
-    fn send_after<M: Send + 'static>(
-        &self, target: &Self::Ref<M>, delay: Duration, msg: M,
-    ) -> Self::Timer;
-
-    // ── Processing Groups ───────────────────────────────
-    fn join_group<M: Send + 'static>(
-        &self, group: &str, actor: &Self::Ref<M>,
-    ) -> Result<(), RuntimeError>;
-
-    fn leave_group<M: Send + 'static>(
-        &self, group: &str, actor: &Self::Ref<M>,
-    ) -> Result<(), RuntimeError>;
-
-    fn broadcast_group<M: Clone + Send + 'static>(
-        &self, group: &str, msg: M,
-    ) -> Result<(), RuntimeError>;
-
-    fn get_group_members<M: Send + 'static>(
-        &self, group: &str,
-    ) -> Result<Vec<Self::Ref<M>>, RuntimeError>;
-
-    // ── Supervision / DeathWatch ────────────────────────
-    /// Watch an actor for termination.
-    /// Returns `Err(NotSupported)` if the adapter doesn't support it.
-    fn watch<M: Send + 'static>(
-        &self, watcher: &Self::Ref<M>, target: ActorId,
-    ) -> Result<(), RuntimeError>;
-
-    fn unwatch<M: Send + 'static>(
-        &self, watcher: &Self::Ref<M>, target: ActorId,
-    ) -> Result<(), RuntimeError>;
-
-    // ── Cluster ─────────────────────────────────────────
-    fn cluster_events(&self) -> &Self::Events;
-
-    // ── Global Interceptors ─────────────────────────────
-    /// Register a global interceptor applied to all actors.
-    /// Returns `Err(NotSupported)` if the adapter doesn't support interceptors.
-    fn add_interceptor(&self, interceptor: Box<dyn Interceptor>) -> Result<(), RuntimeError>;
-
-    // ── Capability Introspection ────────────────────────
-    /// Query which capabilities this runtime supports.
-    /// Callers can pre-flight requirements at startup rather than
-    /// discovering `NotSupported` errors mid-flight.
-    fn capabilities(&self) -> RuntimeCapabilities;
-}
-
-/// Describes which optional capabilities a runtime adapter supports.
-/// Returned by `ActorRuntime::capabilities()`.
-#[derive(Debug, Clone)]
-pub struct RuntimeCapabilities {
-    pub ask: bool,
-    pub stream: bool,
-    pub watch: bool,
-    pub bounded_mailbox: bool,
-    pub priority_mailbox: bool,
-    pub interceptors: bool,
-}
-```
-
-### 3.12 Default Implementations via `RuntimeError::NotSupported`
-
-Capabilities that are universally available (tell, spawn, timers) never return
-`NotSupported`. Capabilities that may not be available in every adapter
-(watch, ask, certain mailbox configs) return `Result<_, RuntimeError>`.
-
-Adapters have three strategies for each method:
-
-| Strategy | When to use | Example |
-|---|---|---|
-| **Native mapping** | The underlying framework directly supports the operation | ractor `call()` → dactor `ask()` |
-| **Adapter-layer shim** | The framework lacks the API but the adapter can emulate it | ractor bounded mailbox via wrapper channel |
-| **`NotSupported`** | The feature genuinely can't be provided | `OverflowStrategy::DropOldest` on ractor |
-
-```rust
-// Example: adapter that doesn't support watch
-fn watch<M: Send + 'static>(
-    &self, _watcher: &Self::Ref<M>, _target: ActorId,
-) -> Result<(), RuntimeError> {
-    Err(RuntimeError::NotSupported(NotSupportedError {
-        operation: "watch",
-        adapter: "dactor-example",
-        detail: Some("underlying framework has no death watch API".into()),
-    }))
-}
-```
-
-### 3.13 Mock Cluster Crate (`dactor-mock`)
+### 12.2 Mock Cluster Crate (`dactor-mock`)
 
 **Rationale:** The existing `test_support` module in the `dactor` core crate
 provides `TestRuntime` — a single-node, in-memory mock useful for unit-testing
@@ -1507,456 +2625,7 @@ bincode = "1"          # default codec
 | **Inspection** | N/A | In-flight count, dropped count, corrupted count, `flush()` |
 | **Use case** | Unit testing single actors | Integration testing cluster behavior, chaos testing |
 
-### 3.14 Error Model for Remote Actor Calls
-
-**Problem:** When a caller makes a remote `ask()` and the actor fails, what
-error can be sent back? Rust's `dyn Error` is **not serializable** — it
-contains vtable pointers and type IDs that are meaningless across processes.
-Returning a raw `String` loses structure. We need a serializable, structured
-error type that gives callers enough information to handle failures
-programmatically.
-
-**Design inspiration:**
-- **gRPC** `Status` — code + message + structured details (protobuf `Any`)
-- **Erlang** — `{error, Reason}` where Reason is any serializable term
-- **Akka** — `StatusReply` with `Status.Failure(exception)` (JVM-serializable)
-
-**Approach:** Define `ActorError` — a structured, serializable error type
-that carries a category code (for programmatic handling), a human-readable
-message (for logging), optional structured details (for debugging), and an
-optional error chain (as strings, since the original error objects can't
-cross the wire).
-
-```rust
-use serde::{Serialize, Deserialize};
-
-/// A structured, serializable error returned by actor handlers.
-///
-/// This is the error type that crosses node boundaries. It replaces
-/// `Box<dyn Error>` in the remote case. Local calls can convert from
-/// any `impl Error` via `From` impls.
-///
-/// Inspired by gRPC's Status model (code + message + details).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActorError {
-    /// Machine-readable error category for programmatic handling.
-    pub code: ErrorCode,
-
-    /// Human-readable error message (for logging / user display).
-    pub message: String,
-
-    /// Optional structured details — serializable key-value pairs
-    /// for debugging, retry hints, validation errors, etc.
-    /// Kept as `Vec` rather than `HashMap` to preserve insertion order
-    /// and allow repeated keys.
-    pub details: Vec<ErrorDetail>,
-
-    /// Error chain — string representations of the causal chain
-    /// (`source()` chain in Rust). The original error objects can't
-    /// be serialized, but their Display strings can.
-    /// Index 0 is the immediate cause, index N is the root cause.
-    pub chain: Vec<String>,
-}
-
-/// Machine-readable error category, modeled after gRPC status codes
-/// but tailored for actor systems.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum ErrorCode {
-    /// The actor's handler returned an error or panicked.
-    /// Analogous to gRPC `INTERNAL`.
-    Internal,
-
-    /// The message was invalid or the actor rejected it on
-    /// business-logic grounds.
-    /// Analogous to gRPC `INVALID_ARGUMENT`.
-    InvalidArgument,
-
-    /// The actor could not be found or has stopped.
-    /// Analogous to gRPC `NOT_FOUND`.
-    ActorNotFound,
-
-    /// The actor is alive but not ready to process messages
-    /// (e.g., still initializing, shutting down).
-    /// Analogous to gRPC `UNAVAILABLE`.
-    Unavailable,
-
-    /// The operation timed out (e.g., ask timeout).
-    /// Analogous to gRPC `DEADLINE_EXCEEDED`.
-    Timeout,
-
-    /// The caller is not authorized to send this message.
-    /// Analogous to gRPC `PERMISSION_DENIED`.
-    PermissionDenied,
-
-    /// A precondition for the operation was not met
-    /// (e.g., state machine in wrong state).
-    /// Analogous to gRPC `FAILED_PRECONDITION`.
-    FailedPrecondition,
-
-    /// The actor or system is overloaded (e.g., mailbox full,
-    /// rate limit exceeded).
-    /// Analogous to gRPC `RESOURCE_EXHAUSTED`.
-    ResourceExhausted,
-
-    /// The operation is not implemented by this actor or adapter.
-    /// Analogous to gRPC `UNIMPLEMENTED`.
-    Unimplemented,
-
-    /// Catch-all for errors that don't fit other categories.
-    /// Analogous to gRPC `UNKNOWN`.
-    Unknown,
-}
-
-/// A single key-value detail attached to an `ActorError`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorDetail {
-    pub key: String,
-    pub value: String,
-}
-```
-
-**How errors flow in different scenarios:**
-
-```
-Local ask() — same process:
-┌────────┐     ┌─────────┐
-│ Caller │────►│  Actor   │  handler returns Result<Reply, ActorError>
-│        │◄────│          │  or handler panics → converted to ActorError
-│ gets:  │     │          │    code: Internal
-│ Err(   │     │          │    message: panic message
-│  Actor │     │          │    chain: ["panicked at ..."]
-│  Error)│     └─────────┘
-└────────┘
-
-Remote ask() — cross-node via dactor-mock or real network:
-┌────────┐     ┌──────────┐  serialize   ┌──────────┐     ┌─────────┐
-│ Caller │────►│ Adapter  │────────────►│ Network  │────►│  Actor  │
-│        │     │ (local)  │             │          │     │ (remote)│
-│        │     │          │◄────────────│          │◄────│         │
-│ gets:  │◄────│ deser.   │  ActorError │          │     │ returns │
-│ Err(   │     │ ActorErr │  as bytes   │          │     │ ActorErr│
-│  Actor │     └──────────┘             └──────────┘     └─────────┘
-│  Error)│
-└────────┘
-   ↑ Same ActorError type, fully deserialized — code, message, details, chain intact
-```
-
-**Conversion from standard Rust errors:**
-
-```rust
-impl ActorError {
-    /// Create from any `impl std::error::Error`, capturing the
-    /// source chain as strings.
-    pub fn from_error(code: ErrorCode, err: impl std::error::Error) -> Self {
-        let mut chain = Vec::new();
-        let message = err.to_string();
-        let mut source = err.source();
-        while let Some(cause) = source {
-            chain.push(cause.to_string());
-            source = cause.source();
-        }
-        Self {
-            code,
-            message,
-            details: Vec::new(),
-            chain,
-        }
-    }
-
-    /// Create a simple error with just a code and message.
-    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            details: Vec::new(),
-            chain: Vec::new(),
-        }
-    }
-
-    /// Add a structured detail (builder pattern).
-    pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.details.push(ErrorDetail { key: key.into(), value: value.into() });
-        self
-    }
-}
-```
-
-**Usage in actor handlers:**
-
-```rust
-#[async_trait]
-impl Handler<TransferFunds> for BankAccount {
-    async fn handle(&mut self, msg: TransferFunds, _ctx: &mut ActorContext)
-        -> Result<Receipt, ActorError>
-    {
-        if msg.amount > self.balance {
-            return Err(ActorError::new(ErrorCode::FailedPrecondition, "insufficient funds")
-                .with_detail("balance", self.balance.to_string())
-                .with_detail("requested", msg.amount.to_string()));
-        }
-        // ... process transfer
-        Ok(Receipt { id: "tx-123".into() })
-    }
-}
-```
-
-**Caller side:**
-
-```rust
-match account.ask(TransferFunds { amount: 1000 }).await {
-    Ok(receipt) => println!("Transfer succeeded: {}", receipt.id),
-    Err(RuntimeError::Actor(err)) => {
-        // Programmatic handling based on code:
-        match err.code {
-            ErrorCode::FailedPrecondition => {
-                let balance = err.details.iter()
-                    .find(|d| d.key == "balance")
-                    .map(|d| &d.value);
-                eprintln!("Insufficient funds (balance: {:?}): {}", balance, err.message);
-            }
-            ErrorCode::Timeout => eprintln!("Request timed out, retrying..."),
-            _ => eprintln!("Unexpected error: {}", err.message),
-        }
-        // Full chain for debugging:
-        for (i, cause) in err.chain.iter().enumerate() {
-            eprintln!("  caused by [{}]: {}", i, cause);
-        }
-    }
-    Err(other) => eprintln!("Runtime error: {}", other),
-}
-```
-
-**Updated `RuntimeError` enum:**
-
-The `RuntimeError` enum gains an `Actor` variant for handler-returned errors:
-
-```rust
-pub enum RuntimeError {
-    Send(ActorSendError),
-    Group(GroupError),
-    Cluster(ClusterError),
-    NotSupported(NotSupportedError),
-    Rejected { reason: String },
-    /// Error returned by an actor handler (local or deserialized from remote).
-    Actor(ActorError),
-}
-```
-
-**Relationship to `Outcome::HandlerError`:**
-
-The `Outcome::HandlerError` passed to interceptors' `on_complete` now carries
-the full `ActorError` rather than a plain string:
-
-```rust
-pub enum Outcome {
-    Success,
-    HandlerError { error: ActorError },
-    StreamCompleted { items_emitted: u64 },
-    StreamCancelled { items_emitted: u64 },
-}
-```
-
-### 3.15 Watch Notification Delivery
-
-**Problem:** When an actor calls `watch(target)`, how does it receive the
-`ChildTerminated` notification? Does the runtime inject a synthetic message,
-or must the actor explicitly implement a handler for it?
-
-**Decision:** The actor must implement `Handler<ChildTerminated>`. This is
-explicit, type-safe, and consistent with the Handler pattern — no magic
-injection.
-
-```rust
-/// Notification delivered when a watched actor terminates.
-/// Actors that call `watch()` must implement `Handler<ChildTerminated>`
-/// to receive these notifications.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChildTerminated {
-    pub child_id: ActorId,
-    pub child_name: String,
-    /// `None` for graceful shutdown, `Some(reason)` for failure.
-    pub reason: Option<String>,
-}
-
-impl Message for ChildTerminated {
-    type Reply = ();
-}
-```
-
-**Usage:**
-
-```rust
-struct Supervisor {
-    children: Vec<ActorId>,
-}
-
-impl Actor for Supervisor {}
-
-#[async_trait]
-impl Handler<ChildTerminated> for Supervisor {
-    async fn handle(&mut self, msg: ChildTerminated, ctx: &mut ActorContext) {
-        tracing::warn!(child = %msg.child_id, reason = ?msg.reason, "child died");
-        self.children.retain(|id| *id != msg.child_id);
-        // Optionally restart the child
-    }
-}
-```
-
-If an actor calls `watch()` but does **not** implement `Handler<ChildTerminated>`,
-the notification is silently dropped (same as an unhandled message). This
-avoids forcing every actor to handle termination events.
-
-### 3.16 Dead Letter Handling
-
-**Problem:** Messages can be lost in several ways: actor stopped before
-consuming them, mailbox overflow with `DropNewest`/`DropOldest`, interceptor
-`Drop`/`Reject`, network failure. What happens to these messages?
-
-**Design:** dactor provides a configurable dead letter sink. Lost messages
-are forwarded to a `DeadLetterHandler` which can log, count, alert, or
-store them for debugging.
-
-```rust
-/// A handler for messages that could not be delivered.
-pub trait DeadLetterHandler: Send + Sync + 'static {
-    /// Called when a message is lost. The message body is type-erased
-    /// (serialized to bytes if possible, otherwise `None`).
-    fn on_dead_letter(&self, event: DeadLetterEvent);
-}
-
-/// Describes a message that was not delivered.
-#[derive(Debug)]
-pub struct DeadLetterEvent {
-    /// Why the message was not delivered.
-    pub reason: DeadLetterReason,
-    /// The target actor (may no longer exist).
-    pub target_actor: ActorId,
-    /// The target actor's name.
-    pub target_name: String,
-    /// The Rust type name of the message.
-    pub message_type: &'static str,
-    /// Headers from the envelope (if available).
-    pub headers: Option<Headers>,
-}
-
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum DeadLetterReason {
-    /// The target actor has stopped.
-    ActorStopped,
-    /// The mailbox was full and the overflow strategy discarded the message.
-    MailboxOverflow,
-    /// An interceptor dropped the message.
-    InterceptorDrop,
-    /// An interceptor rejected the message.
-    InterceptorReject { reason: String },
-    /// Network delivery failed (remote actor unreachable).
-    NetworkFailure { detail: String },
-}
-```
-
-**Registration:**
-
-```rust
-impl ActorRuntime {
-    /// Set the dead letter handler. Only one handler is active at a time.
-    /// Default: `LoggingDeadLetterHandler` which logs at WARN level.
-    fn set_dead_letter_handler(&self, handler: Box<dyn DeadLetterHandler>);
-}
-```
-
-**Built-in handlers:**
-
-```rust
-/// Logs dead letters at WARN level (default).
-pub struct LoggingDeadLetterHandler;
-
-/// Counts dead letters and exposes metrics.
-pub struct CountingDeadLetterHandler { /* AtomicU64 counters */ }
-
-/// Discards dead letters silently (for tests or high-throughput systems).
-pub struct NullDeadLetterHandler;
-```
-
-### 3.17 Message Ordering Guarantees
-
-Ordering is a fundamental contract that actors rely on. dactor specifies:
-
-1. **Same sender → same actor:** Messages are delivered in send order (FIFO
-   within the same priority level). This matches all 6 surveyed frameworks.
-
-2. **Different senders → same actor:** No ordering guarantee between senders.
-   Messages from sender A and sender B may interleave arbitrarily.
-
-3. **Priority mailbox:** Messages are ordered by priority first, then FIFO
-   within each priority level. A `High` message sent after a `Low` message
-   will be delivered first.
-
-4. **Timer-injected messages:** Timer messages (`send_after`, `send_interval`)
-   enter the mailbox like any other message and follow mailbox ordering rules.
-   They have `Priority::Normal` unless sent via envelope with explicit priority.
-
-5. **Handler execution:** Handlers on the same actor execute **sequentially**
-   (one at a time), never concurrently. This is the fundamental actor model
-   guarantee — no locking needed inside handlers.
-
-6. **Cross-node messages:** No ordering guarantee across nodes. Network latency,
-   retries, and partitions can reorder messages. Applications requiring
-   cross-node ordering should use sequence numbers or vector clocks.
-
-### 3.18 Remote Serialization Contract
-
-**Problem:** When messages cross node boundaries, they must be serialized.
-Not all messages need to be serializable (local-only actors don't need it).
-The design must make this explicit without forcing serialization on all users.
-
-**Design:** A marker trait `RemoteMessage` extends `Message` with serialization
-bounds. Only messages intended for remote actors need to implement it.
-
-```rust
-/// Marker for messages that can cross node boundaries.
-/// Requires serde Serialize + Deserialize in addition to Message.
-pub trait RemoteMessage: Message + Serialize + DeserializeOwned {}
-
-/// Blanket impl: any Message that is also Serialize + DeserializeOwned
-/// automatically implements RemoteMessage.
-impl<M> RemoteMessage for M
-where
-    M: Message + Serialize + DeserializeOwned,
-{}
-```
-
-**Compile-time enforcement:** When an adapter detects a cross-node send
-(the target `ActorId.node` differs from the local node), it requires the
-message to implement `RemoteMessage`. This is enforced at the adapter's
-`tell()` / `ask()` implementation:
-
-```rust
-// Inside adapter's cross-node send path:
-fn send_remote<M: RemoteMessage>(&self, target: ActorId, msg: M) -> Result<(), RuntimeError> {
-    let bytes = bincode::serialize(&msg)
-        .map_err(|e| RuntimeError::Send(ActorSendError(format!("serialization failed: {e}"))))?;
-    self.network.deliver(target, bytes)
-}
-```
-
-**Local sends** never serialize — messages are passed by move through channels.
-This means local-only messages can contain non-serializable types (`Arc`, channels,
-closures) without any issue.
-
-**Schema evolution:** dactor does not prescribe a versioning strategy. Recommended
-approaches (all compatible with serde):
-
-| Strategy | How | When |
-|---|---|---|
-| `#[serde(default)]` | New fields get defaults on old receivers | Adding fields |
-| `#[serde(rename)]` | Field renamed without breaking old format | Renaming fields |
-| `#[serde(deny_unknown_fields)]` | Strict: reject messages with unexpected fields | Strict compatibility |
-| Protobuf / flatbuffers | Use a schema-evolution-native format via custom `MessageCodec` | Complex evolution |
-| Envelope version header | Add a `SchemaVersion(u32)` header; handler checks before processing | Explicit versioning |
-
-### 3.19 Adapter Conformance Test Suite
+### 12.3 Adapter Conformance Test Suite
 
 **Problem:** With multiple traits and capabilities, adapters risk subtle
 incompleteness — an adapter might forget to run interceptors on stream
@@ -2014,20 +2683,229 @@ pub async fn run_all<R: ActorRuntime>(runtime: &R) {
 **Error mapping tables** — each adapter documents how it maps the underlying
 library's errors to dactor's `ErrorCode`:
 
-| dactor `ErrorCode` | ractor | kameo | coerce |
-|---|---|---|---|
-| `Internal` | `ActorProcessingErr` | Handler panic | Handler error |
-| `ActorNotFound` | Actor cell dead | `SendError::ActorNotRunning` | Actor not in system |
-| `Unavailable` | Spawn failure | Actor not started | Node unreachable |
-| `Timeout` | `call` timeout | `ask` timeout | `send` timeout |
-| `ResourceExhausted` | — | Mailbox full (`try_send` error) | — |
-| `InvalidArgument` | — (application-level) | — (application-level) | — (application-level) |
-| `PermissionDenied` | — (interceptor) | — (interceptor) | — (interceptor) |
-| `FailedPrecondition` | — (application-level) | — (application-level) | — (application-level) |
-| `Unimplemented` | `NotSupported` | `NotSupported` | `NotSupported` |
-| `Unknown` | Catch-all | Catch-all | Catch-all |
+---
 
-### 3.20 Proc-Macro Error Handling
+## 13. Developer Experience
+
+### 13.1 Proc-Macro for Reduced Boilerplate (`dactor-macros`)
+
+The trait-based API (§10.6) is explicit and type-safe but requires repetitive
+boilerplate — each message needs a struct, a `Message` impl, and a `Handler`
+impl. A proc-macro crate (`dactor-macros`) can eliminate most of this while
+generating the exact same traits underneath.
+
+**Without macros** (29 lines for 3 messages):
+
+```rust
+struct Counter { count: u64 }
+impl Actor for Counter {}
+
+struct Increment(u64);
+impl Message for Increment { type Reply = (); }
+
+struct GetCount;
+impl Message for GetCount { type Reply = u64; }
+
+struct Reset;
+impl Message for Reset { type Reply = u64; }
+
+#[async_trait]
+impl Handler<Increment> for Counter {
+    async fn handle(&mut self, msg: Increment, _ctx: &mut ActorContext) {
+        self.count += msg.0;
+    }
+}
+#[async_trait]
+impl Handler<GetCount> for Counter {
+    async fn handle(&mut self, _msg: GetCount, _ctx: &mut ActorContext) -> u64 {
+        self.count
+    }
+}
+#[async_trait]
+impl Handler<Reset> for Counter {
+    async fn handle(&mut self, _msg: Reset, _ctx: &mut ActorContext) -> u64 {
+        let old = self.count;
+        self.count = 0;
+        old
+    }
+}
+```
+
+**With `#[dactor::actor]` macro** (same functionality, ~15 lines):
+
+```rust
+use dactor::prelude::*;
+
+#[dactor::actor]
+struct Counter { count: u64 }
+
+#[dactor::messages]
+impl Counter {
+    /// Fire-and-forget: no return type = `Message::Reply = ()`
+    pub async fn increment(&mut self, amount: u64) {
+        self.count += amount;
+    }
+
+    /// Request-reply: return type = `Message::Reply = u64`
+    pub async fn get_count(&self) -> u64 {
+        self.count
+    }
+
+    /// Request-reply: returns old value
+    pub async fn reset(&mut self) -> u64 {
+        let old = self.count;
+        self.count = 0;
+        old
+    }
+}
+```
+
+**What the macros generate:**
+
+`#[dactor::actor]` on the struct expands to:
+```rust
+struct Counter { count: u64 }
+impl dactor::Actor for Counter {}  // with default lifecycle hooks
+```
+
+`#[dactor::messages]` on the impl block generates, for each method:
+1. A **message struct** named after the method (PascalCase):
+   `Increment { amount: u64 }`, `GetCount`, `Reset`
+2. A **`Message` impl** with `Reply` derived from the return type
+3. A **`Handler<M>` impl** that delegates to the method body
+
+Expanded output for `increment`:
+```rust
+// Generated by #[dactor::messages]
+pub struct Increment { pub amount: u64 }
+
+impl dactor::Message for Increment {
+    type Reply = ();
+}
+
+#[async_trait]
+impl dactor::Handler<Increment> for Counter {
+    async fn handle(&mut self, msg: Increment, _ctx: &mut dactor::ActorContext) {
+        self.increment(msg.amount).await
+    }
+}
+```
+
+**Caller side is identical** regardless of whether macros were used:
+
+```rust
+let counter: ActorRef<Counter> = runtime.spawn("counter", Counter { count: 0 });
+
+counter.tell(Increment { amount: 5 }).unwrap();   // generated struct
+let count = counter.ask(GetCount).await.unwrap();  // returns u64
+let old = counter.ask(Reset).await.unwrap();       // returns u64
+```
+
+**Lifecycle hooks with macro:**
+
+```rust
+#[dactor::actor]
+struct DatabaseWorker {
+    conn: Option<DbConnection>,
+}
+
+#[dactor::lifecycle]
+impl DatabaseWorker {
+    fn on_start(&mut self) {
+        self.conn = Some(DbConnection::connect("postgres://..."));
+    }
+
+    fn on_stop(&mut self) {
+        self.conn.take().map(|c| c.close());
+    }
+
+    fn on_error(&mut self, error: &ActorError) -> ErrorAction {
+        match error.code {
+            ErrorCode::Unavailable => ErrorAction::Restart,
+            _ => ErrorAction::Stop,
+        }
+    }
+}
+
+#[dactor::messages]
+impl DatabaseWorker {
+    pub async fn query(&mut self, sql: String) -> Vec<Row> {
+        self.conn.as_ref().unwrap().query(&sql).await
+    }
+}
+```
+
+`#[dactor::lifecycle]` generates the `Actor` trait impl with the provided
+hooks. If omitted, `#[dactor::actor]` generates default no-op hooks.
+
+**How each adapter handles the generated code:**
+
+| Adapter | What happens under the hood |
+|---|---|
+| dactor-ractor | The generated `Handler<M>` impls are wrapped into a single ractor `Actor` that deserializes a type-erased message enum and dispatches to the matching `Handler`. |
+| dactor-kameo | Nearly 1:1 — each generated `Handler<M>` maps directly to kameo's `impl Message<M> for Actor`. |
+| dactor-coerce | Each generated `Handler<M>` maps to coerce's `impl Handler<M> for Actor` + `impl Message for M`. |
+| dactor-mock | Dispatches via trait objects — the generated `Handler<M>` impls are invoked directly. |
+
+**Workspace placement:**
+
+```toml
+# dactor/Cargo.toml
+[features]
+default = ["macros"]
+macros = ["dactor-macros"]
+
+[dependencies]
+dactor-macros = { path = "../dactor-macros", optional = true }
+```
+
+```toml
+# Workspace Cargo.toml
+[workspace]
+members = ["dactor", "dactor-macros", "dactor-ractor", "dactor-kameo", "dactor-coerce", "dactor-mock"]
+```
+
+**Summary: what you write vs what's generated**
+
+| You write | Macro generates |
+|---|---|
+| `#[dactor::actor] struct Foo { ... }` | `impl Actor for Foo {}` |
+| `#[dactor::lifecycle] impl Foo { fn on_start ... }` | `impl Actor for Foo { fn on_start ... }` |
+| `pub async fn bar(&mut self, x: u64)` | `struct Bar { x: u64 }` + `impl Message` + `impl Handler<Bar>` |
+| `pub async fn baz(&self) -> String` | `struct Baz;` + `impl Message { type Reply = String }` + `impl Handler<Baz>` |
+
+### 13.2 Closure-based Actors (Backward Compatibility)
+
+**Backward compatibility with closures:**
+
+Simple closure-based actors (v0.1 style) remain available via a built-in
+`ClosureActor<M>` wrapper:
+
+```rust
+/// Built-in actor that wraps a closure for simple use cases.
+/// Equivalent to v0.1's `runtime.spawn("name", |msg| { ... })`.
+pub struct ClosureActor<M: Send + 'static> {
+    handler: Box<dyn FnMut(M) + Send>,
+}
+
+impl<M: Send + 'static> Actor for ClosureActor<M> {}
+
+impl<M: Send + 'static> Message for M where M: Send + 'static {
+    type Reply = ();
+}
+
+impl<M: Send + 'static> Handler<M> for ClosureActor<M> {
+    async fn handle(&mut self, msg: M, _ctx: &mut ActorContext) {
+        (self.handler)(msg);
+    }
+}
+
+// Convenience method on ActorRuntime:
+fn spawn_fn<M, H>(&self, name: &str, handler: H) -> ActorRef<ClosureActor<M>>
+where M: Send + 'static, H: FnMut(M) + Send + 'static;
+```
+
+### 13.3 Proc-Macro Error Handling
 
 The `dactor-macros` proc-macro crate must emit clear, actionable compile
 errors for patterns it cannot support. This section documents the expected
@@ -2050,372 +2928,41 @@ error messages.
 - Suggestions are actionable ("use X instead of Y")
 - No cryptic trait-bound errors leaked from generated code
 
-### 3.21 Runtime Observability
-
-**Problem:** In production, operators need visibility into actor system health:
-which actors are busiest, which fail most, what message sizes look like, how
-long handlers take. Building this into every actor's handler code is
-error-prone and repetitive.
-
-**Design:** dactor provides observability primarily through the **interceptor
-pipeline** (§3.2). Because interceptors see every message with full context
-(`InterceptContext`), they are the natural place to collect metrics. dactor
-also provides a built-in `MetricsInterceptor` and a `RuntimeMetrics` query
-API for common operational needs.
-
-#### 3.21.1 Built-in `MetricsInterceptor`
-
-A ready-to-use interceptor that tracks per-actor and per-message-type
-statistics. Users register it once; it collects everything automatically.
-
-```rust
-/// Built-in interceptor that collects runtime-level metrics.
-/// Register via `runtime.add_interceptor(Box::new(MetricsInterceptor::new()))`.
-pub struct MetricsInterceptor {
-    inner: Arc<MetricsStore>,
-}
-
-impl MetricsInterceptor {
-    pub fn new() -> Self { ... }
-
-    /// Access the collected metrics for querying.
-    pub fn metrics(&self) -> &MetricsStore { ... }
-}
-
-impl Interceptor for MetricsInterceptor {
-    fn on_receive(&self, ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
-        self.inner.record_receive(ctx);
-        Disposition::Continue
-    }
-
-    fn on_complete(&self, ctx: &InterceptContext<'_>, _headers: &Headers, outcome: &Outcome) {
-        self.inner.record_complete(ctx, outcome);
-    }
-
-    fn on_stream_item(&self, ctx: &InterceptContext<'_>, _headers: &Headers, seq: u64) {
-        self.inner.record_stream_item(ctx, seq);
-    }
-}
-```
-
-#### 3.21.2 `MetricsStore` Query API
-
-```rust
-/// Queryable metrics collected by `MetricsInterceptor`.
-pub struct MetricsStore { /* internal concurrent maps */ }
-
-impl MetricsStore {
-    // ── Per-actor metrics ───────────────────────────────
-
-    /// Total messages received by each actor (sorted descending = busiest first).
-    pub fn busiest_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
-
-    /// Actors with the most handler errors (sorted descending = most failed first).
-    pub fn most_failed_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
-
-    /// Actors with the highest average handler latency.
-    pub fn slowest_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
-
-    /// Metrics for a specific actor.
-    pub fn actor(&self, id: ActorId) -> Option<ActorMetrics>;
-
-    // ── Per-message-type metrics ────────────────────────
-
-    /// Message types with the highest volume.
-    pub fn busiest_message_types(&self, top_n: usize) -> Vec<MessageTypeMetrics>;
-
-    // ── Global metrics ──────────────────────────────────
-
-    /// Total messages processed across all actors.
-    pub fn total_messages(&self) -> u64;
-
-    /// Total errors across all actors.
-    pub fn total_errors(&self) -> u64;
-
-    /// Reset all counters.
-    pub fn reset(&self);
-}
-
-/// Per-actor statistics.
-#[derive(Debug, Clone)]
-pub struct ActorMetrics {
-    pub actor_id: ActorId,
-    pub actor_name: String,
-    /// Total messages received (tell + ask + stream requests).
-    pub messages_received: u64,
-    /// Total handler errors.
-    pub errors: u64,
-    /// Total handler invocations that succeeded.
-    pub successes: u64,
-    /// Average handler latency.
-    pub avg_latency: Duration,
-    /// Maximum handler latency observed.
-    pub max_latency: Duration,
-    /// Total stream items emitted (if actor handles streams).
-    pub stream_items_emitted: u64,
-    /// Count of messages received per priority level.
-    pub by_priority: HashMap<Priority, u64>,
-    /// Count of remote vs local messages.
-    pub remote_messages: u64,
-    pub local_messages: u64,
-}
-
-/// Per-message-type statistics.
-#[derive(Debug, Clone)]
-pub struct MessageTypeMetrics {
-    pub message_type: String,
-    pub count: u64,
-    pub errors: u64,
-    pub avg_latency: Duration,
-}
-```
-
-#### 3.21.3 Custom Interceptor Examples
-
-The built-in `MetricsInterceptor` covers common needs. For specialized
-observability, users write custom interceptors:
-
-**Example: Message size tracking**
-
-```rust
-use std::mem;
-
-struct MessageSizeInterceptor {
-    sizes: Arc<Mutex<HashMap<String, Vec<usize>>>>,
-}
-
-impl Interceptor for MessageSizeInterceptor {
-    fn on_receive(&self, ctx: &InterceptContext<'_>, _headers: &mut Headers) -> Disposition {
-        // std::mem::size_of gives the stack size of the message type.
-        // For heap-allocated content, use a custom SizeOf header set by the sender.
-        let mut sizes = self.sizes.lock().unwrap();
-        sizes.entry(ctx.message_type.to_string())
-            .or_default()
-            .push(mem::size_of_val(ctx.message_type));  // illustrative
-        Disposition::Continue
-    }
-}
-
-// For accurate message size tracking with heap data, use a header:
-pub struct MessageSize(pub usize);
-impl HeaderValue for MessageSize { ... }
-
-// Sender sets it:
-let mut env = Envelope::from(my_large_message);
-env.headers.insert(MessageSize(serialized_bytes.len()));
-actor.tell_envelope(env)?;
-```
-
-**Example: Slow handler alerting**
-
-```rust
-use std::time::Instant;
-
-struct SlowHandlerInterceptor {
-    threshold: Duration,
-}
-
-impl Interceptor for SlowHandlerInterceptor {
-    fn on_receive(&self, _ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
-        // Stash the start time in a header for on_complete to read.
-        headers.insert(HandlerStartTime(Instant::now()));
-        Disposition::Continue
-    }
-
-    fn on_complete(&self, ctx: &InterceptContext<'_>, headers: &Headers, outcome: &Outcome) {
-        if let Some(start) = headers.get::<HandlerStartTime>() {
-            let elapsed = start.0.elapsed();
-            if elapsed > self.threshold {
-                tracing::warn!(
-                    actor = ctx.actor_name,
-                    message = ctx.message_type,
-                    elapsed_ms = elapsed.as_millis(),
-                    "slow handler detected"
-                );
-            }
-        }
-    }
-}
-
-struct HandlerStartTime(Instant);
-impl HeaderValue for HandlerStartTime { ... }
-```
-
-**Example: Error rate circuit breaker**
-
-```rust
-struct CircuitBreakerInterceptor {
-    error_counts: Arc<DashMap<ActorId, AtomicU64>>,
-    threshold: u64,
-}
-
-impl Interceptor for CircuitBreakerInterceptor {
-    fn on_receive(&self, ctx: &InterceptContext<'_>, _headers: &mut Headers) -> Disposition {
-        let count = self.error_counts
-            .entry(ctx.actor_id)
-            .or_insert(AtomicU64::new(0));
-        if count.load(Ordering::Relaxed) >= self.threshold {
-            return Disposition::Reject(
-                format!("actor {} circuit breaker open ({} consecutive errors)",
-                    ctx.actor_name, self.threshold)
-            );
-        }
-        Disposition::Continue
-    }
-
-    fn on_complete(&self, ctx: &InterceptContext<'_>, _headers: &Headers, outcome: &Outcome) {
-        match outcome {
-            Outcome::Success => {
-                // Reset on success
-                if let Some(count) = self.error_counts.get(&ctx.actor_id) {
-                    count.store(0, Ordering::Relaxed);
-                }
-            }
-            Outcome::HandlerError { .. } => {
-                self.error_counts
-                    .entry(ctx.actor_id)
-                    .or_insert(AtomicU64::new(0))
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-    }
-}
-```
-
-**Example: OpenTelemetry tracing (via dcontext)**
-
-```rust
-use dcontext::{TraceContext, SpanContext};
-
-struct OtelInterceptor;
-
-impl Interceptor for OtelInterceptor {
-    fn on_receive(&self, ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
-        // Extract trace context from headers (injected by sender)
-        let parent = headers.get::<TraceContext>();
-
-        // Create a child span for this handler invocation
-        let span = tracer::start_span(ctx.message_type)
-            .with_parent(parent)
-            .with_attribute("actor.id", ctx.actor_id.to_string())
-            .with_attribute("actor.name", ctx.actor_name)
-            .with_attribute("send.mode", format!("{:?}", ctx.send_mode))
-            .with_attribute("remote", ctx.remote)
-            .start();
-
-        // Stash the span in headers for on_complete to close it
-        headers.insert(SpanContext(span));
-        Disposition::Continue
-    }
-
-    fn on_complete(&self, _ctx: &InterceptContext<'_>, headers: &Headers, outcome: &Outcome) {
-        if let Some(span_ctx) = headers.get::<SpanContext>() {
-            match outcome {
-                Outcome::Success => span_ctx.0.set_status(StatusCode::Ok),
-                Outcome::HandlerError { error } => {
-                    span_ctx.0.set_status(StatusCode::Error);
-                    span_ctx.0.record_error(&error.message);
-                }
-                _ => {}
-            }
-            span_ctx.0.end();
-        }
-    }
-}
-```
-
-#### 3.21.4 Registering Multiple Interceptors
-
-Interceptors are composable. A typical production setup:
-
-```rust
-let metrics = MetricsInterceptor::new();
-let metrics_store = metrics.metrics().clone();  // for querying later
-
-runtime.add_interceptor(Box::new(OtelInterceptor))?;
-runtime.add_interceptor(Box::new(metrics))?;
-runtime.add_interceptor(Box::new(SlowHandlerInterceptor { threshold: Duration::from_secs(1) }))?;
-runtime.add_interceptor(Box::new(CircuitBreakerInterceptor::new(10)))?;
-
-// Later: query metrics
-let top_5_busiest = metrics_store.busiest_actors(5);
-let top_5_failing = metrics_store.most_failed_actors(5);
-```
-
-Interceptors execute in registration order. The pipeline is:
-`OTel → Metrics → SlowHandler → CircuitBreaker → Actor Handler → CircuitBreaker.on_complete → SlowHandler.on_complete → Metrics.on_complete → OTel.on_complete`
-
 ---
 
-## 4. Module Reorganization
+## 14. Adapter Support
 
-### Before (v0.1)
+### Adapter Support Matrix (Planned)
 
-```
-dactor/src/
-├── lib.rs
-├── traits/
-│   ├── mod.rs
-│   ├── runtime.rs       ← ActorRef + ActorRuntime + errors + ClusterEvents + NodeId
-│   └── clock.rs         ← Clock + SystemClock + TestClock (mixed!)
-├── types/
-│   ├── mod.rs
-│   └── node.rs          ← NodeId
-└── test_support/
-    ├── mod.rs
-    ├── test_runtime.rs
-    └── test_clock.rs
-```
+For each feature and each adapter, there are exactly three possibilities:
 
-### After (v0.2)
+- ✅ **Library Native** — the underlying actor library (ractor / kameo / coerce) directly supports this feature; the adapter maps to the library's API
+- ⚙️ **Adapter Implemented** — the library does *not* support this feature, but the adapter crate implements it with custom logic
+- ❌ **Not Supported** — the feature cannot be provided; returns `RuntimeError::NotSupported` at runtime
 
-```
-dactor/src/
-├── lib.rs               ← public API, re-exports
-├── actor.rs             ← ActorRef, ActorId, ActorRuntime, SpawnConfig
-├── message.rs           ← Envelope, Headers, HeaderValue, built-in headers
-├── interceptor.rs       ← Interceptor trait, Disposition
-├── lifecycle.rs         ← ErrorAction (lifecycle hooks live on Actor trait)
-├── supervision.rs       ← SupervisionStrategy, SupervisionAction, ChildTerminated
-├── stream.rs            ← StreamRef, StreamSender, BoxStream, StreamSendError
-├── clock.rs             ← Clock, SystemClock (NO TestClock)
-├── cluster.rs           ← ClusterEvents, ClusterEvent, NodeId, SubscriptionId
-├── timer.rs             ← TimerHandle
-├── mailbox.rs           ← MailboxConfig, OverflowStrategy
-├── errors.rs            ← ActorSendError, GroupError, ClusterError, RuntimeError, ActorError
-├── dead_letter.rs       ← DeadLetterHandler, DeadLetterEvent, DeadLetterReason
-├── metrics.rs           ← MetricsInterceptor, MetricsStore, ActorMetrics
-├── remote.rs            ← RemoteMessage marker trait, serialization contract
-└── test_support/        ← #[cfg(feature = "test-support")]
-    ├── mod.rs
-    ├── conformance.rs   ← Adapter conformance test suite
-    ├── test_runtime.rs  ← TestRuntime, TestActorRef, TestClusterEvents
-    └── test_clock.rs    ← TestClock
-```
+| Capability | dactor-ractor | dactor-kameo | dactor-coerce | Notes |
+|---|:---:|:---:|:---:|---|
+| `tell()` | ✅ Library | ✅ Library | ✅ Library | ractor `cast()` / kameo `tell().try_send()` / coerce `notify()` |
+| `tell_envelope()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has envelopes; adapter unwraps, runs interceptors, forwards body |
+| `ask()` | ✅ Library | ✅ Library | ✅ Library | ractor `call()` / kameo `ask()` / coerce `send()` |
+| `stream()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has streaming; adapter creates `mpsc` channel shim |
+| `ActorRef::id()` | ✅ Library | ✅ Library | ✅ Library | Each library provides actor identity |
+| `ActorRef::is_alive()` | ✅ Library | ✅ Library | ✅ Library | Check actor cell / ref validity |
+| Lifecycle hooks | ✅ Library | ✅ Library | ✅ Library | ractor `pre_start`/`post_stop` / kameo `on_start`/`on_stop` / coerce lifecycle events |
+| Supervision | ✅ Library | ✅ Library | ✅ Library | ractor parent-child / kameo `on_link_died` / coerce child restart |
+| `watch()` / `unwatch()` | ✅ Library | ✅ Library | ✅ Library | ractor supervisor notifications / kameo linking / coerce supervision |
+| `MailboxConfig::Unbounded` | ✅ Library | ✅ Library | ✅ Library | Default for all three |
+| `MailboxConfig::Bounded` | ⚙️ Adapter | ✅ Library | ❌ Not Supported | ractor: adapter wraps with bounded channel; kameo: `spawn_bounded()`; coerce: unbounded only |
+| `OverflowStrategy::Block` | ⚙️ Adapter | ✅ Library | ❌ Not Supported | coerce: no bounded mailbox |
+| `OverflowStrategy::RejectWithError` | ⚙️ Adapter | ✅ Library | ❌ Not Supported | coerce: no bounded mailbox |
+| `OverflowStrategy::DropNewest` | ⚙️ Adapter | ⚙️ Adapter | ❌ Not Supported | coerce: no bounded mailbox |
+| `OverflowStrategy::DropOldest` | ❌ Not Supported | ❌ Not Supported | ❌ Not Supported | No library exposes queue eviction |
+| Priority mailbox | ⚙️ Adapter | ✅ Library | ❌ Not Supported | ractor: BinaryHeap wrapper; kameo: custom mailbox; coerce: no priority support |
+| Interceptors (global) | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has generic interceptors; adapter runs chain before dispatch |
+| Interceptors (per-actor) | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | Stored in actor wrapper by adapter, run per message |
+| Processing groups | ✅ Library | ⚙️ Adapter | ✅ Library | ractor: native `pg` module; kameo: adapter registry; coerce: sharding/pub-sub |
+| Cluster events | ⚙️ Adapter | ⚙️ Adapter | ✅ Library | ractor/kameo: adapter callback system; coerce: native cluster membership |
 
----
-
-## 5. Breaking Changes & Migration
-
-| v0.1 | v0.2 | Migration |
-|------|------|-----------|
-| `ActorRef::send()` | `ActorRef::tell()` | Rename. Provide deprecated `send()` shim for one release. |
-| `TestClock` in `traits::clock` | `test_support::TestClock` behind feature | Add `features = ["test-support"]` to dev-deps. |
-| `test_support` always compiled | Feature-gated | Same as above. |
-| No `ActorId` | `ActorRef::id()` required | Adapters must implement. |
-| `NodeId` in `types::node` | `cluster::NodeId` | Module moved, re-exported from root. |
-| `GroupError` return type | `RuntimeError` return type | Wrap existing errors in `RuntimeError::Group(...)`. |
-| — | `NotSupportedError` / `RuntimeError` | New error types. Unsupported ops return `Err(NotSupported)`. |
-| — | `Envelope<M>`, `Headers` | New types, `tell()` accepts both `M` and `Envelope<M>`. |
-| — | `Interceptor` pipeline | New opt-in feature, no breakage. |
-| — | `SpawnConfig` / `MailboxConfig` | New, with defaults matching v0.1 behavior. |
-| — | Lifecycle hooks on `Actor` trait | Actor struct implements `on_start`/`on_stop`/`on_error` with default no-ops. |
-| — | `StreamRef<M, R>` / `BoxStream<R>` | New streaming trait. Adapters implement via channel shim. |
-
----
-
-## 6. Adapter Impact
 
 ### Strategy Key
 
@@ -2497,37 +3044,9 @@ For each feature and each adapter, there are exactly three possibilities:
 
 ---
 
-## 7. Dependency Cleanup
-
-### v0.1 dactor/Cargo.toml deps:
-```toml
-serde = { version = "1", features = ["derive"] }   # for NodeId
-tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
-tracing = "0.1"
-```
-
-### v0.2 proposed:
-```toml
-[dependencies]
-tokio = { version = "1", features = ["time", "sync", "rt"] }  # drop macros
-tracing = "0.1"
-futures-core = "0.3"      # Stream trait (used by StreamRef)
-tokio-stream = "0.1"      # ReceiverStream wrapper
-
-[dependencies.serde]
-version = "1"
-features = ["derive"]
-optional = true  # only if user needs NodeId serialization
-
-[features]
-default = []
-serde = ["dep:serde"]
-test-support = ["tokio/test-util"]
-```
-
 ---
 
-## 8. Implementation Priority
+## 15. Implementation Roadmap
 
 ### Phase 1 — Foundation (v0.2.0)
 1. Module reorganization (flat structure, one concept per file)
@@ -2574,7 +3093,108 @@ test-support = ["tokio/test-util"]
 
 ---
 
-## 9. Open Questions
+### 15.6 Dependency Cleanup
+
+### v0.1 dactor/Cargo.toml deps:
+```toml
+serde = { version = "1", features = ["derive"] }   # for NodeId
+tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
+tracing = "0.1"
+```
+
+### v0.2 proposed:
+```toml
+[dependencies]
+tokio = { version = "1", features = ["time", "sync", "rt"] }  # drop macros
+tracing = "0.1"
+futures-core = "0.3"      # Stream trait (used by StreamRef)
+tokio-stream = "0.1"      # ReceiverStream wrapper
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+optional = true  # only if user needs NodeId serialization
+
+[features]
+default = []
+serde = ["dep:serde"]
+test-support = ["tokio/test-util"]
+```
+
+---
+
+### 15.7 Breaking Changes & Migration
+
+| v0.1 | v0.2 | Migration |
+|------|------|-----------|
+| `ActorRef::send()` | `ActorRef::tell()` | Rename. Provide deprecated `send()` shim for one release. |
+| `TestClock` in `traits::clock` | `test_support::TestClock` behind feature | Add `features = ["test-support"]` to dev-deps. |
+| `test_support` always compiled | Feature-gated | Same as above. |
+| No `ActorId` | `ActorRef::id()` required | Adapters must implement. |
+| `NodeId` in `types::node` | `cluster::NodeId` | Module moved, re-exported from root. |
+| `GroupError` return type | `RuntimeError` return type | Wrap existing errors in `RuntimeError::Group(...)`. |
+| — | `NotSupportedError` / `RuntimeError` | New error types. Unsupported ops return `Err(NotSupported)`. |
+| — | `Envelope<M>`, `Headers` | New types, `tell()` accepts both `M` and `Envelope<M>`. |
+| — | `Interceptor` pipeline | New opt-in feature, no breakage. |
+| — | `SpawnConfig` / `MailboxConfig` | New, with defaults matching v0.1 behavior. |
+| — | Lifecycle hooks on `Actor` trait | Actor struct implements `on_start`/`on_stop`/`on_error` with default no-ops. |
+| — | `StreamRef<M, R>` / `BoxStream<R>` | New streaming trait. Adapters implement via channel shim. |
+
+---
+
+---
+
+## 16. Module Layout
+
+### Before (v0.1)
+
+```
+dactor/src/
+├── lib.rs
+├── traits/
+│   ├── mod.rs
+│   ├── runtime.rs       ← ActorRef + ActorRuntime + errors + ClusterEvents + NodeId
+│   └── clock.rs         ← Clock + SystemClock + TestClock (mixed!)
+├── types/
+│   ├── mod.rs
+│   └── node.rs          ← NodeId
+└── test_support/
+    ├── mod.rs
+    ├── test_runtime.rs
+    └── test_clock.rs
+```
+
+### After (v0.2)
+
+```
+dactor/src/
+├── lib.rs               ← public API, re-exports
+├── actor.rs             ← ActorRef, ActorId, ActorRuntime, SpawnConfig
+├── message.rs           ← Envelope, Headers, HeaderValue, built-in headers
+├── interceptor.rs       ← Interceptor trait, Disposition
+├── lifecycle.rs         ← ErrorAction (lifecycle hooks live on Actor trait)
+├── supervision.rs       ← SupervisionStrategy, SupervisionAction, ChildTerminated
+├── stream.rs            ← StreamRef, StreamSender, BoxStream, StreamSendError
+├── clock.rs             ← Clock, SystemClock (NO TestClock)
+├── cluster.rs           ← ClusterEvents, ClusterEvent, NodeId, SubscriptionId
+├── timer.rs             ← TimerHandle
+├── mailbox.rs           ← MailboxConfig, OverflowStrategy
+├── errors.rs            ← ActorSendError, GroupError, ClusterError, RuntimeError, ActorError
+├── dead_letter.rs       ← DeadLetterHandler, DeadLetterEvent, DeadLetterReason
+├── metrics.rs           ← MetricsInterceptor, MetricsStore, ActorMetrics
+├── remote.rs            ← RemoteMessage marker trait, serialization contract
+└── test_support/        ← #[cfg(feature = "test-support")]
+    ├── mod.rs
+    ├── conformance.rs   ← Adapter conformance test suite
+    ├── test_runtime.rs  ← TestRuntime, TestActorRef, TestClusterEvents
+    └── test_clock.rs    ← TestClock
+```
+
+---
+
+---
+
+## 17. Open Questions
 
 1. **Should `Envelope<M>` be the only way to send messages?** Or should `tell(M)` auto-wrap in an envelope with empty headers? → **Proposed: both.** `tell(msg)` wraps automatically; `tell_envelope(env)` gives full control.
 
@@ -2594,11 +3214,12 @@ test-support = ["tokio/test-util"]
 
 ---
 
-## 10. Consumer API Pattern Analysis
+---
 
-The three Rust actor frameworks dactor abstracts over use fundamentally
-different consumer-facing API patterns. This section analyzes them and
-evaluates options for dactor's primary interface.
+## Appendix A: Consumer API Pattern Analysis
+
+> **Note:** This analysis led to the decision in §4 to adopt the Kameo/Coerce
+> pattern. Retained here for reference.
 
 ### 10.1 Pattern A: Ractor Style — `ActorRef<MessageEnum>`
 
@@ -2796,607 +3417,3 @@ macros = ["dactor-macros"]      # proc-macro based actor definitions
 trait-actor = []                 # Handler<M> trait-based definitions
 ```
 
-### 10.6 Decision: Kameo/Coerce Style (Actor-Typed Refs)
-
-**Decision:** dactor adopts the **Kameo/Coerce pattern** as its primary
-consumer interface.
-
-**Rationale:**
-- **2 of 3** backend libraries (kameo + coerce) already use this pattern,
-  making adapter implementation natural
-- **Compile-time reply safety** — each message type has its own `Reply` type,
-  so `ask()` returns the correct type without runtime downcasting
-- **State as `&mut self`** — Rust-idiomatic, no separate `type State`
-- **Multiple message types** — each gets its own `impl Handler<M>`, cleaner
-  than a monolithic enum with pattern matching
-- **Message reuse** — a single message struct can be handled by multiple
-  actors (unlike ractor's per-actor enum)
-
-**Concrete design:**
-
-```rust
-// ─── Core trait: Actor ──────────────────────────────────────
-
-/// Marker trait for an actor. State lives in the implementing struct.
-/// Lifecycle hooks have default no-op implementations.
-pub trait Actor: Send + 'static {
-    /// Called after the actor is spawned, before processing messages.
-    fn on_start(&mut self) {}
-
-    /// Called when the actor is stopping.
-    fn on_stop(&mut self) {}
-
-    /// Called when a handler panics or returns an error.
-    fn on_error(&mut self, _error: &ActorError) -> ErrorAction {
-        ErrorAction::Stop
-    }
-}
-
-// ─── Core trait: Message ────────────────────────────────────
-
-/// Defines a message type and its reply. Implemented on the MESSAGE,
-/// not on the actor. This decouples message definition from handling
-/// (Coerce style) and allows the same message to be handled by
-/// different actors.
-pub trait Message: Send + 'static {
-    /// The reply type for this message. Use `()` for fire-and-forget.
-    type Reply: Send + 'static;
-}
-
-// ─── Core trait: Handler ────────────────────────────────────
-
-/// Implemented by an actor for each message type it can handle.
-/// One impl per (Actor, Message) pair.
-#[async_trait::async_trait]
-pub trait Handler<M: Message>: Actor {
-    /// Handle the message and return a reply.
-    async fn handle(&mut self, msg: M, ctx: &mut ActorContext) -> M::Reply;
-}
-
-// ─── ActorRef ───────────────────────────────────────────────
-
-/// A reference to a running actor of type `A`.
-///
-/// `ActorRef<A>` is typed to the ACTOR, not the message. You can send
-/// any message type `M` for which `A: Handler<M>`.
-pub struct ActorRef<A: Actor> { /* internal handle */ }
-
-impl<A: Actor> ActorRef<A> {
-    /// The actor's unique identity.
-    pub fn id(&self) -> ActorId { ... }
-
-    /// Fire-and-forget: deliver a message.
-    /// Requires `A: Handler<M>`.
-    pub fn tell<M>(&self, msg: M) -> Result<(), ActorSendError>
-    where
-        A: Handler<M>,
-        M: Message<Reply = ()>,  // tell only for fire-and-forget
-    { ... }
-
-    /// Request-reply: send a message and await the reply.
-    /// The return type is determined by `M::Reply` at compile time.
-    pub async fn ask<M>(&self, msg: M) -> Result<M::Reply, RuntimeError>
-    where
-        A: Handler<M>,
-        M: Message,
-    { ... }
-
-    /// Request-reply with explicit timeout.
-    /// Returns `Err(RuntimeError::Actor(ActorError { code: Timeout, .. }))`
-    /// if the actor does not reply within the given duration.
-    pub async fn ask_timeout<M>(
-        &self, msg: M, timeout: Duration,
-    ) -> Result<M::Reply, RuntimeError>
-    where
-        A: Handler<M>,
-        M: Message,
-    { ... }
-
-    /// Fire-and-forget with an envelope (headers + body).
-    pub fn tell_envelope<M>(&self, envelope: Envelope<M>) -> Result<(), RuntimeError>
-    where
-        A: Handler<M>,
-        M: Message<Reply = ()>,
-    { ... }
-
-    /// Fire-and-forget with priority.
-    pub fn tell_with_priority<M>(&self, msg: M, priority: Priority) -> Result<(), RuntimeError>
-    where
-        A: Handler<M>,
-        M: Message<Reply = ()>,
-    { ... }
-
-    /// Check if the actor is still alive.
-    pub fn is_alive(&self) -> Result<bool, NotSupportedError> { ... }
-}
-
-impl<A: Actor> Clone for ActorRef<A> { ... }
-impl<A: Actor> Send for ActorRef<A> {}
-impl<A: Actor> Sync for ActorRef<A> {}
-
-// ─── ActorContext ───────────────────────────────────────────
-
-/// Context passed to handlers, providing access to the actor's identity,
-/// message metadata, and runtime operations.
-pub struct ActorContext {
-    /// The headers from the incoming message envelope.
-    pub headers: Headers,
-    /// The actor's own unique identity.
-    pub actor_id: ActorId,
-    /// The name the actor was spawned with.
-    pub actor_name: String,
-    /// How the message was sent (Tell, Ask, Stream).
-    pub send_mode: SendMode,
-}
-
-impl ActorContext {
-    /// Spawn a child actor (delegates to the runtime).
-    pub fn spawn<A: Actor>(&self, name: &str, actor: A) -> ActorRef<A> { ... }
-
-    /// Schedule a one-shot message to an actor.
-    pub fn send_after<A, M>(&self, target: &ActorRef<A>, delay: Duration, msg: M)
-    where A: Handler<M>, M: Message<Reply = ()> { ... }
-
-    /// Schedule a recurring message to an actor.
-    pub fn send_interval<A, M>(&self, target: &ActorRef<A>, interval: Duration, msg: M)
-    where A: Handler<M>, M: Message<Reply = ()> + Clone { ... }
-}
-
-// ─── ActorRuntime (revised) ─────────────────────────────────
-
-pub trait ActorRuntime: Send + Sync + 'static {
-    type Events: ClusterEvents;
-    type Timer: TimerHandle;
-
-    /// Spawn an actor with default configuration.
-    fn spawn<A: Actor>(&self, name: &str, actor: A) -> ActorRef<A>;
-
-    /// Spawn with per-actor configuration (mailbox, interceptors).
-    fn spawn_with_config<A: Actor>(
-        &self, name: &str, actor: A, config: SpawnConfig,
-    ) -> Result<ActorRef<A>, RuntimeError>;
-
-    /// Schedule a recurring message.
-    fn send_interval<A, M>(
-        &self, target: &ActorRef<A>, interval: Duration, msg: M,
-    ) -> Self::Timer
-    where A: Handler<M>, M: Message<Reply = ()> + Clone;
-
-    /// Schedule a one-shot message.
-    fn send_after<A, M>(
-        &self, target: &ActorRef<A>, delay: Duration, msg: M,
-    ) -> Self::Timer
-    where A: Handler<M>, M: Message<Reply = ()>;
-
-    // ... groups, cluster events, watch, interceptors (same as before) ...
-}
-```
-
-**Complete consumer example:**
-
-```rust
-use dactor::prelude::*;
-
-// ── Define the actor ────────────────────────────────────────
-
-struct Counter {
-    count: u64,
-}
-
-impl Actor for Counter {
-    fn on_start(&mut self) {
-        println!("Counter started at {}", self.count);
-    }
-}
-
-// ── Define messages ─────────────────────────────────────────
-
-struct Increment(u64);
-impl Message for Increment { type Reply = (); }
-
-struct GetCount;
-impl Message for GetCount { type Reply = u64; }
-
-struct Reset;
-impl Message for Reset { type Reply = u64; }  // returns old count
-
-// ── Implement handlers ─────────────────────────────────────
-
-#[async_trait]
-impl Handler<Increment> for Counter {
-    async fn handle(&mut self, msg: Increment, _ctx: &mut ActorContext) {
-        self.count += msg.0;
-    }
-}
-
-#[async_trait]
-impl Handler<GetCount> for Counter {
-    async fn handle(&mut self, _msg: GetCount, _ctx: &mut ActorContext) -> u64 {
-        self.count
-    }
-}
-
-#[async_trait]
-impl Handler<Reset> for Counter {
-    async fn handle(&mut self, _msg: Reset, _ctx: &mut ActorContext) -> u64 {
-        let old = self.count;
-        self.count = 0;
-        old
-    }
-}
-
-// ── Usage ───────────────────────────────────────────────────
-
-#[tokio::main]
-async fn main() {
-    let runtime = dactor_ractor::RactorRuntime::new();
-    let counter: ActorRef<Counter> = runtime.spawn("counter", Counter { count: 0 });
-
-    counter.tell(Increment(5)).unwrap();          // fire-and-forget
-    counter.tell(Increment(3)).unwrap();
-
-    let count = counter.ask(GetCount).await.unwrap();  // returns u64 (compile-time!)
-    assert_eq!(count, 8);
-
-    let old = counter.ask(Reset).await.unwrap();       // returns u64
-    assert_eq!(old, 8);
-}
-```
-
-**Remote actor call example:**
-
-Messages used for remote calls must implement `Serialize + Deserialize` so
-they can cross node boundaries. The caller uses the same `tell()` / `ask()`
-API — the adapter handles serialization transparently. Errors from the
-remote actor arrive as structured `ActorError` (see §3.14).
-
-```rust
-use dactor::prelude::*;
-use serde::{Serialize, Deserialize};
-
-// ── Messages must be serializable for remote calls ─────────
-
-#[derive(Serialize, Deserialize)]
-struct TransferFunds {
-    from_account: String,
-    to_account: String,
-    amount: u64,
-}
-impl Message for TransferFunds {
-    type Reply = Result<Receipt, ActorError>;
-}
-
-#[derive(Serialize, Deserialize)]
-struct Receipt {
-    transaction_id: String,
-    new_balance: u64,
-}
-
-// ── Actor lives on a remote node ────────────────────────────
-
-struct BankAccount {
-    account_id: String,
-    balance: u64,
-}
-
-impl Actor for BankAccount {}
-
-#[async_trait]
-impl Handler<TransferFunds> for BankAccount {
-    async fn handle(
-        &mut self,
-        msg: TransferFunds,
-        _ctx: &mut ActorContext,
-    ) -> Result<Receipt, ActorError> {
-        if msg.amount > self.balance {
-            return Err(
-                ActorError::new(ErrorCode::FailedPrecondition, "insufficient funds")
-                    .with_detail("balance", self.balance.to_string())
-                    .with_detail("requested", msg.amount.to_string()),
-            );
-        }
-        self.balance -= msg.amount;
-        Ok(Receipt {
-            transaction_id: uuid::Uuid::new_v4().to_string(),
-            new_balance: self.balance,
-        })
-    }
-}
-
-// ── Caller on a different node ──────────────────────────────
-
-#[tokio::main]
-async fn main() {
-    let runtime = dactor_ractor::RactorRuntime::new();
-
-    // Obtain a reference to an actor on a remote node.
-    // The ActorRef<BankAccount> is location-transparent — the caller
-    // doesn't know or care whether the actor is local or remote.
-    let remote_account: ActorRef<BankAccount> = runtime
-        .lookup("bank-account-alice")       // registry lookup
-        .await
-        .expect("actor not found");
-
-    // Remote ask — message is serialized, sent over the network,
-    // deserialized on the remote node, handled by BankAccount,
-    // reply is serialized back and deserialized on the caller side.
-    match remote_account.ask(TransferFunds {
-        from_account: "alice".into(),
-        to_account: "bob".into(),
-        amount: 500,
-    }).await {
-        Ok(Ok(receipt)) => {
-            println!("Transfer succeeded: tx={}, balance={}",
-                receipt.transaction_id, receipt.new_balance);
-        }
-        Ok(Err(actor_err)) => {
-            // Structured error from the remote actor (deserialized)
-            eprintln!("Transfer failed: [{}] {}",
-                actor_err.code, actor_err.message);
-            for detail in &actor_err.details {
-                eprintln!("  {}: {}", detail.key, detail.value);
-            }
-        }
-        Err(runtime_err) => {
-            // Infrastructure error (network, timeout, serialization, etc.)
-            eprintln!("Runtime error: {}", runtime_err);
-        }
-    }
-}
-```
-
-**What happens under the hood for a remote `ask()`:**
-
-```
-Caller Node                                              Remote Node
-┌─────────────┐                                    ┌──────────────────┐
-│ ask(Transfer │                                    │   BankAccount    │
-│   Funds)     │                                    │   actor handler  │
-└──────┬──────┘                                    └────────┬─────────┘
-       │  1. serialize(TransferFunds)                       │
-       │  2. send bytes + reply channel ID                  │
-       │─────────────────────────────────────────────────►  │
-       │                                                    │  3. deserialize(TransferFunds)
-       │                                                    │  4. run interceptor chain
-       │                                                    │  5. handler(&mut self, msg)
-       │                                                    │  6. returns Result<Receipt, ActorError>
-       │  8. deserialize reply                              │
-       │  ◄─────────────────────────────────────────────────│  7. serialize reply
-       │  9. return to caller                               │
-       ▼                                                    │
-  Ok(receipt) or                                            │
-  Ok(ActorError) or                                         │
-  Err(RuntimeError)                                         │
-```
-
-**Three layers of errors the caller may see:**
-
-| Layer | Type | Example | When |
-|---|---|---|---|
-| **Business error** | `ActorError` (inside `Ok`) | Insufficient funds, validation failure | Handler returns `Err(ActorError)` — this is application-level, serialized cleanly |
-| **Runtime error** | `RuntimeError::Actor(ActorError)` | Handler panicked, unhandled exception | Handler panics — adapter captures and wraps as `ActorError` |
-| **Infrastructure error** | `RuntimeError::Send` / `NotSupported` | Network timeout, node down, serialization failure | Message never reached the actor or reply was lost |
-
-**Impact on adapters:**
-
-| Adapter | Mapping |
-|---|---|
-| dactor-ractor | Wrap ractor's `Actor` trait. The adapter generates a ractor actor that dispatches incoming messages (a type-erased enum internally) to the appropriate `Handler<M>` impl. |
-| dactor-kameo | Nearly 1:1 mapping — kameo already uses `ActorRef<A>` and `impl Message<M> for A`. The adapter maps `dactor::Handler<M>` → `kameo::message::Message<M>`. |
-| dactor-mock | Straightforward — mock runtime stores actor state and dispatches via `Handler<M>` trait objects. |
-
-**Backward compatibility with closures:**
-
-Simple closure-based actors (v0.1 style) remain available via a built-in
-`ClosureActor<M>` wrapper:
-
-```rust
-/// Built-in actor that wraps a closure for simple use cases.
-/// Equivalent to v0.1's `runtime.spawn("name", |msg| { ... })`.
-pub struct ClosureActor<M: Send + 'static> {
-    handler: Box<dyn FnMut(M) + Send>,
-}
-
-impl<M: Send + 'static> Actor for ClosureActor<M> {}
-
-impl<M: Send + 'static> Message for M where M: Send + 'static {
-    type Reply = ();
-}
-
-impl<M: Send + 'static> Handler<M> for ClosureActor<M> {
-    async fn handle(&mut self, msg: M, _ctx: &mut ActorContext) {
-        (self.handler)(msg);
-    }
-}
-
-// Convenience method on ActorRuntime:
-fn spawn_fn<M, H>(&self, name: &str, handler: H) -> ActorRef<ClosureActor<M>>
-where M: Send + 'static, H: FnMut(M) + Send + 'static;
-```
-
-### 10.7 Proc-Macro for Reduced Boilerplate (`dactor-macros`)
-
-The trait-based API (§10.6) is explicit and type-safe but requires repetitive
-boilerplate — each message needs a struct, a `Message` impl, and a `Handler`
-impl. A proc-macro crate (`dactor-macros`) can eliminate most of this while
-generating the exact same traits underneath.
-
-**Without macros** (29 lines for 3 messages):
-
-```rust
-struct Counter { count: u64 }
-impl Actor for Counter {}
-
-struct Increment(u64);
-impl Message for Increment { type Reply = (); }
-
-struct GetCount;
-impl Message for GetCount { type Reply = u64; }
-
-struct Reset;
-impl Message for Reset { type Reply = u64; }
-
-#[async_trait]
-impl Handler<Increment> for Counter {
-    async fn handle(&mut self, msg: Increment, _ctx: &mut ActorContext) {
-        self.count += msg.0;
-    }
-}
-#[async_trait]
-impl Handler<GetCount> for Counter {
-    async fn handle(&mut self, _msg: GetCount, _ctx: &mut ActorContext) -> u64 {
-        self.count
-    }
-}
-#[async_trait]
-impl Handler<Reset> for Counter {
-    async fn handle(&mut self, _msg: Reset, _ctx: &mut ActorContext) -> u64 {
-        let old = self.count;
-        self.count = 0;
-        old
-    }
-}
-```
-
-**With `#[dactor::actor]` macro** (same functionality, ~15 lines):
-
-```rust
-use dactor::prelude::*;
-
-#[dactor::actor]
-struct Counter { count: u64 }
-
-#[dactor::messages]
-impl Counter {
-    /// Fire-and-forget: no return type = `Message::Reply = ()`
-    pub async fn increment(&mut self, amount: u64) {
-        self.count += amount;
-    }
-
-    /// Request-reply: return type = `Message::Reply = u64`
-    pub async fn get_count(&self) -> u64 {
-        self.count
-    }
-
-    /// Request-reply: returns old value
-    pub async fn reset(&mut self) -> u64 {
-        let old = self.count;
-        self.count = 0;
-        old
-    }
-}
-```
-
-**What the macros generate:**
-
-`#[dactor::actor]` on the struct expands to:
-```rust
-struct Counter { count: u64 }
-impl dactor::Actor for Counter {}  // with default lifecycle hooks
-```
-
-`#[dactor::messages]` on the impl block generates, for each method:
-1. A **message struct** named after the method (PascalCase):
-   `Increment { amount: u64 }`, `GetCount`, `Reset`
-2. A **`Message` impl** with `Reply` derived from the return type
-3. A **`Handler<M>` impl** that delegates to the method body
-
-Expanded output for `increment`:
-```rust
-// Generated by #[dactor::messages]
-pub struct Increment { pub amount: u64 }
-
-impl dactor::Message for Increment {
-    type Reply = ();
-}
-
-#[async_trait]
-impl dactor::Handler<Increment> for Counter {
-    async fn handle(&mut self, msg: Increment, _ctx: &mut dactor::ActorContext) {
-        self.increment(msg.amount).await
-    }
-}
-```
-
-**Caller side is identical** regardless of whether macros were used:
-
-```rust
-let counter: ActorRef<Counter> = runtime.spawn("counter", Counter { count: 0 });
-
-counter.tell(Increment { amount: 5 }).unwrap();   // generated struct
-let count = counter.ask(GetCount).await.unwrap();  // returns u64
-let old = counter.ask(Reset).await.unwrap();       // returns u64
-```
-
-**Lifecycle hooks with macro:**
-
-```rust
-#[dactor::actor]
-struct DatabaseWorker {
-    conn: Option<DbConnection>,
-}
-
-#[dactor::lifecycle]
-impl DatabaseWorker {
-    fn on_start(&mut self) {
-        self.conn = Some(DbConnection::connect("postgres://..."));
-    }
-
-    fn on_stop(&mut self) {
-        self.conn.take().map(|c| c.close());
-    }
-
-    fn on_error(&mut self, error: &ActorError) -> ErrorAction {
-        match error.code {
-            ErrorCode::Unavailable => ErrorAction::Restart,
-            _ => ErrorAction::Stop,
-        }
-    }
-}
-
-#[dactor::messages]
-impl DatabaseWorker {
-    pub async fn query(&mut self, sql: String) -> Vec<Row> {
-        self.conn.as_ref().unwrap().query(&sql).await
-    }
-}
-```
-
-`#[dactor::lifecycle]` generates the `Actor` trait impl with the provided
-hooks. If omitted, `#[dactor::actor]` generates default no-op hooks.
-
-**How each adapter handles the generated code:**
-
-| Adapter | What happens under the hood |
-|---|---|
-| dactor-ractor | The generated `Handler<M>` impls are wrapped into a single ractor `Actor` that deserializes a type-erased message enum and dispatches to the matching `Handler`. |
-| dactor-kameo | Nearly 1:1 — each generated `Handler<M>` maps directly to kameo's `impl Message<M> for Actor`. |
-| dactor-coerce | Each generated `Handler<M>` maps to coerce's `impl Handler<M> for Actor` + `impl Message for M`. |
-| dactor-mock | Dispatches via trait objects — the generated `Handler<M>` impls are invoked directly. |
-
-**Workspace placement:**
-
-```toml
-# dactor/Cargo.toml
-[features]
-default = ["macros"]
-macros = ["dactor-macros"]
-
-[dependencies]
-dactor-macros = { path = "../dactor-macros", optional = true }
-```
-
-```toml
-# Workspace Cargo.toml
-[workspace]
-members = ["dactor", "dactor-macros", "dactor-ractor", "dactor-kameo", "dactor-coerce", "dactor-mock"]
-```
-
-**Summary: what you write vs what's generated**
-
-| You write | Macro generates |
-|---|---|
-| `#[dactor::actor] struct Foo { ... }` | `impl Actor for Foo {}` |
-| `#[dactor::lifecycle] impl Foo { fn on_start ... }` | `impl Actor for Foo { fn on_start ... }` |
-| `pub async fn bar(&mut self, x: u64)` | `struct Bar { x: u64 }` + `impl Message` + `impl Handler<Bar>` |
-| `pub async fn baz(&self) -> String` | `struct Baz;` + `impl Message { type Reply = String }` + `impl Handler<Baz>` |
