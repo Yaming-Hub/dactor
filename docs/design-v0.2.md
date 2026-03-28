@@ -2931,25 +2931,19 @@ pub trait NodeTransport: Send + Sync + 'static {
 }
 ```
 
-```
-┌─────────────────────────────────────────────────┐
-│  dactor core crate                              │
-│                                                 │
-│  OutboundInterceptors → Two-Lane Queue          │
-│                         ├── Control Lane        │
-│                         └── User Lane (priority)│
-│                                │                │
-│                         MessageComparer          │
-│                                │                │
-│                         dequeue & serialize      │
-│                                │                │
-├─────────────────────────────────┼───────────────┤
-│  Adapter (thin layer)          │               │
-│                                ▼               │
-│                    NodeTransport::send_to_node() │
-│                    (ractor_cluster / libp2p /     │
-│                     gRPC / mock channel)         │
-└─────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph "dactor core crate"
+        OI[Outbound Interceptors] --> LS{Lane Separator}
+        LS -->|system msg| CL[Control Lane<br/>always first]
+        LS -->|user msg| UL[User Lane<br/>priority queue]
+        UL --> MC[MessageComparer<br/>ordering]
+        MC --> SER[Dequeue & Serialize]
+        CL --> SER
+    end
+    subgraph "Adapter (thin layer)"
+        SER --> NT["NodeTransport::send_to_node()<br/>(ractor_cluster / libp2p / gRPC / mock)"]
+    end
 ```
 
 | Layer | Responsibility | Implemented in |
