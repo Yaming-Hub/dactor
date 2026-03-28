@@ -265,6 +265,28 @@ actors can ignore them entirely.
 /// The core actor trait. Implemented by the user's actor struct.
 /// State lives in `self`. Lifecycle hooks have default no-ops.
 pub trait Actor: Send + 'static {
+    /// Serializable construction arguments — the parameters needed to
+    /// create this actor. For remote spawn, these are serialized and
+    /// sent over the wire. For simple local-only actors, this defaults
+    /// to `Self` (the actor struct is its own args).
+    type Args: Send + 'static = Self;
+
+    /// Local dependencies — non-serializable components resolved at the
+    /// node where the actor runs. Examples: references to other actors,
+    /// shared services, connection pools, runtime handles.
+    ///
+    /// For remote spawn, `Deps` are resolved on the target node via
+    /// a `DepsFactory` registered in the `TypeRegistry` — they never
+    /// cross the wire.
+    ///
+    /// Defaults to `()` for actors with no local dependencies.
+    type Deps: Send + 'static = ();
+
+    /// Construct the actor from its arguments and local dependencies.
+    /// Called by the runtime after receiving args (locally or deserialized
+    /// from remote) and resolving deps (always local to the target node).
+    fn create(args: Self::Args, deps: Self::Deps) -> Self where Self: Sized;
+
     /// Called after the actor is spawned, before it processes any messages.
     /// Use for async initialization, resource acquisition, subscriptions, etc.
     async fn on_start(&mut self, ctx: &mut ActorContext) {}
@@ -285,8 +307,8 @@ pub enum ErrorAction {
     /// Resume processing the next message (Erlang: continue).
     Resume,
     /// Restart the actor (Erlang: restart, Akka: Restart).
-    /// The runtime calls `on_stop()` then re-creates the actor and
-    /// calls `on_start()`.
+    /// The runtime keeps the original `Args` and resolves `Deps` again,
+    /// then calls `Actor::create(args, deps)` → `on_start()`.
     Restart,
     /// Stop the actor (Erlang: shutdown).
     Stop,
@@ -295,85 +317,218 @@ pub enum ErrorAction {
 }
 ```
 
-**Spawning actors with parameters:**
+**Why separate Args, Deps, and State?**
 
-Every actor framework supports passing initialization parameters. In dactor,
-the actor struct's fields ARE the parameters — you construct the struct with
-the desired values and pass it to `spawn()`:
+Actor construction involves three distinct categories of data:
+
+| | `Args` | `Deps` | Actor struct (State) |
+|---|---|---|---|
+| **What** | Config values, IDs, URLs | Other actor refs, shared services, pools | Args + Deps + runtime resources |
+| **Serializable** | ✅ Required for remote spawn | ❌ Local to target node | ❌ Not required |
+| **Provided by** | Caller (at spawn site) | Target node's runtime / registry | `Actor::create(args, deps)` |
+| **Survives restart** | ✅ Kept by runtime | ✅ Re-resolved by runtime | ❌ Rebuilt from Args + Deps |
+| **Crosses network** | ✅ For remote spawn | ❌ Never | ❌ Never |
+
+This matches established patterns:
+
+| Framework | Args (serializable) | Deps (local) | State |
+|---|---|---|---|
+| Erlang | `Args` in `start_link` | Resolved in `init/1` via name registry | `{ok, State}` from `init` |
+| Akka | `Props(args)` | Injected via `ActorContext` or DI | Actor instance fields |
+| Ractor | `type Arguments` | Available in `pre_start` via `myself` ref | `type State` |
+| Spring/Guice | Constructor params | `@Inject` dependencies | Bean instance |
+
+**Three usage tiers:**
 
 ```rust
-// Simple: fields are the parameters
-let counter = runtime.spawn("counter", Counter { count: 0, label: "main".into() });
+// ── Tier 1: Simple actor — Args = Self, Deps = () ───────────
+// No separation needed. The actor struct IS the args.
 
-// With config (e.g., database connection string)
-let worker = runtime.spawn("db-worker", DatabaseWorker {
-    connection_string: "postgres://localhost/mydb".into(),
-    pool_size: 10,
-    conn: None,  // will be connected in on_start()
-});
+struct Counter { count: u64 }
+
+impl Actor for Counter {
+    // type Args = Self;   ← default, can omit
+    // type Deps = ();     ← default, can omit
+    fn create(args: Self, _deps: ()) -> Self { args }
+}
+
+let counter = runtime.spawn("counter", Counter { count: 0 });
 ```
 
-| Framework | Pattern | dactor Equivalent |
-|---|---|---|
-| Erlang | `gen_server:start_link(Mod, Args, Opts)` → `init(Args)` | `runtime.spawn(name, MyActor { args... })` |
-| Akka | `Props(new MyActor(arg1, arg2))` | Actor struct fields = constructor args |
-| Ractor | `Actor::spawn(name, actor, arguments)` → `pre_start(args)` | Actor struct fields = args, `on_start()` = `pre_start` |
-| Kameo | `Actor::spawn(args)` → `on_start(args)` | Same pattern |
-| Coerce | `MyActor { fields }.into_actor(name, &sys)` | Same pattern |
-
-**Async initialization in `on_start`:**
-
-For actors that need async setup (database connections, service discovery,
-file I/O), use `on_start` — it runs after spawn but before any messages:
-
 ```rust
-struct DatabaseWorker {
+// ── Tier 2: Async init — Args ≠ State, Deps = () ────────────
+// Args are serializable config. State has non-serializable resources.
+// No local dependencies.
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DatabaseWorkerArgs {
     connection_string: String,
     pool_size: usize,
-    conn: Option<DbPool>,
+}
+
+struct DatabaseWorker {
+    args: DatabaseWorkerArgs,
+    conn: Option<DbPool>,     // non-serializable, created in on_start()
 }
 
 impl Actor for DatabaseWorker {
+    type Args = DatabaseWorkerArgs;
+
+    fn create(args: DatabaseWorkerArgs, _deps: ()) -> Self {
+        DatabaseWorker { args, conn: None }
+    }
+
     async fn on_start(&mut self, _ctx: &mut ActorContext) {
-        // Async initialization: connect to database
         self.conn = Some(
-            DbPool::connect(&self.connection_string)
-                .max_connections(self.pool_size)
+            DbPool::connect(&self.args.connection_string)
+                .max_connections(self.args.pool_size)
                 .await
-                .expect("failed to connect to database")
+                .expect("failed to connect")
         );
-        tracing::info!("DatabaseWorker connected to {}", self.connection_string);
     }
+}
 
-    async fn on_stop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            conn.close().await;
-        }
-        tracing::info!("DatabaseWorker disconnected");
-    }
+let worker = runtime.spawn("db-worker", DatabaseWorkerArgs {
+    connection_string: "postgres://localhost/mydb".into(),
+    pool_size: 10,
+});
+```
 
-    fn on_error(&mut self, error: &ActorError) -> ErrorAction {
-        match error.code {
-            ErrorCode::Unavailable => ErrorAction::Restart,  // reconnect
-            _ => ErrorAction::Stop,
+```rust
+// ── Tier 3: Local dependencies — Args + Deps ────────────────
+// The actor depends on other actors or shared local services
+// that cannot be serialized.
+
+#[derive(Clone, Serialize, Deserialize)]
+struct OrderProcessorArgs {
+    region: String,
+    max_retries: u32,
+}
+
+/// Local dependencies — resolved at the target node, never serialized.
+struct OrderProcessorDeps {
+    payment_service: ActorRef<PaymentService>,
+    inventory: ActorRef<InventoryManager>,
+    metrics: Arc<MetricsCollector>,
+}
+
+struct OrderProcessor {
+    args: OrderProcessorArgs,
+    deps: OrderProcessorDeps,
+    pending_orders: Vec<Order>,
+}
+
+impl Actor for OrderProcessor {
+    type Args = OrderProcessorArgs;
+    type Deps = OrderProcessorDeps;
+
+    fn create(args: OrderProcessorArgs, deps: OrderProcessorDeps) -> Self {
+        OrderProcessor {
+            args,
+            deps,
+            pending_orders: Vec::new(),
         }
     }
 }
 
-// Spawn with parameters — on_start() does the async work:
-let worker = runtime.spawn("db-worker", DatabaseWorker {
-    connection_string: "postgres://localhost/mydb".into(),
-    pool_size: 10,
-    conn: None,
-});
-// worker is immediately usable — messages queue until on_start() completes
+#[async_trait]
+impl Handler<PlaceOrder> for OrderProcessor {
+    async fn handle(&mut self, msg: PlaceOrder, _ctx: &mut ActorContext)
+        -> Result<OrderId, ActorError>
+    {
+        // Use local dependencies — these are ActorRefs, not serializable
+        let payment = self.deps.payment_service
+            .ask(ChargeCard { amount: msg.total })
+            .await?;
+
+        self.deps.inventory
+            .tell(ReserveItems { items: msg.items.clone() })
+            .unwrap();
+
+        self.deps.metrics.record_order(&self.args.region);
+
+        Ok(payment.order_id)
+    }
+}
+
+// ── Local spawn with deps ───────────────────────────────────
+let payment = runtime.spawn("payment", PaymentServiceArgs { ... });
+let inventory = runtime.spawn("inventory", InventoryArgs { ... });
+let metrics = Arc::new(MetricsCollector::new());
+
+let processor = runtime.spawn_with_deps(
+    "order-processor",
+    OrderProcessorArgs { region: "us-east".into(), max_retries: 3 },
+    OrderProcessorDeps { payment_service: payment, inventory, metrics },
+);
 ```
 
-**Restart behavior:** When `ErrorAction::Restart` is triggered, the runtime
-calls `on_stop()`, then **re-creates the actor from the original spawn
-arguments** (or a factory function) and calls `on_start()` again. This means
-the actor's initial state (connection_string, pool_size) is preserved but
-runtime state (conn) is reset — matching Erlang's restart semantics.
+**The `spawn()` signatures become:**
+
+```rust
+impl ActorRuntime {
+    /// Spawn an actor with no local dependencies (Deps = ()).
+    fn spawn<A: Actor<Deps = ()>>(&self, name: &str, args: A::Args) -> ActorRef<A>;
+
+    /// Spawn an actor with local dependencies.
+    fn spawn_with_deps<A: Actor>(
+        &self, name: &str, args: A::Args, deps: A::Deps,
+    ) -> ActorRef<A>;
+
+    /// Spawn with full configuration (mailbox, interceptors, target node).
+    fn spawn_with_config<A: Actor>(
+        &self, name: &str, args: A::Args, deps: A::Deps, config: SpawnConfig,
+    ) -> Result<ActorRef<A>, RuntimeError>;
+}
+```
+
+**Remote spawn with Deps:**
+
+When spawning remotely, `Args` is serialized and sent over the wire, but
+`Deps` must be resolved **on the target node**. This is done via a
+`DepsFactory` registered in the remote node's `TypeRegistry`:
+
+```rust
+/// Factory that resolves local dependencies on the target node.
+/// Registered per actor type in the TypeRegistry.
+pub trait DepsFactory<A: Actor>: Send + Sync + 'static {
+    /// Resolve dependencies using the local runtime.
+    /// Called on the target node after receiving a remote spawn request.
+    fn resolve(&self, runtime: &dyn ActorRuntime) -> Result<A::Deps, ActorError>;
+}
+
+// Registration on the remote node at startup:
+runtime.register_remote_actor::<OrderProcessor>(
+    OrderProcessorDepsFactory { /* config for how to find local services */ }
+);
+```
+
+```mermaid
+sequenceDiagram
+    participant C as Caller (Node 1)
+    participant N as Network
+    participant R2 as Runtime (Node 3)
+    participant DF as DepsFactory (Node 3)
+    participant A as Actor (Node 3)
+
+    C->>N: SpawnRequest { type: "OrderProcessor", args: {region, retries} }
+    N->>R2: deliver spawn request
+
+    R2->>R2: 1. Deserialize Args
+    R2->>DF: 2. resolve(runtime) → OrderProcessorDeps
+    Note over DF: Looks up local PaymentService,<br/>InventoryManager ActorRefs,<br/>creates MetricsCollector
+    DF-->>R2: 3. Returns Deps
+
+    R2->>R2: 4. Actor::create(args, deps)
+    R2->>A: 5. on_start()
+    A-->>R2: 6. Ready
+    R2->>N: 7. Return ActorId
+```
+
+**Restart with Deps:** On restart, the runtime keeps the original `Args` and
+calls `DepsFactory::resolve()` again to get fresh `Deps`. This ensures the
+restarted actor gets current references to local services (which may have
+themselves restarted with new ActorIds since the original spawn).
 
 **Actor lifecycle ordering guarantee:**
 
