@@ -91,6 +91,7 @@ capability. **≥ 2** means it qualifies for inclusion in dactor.
 | Clock abstraction | ✓ | ✓ | — | — | — | — | **2** | ✅ |
 | Streaming responses | ✓ | ✓ | — | — | — | — | **2** | ✅ |
 | Priority mailbox | ~ | ✓ | — | ✓ | — | — | **2+** | ✅ |
+| Actor pool / worker factory | ✓ | ✓ | ✓ | ✓ | ~ | ~ | **4+** | ✅ |
 | Hot code upgrade | ✓ | — | — | — | — | — | **1** | ❌ |
 
 ### 2.3 NotSupported Error
@@ -186,6 +187,7 @@ pub struct RuntimeCapabilities {
 | **Clock/time** | `erlang:monotonic_time` | Scheduler | — | — | — | — |
 | **Streaming responses** | Multi-part `gen_server` reply | Akka Streams `Source` | — | — | — | — |
 | **Priority mailbox** | Selective receive (mimic) | `PriorityMailbox` (native) | — | Custom mailbox pluggable | — | — |
+| **Actor pool / workers** | `poolboy`, supervisor pools | `Routers.pool()` with routing strategies | `Factory` + `Worker` trait | `ActorPool` built-in | `SyncArbiter` (N instances) | Sharding primitives |
 
 ### 3.1 Key Takeaways
 
@@ -1640,6 +1642,151 @@ Ordering is a fundamental contract that actors rely on. dactor specifies:
 6. **Cross-node messages:** No ordering guarantee across nodes. Network latency,
    retries, and partitions can reorder messages. Applications requiring
    cross-node ordering should use sequence numbers or vector clocks.
+
+### 8.3 Actor Pool / Worker Factory
+
+**Rationale:** A single actor processes messages sequentially — this is safe
+but limits throughput. When work is stateless or partitionable, a **pool of
+worker actors** can process messages in parallel. This is supported by 4+ of
+the 6 surveyed frameworks, qualifying under the superset rule.
+
+| Framework | Mechanism | Routing Strategies |
+|---|---|---|
+| **Erlang/OTP** | `poolboy` library, supervisor-managed worker pools | Checkout/checkin, FIFO |
+| **Akka** | `Routers.pool(N)` with configurable routing | RoundRobin, Random, SmallestMailbox, Broadcast, ConsistentHashing |
+| **Ractor** | `Factory` module with `Worker` trait | RoundRobin, KeyPersistent (sticky), StickyQueuer, Custom |
+| **Kameo** | `ActorPool` built-in abstraction | Round-robin, least-connections |
+| **Actix** | `SyncArbiter::start(N, \|\| MyActor)` for N instances | Round-robin (implicit) |
+| **Coerce** | Sharding primitives, custom routing | Shard-key-based distribution |
+
+**dactor API:**
+
+```rust
+/// Routing strategy for distributing messages across pool workers.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum PoolRouting {
+    /// Distribute messages evenly across workers in order.
+    RoundRobin,
+    /// Route to the worker with the fewest queued messages.
+    LeastLoaded,
+    /// Route randomly.
+    Random,
+    /// Route by a key — all messages with the same key go to the same
+    /// worker, preserving per-key ordering (sticky sessions).
+    KeyBased,
+}
+
+/// Configuration for an actor pool.
+pub struct PoolConfig {
+    /// Number of worker instances.
+    pub pool_size: usize,
+    /// How to distribute messages across workers.
+    pub routing: PoolRouting,
+    /// Per-worker spawn configuration (mailbox, interceptors).
+    pub worker_config: SpawnConfig,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            pool_size: num_cpus::get(),
+            routing: PoolRouting::RoundRobin,
+            worker_config: SpawnConfig::default(),
+        }
+    }
+}
+```
+
+**Spawning a pool:**
+
+```rust
+/// A handle to a pool of actors. Sending a message to the pool
+/// routes it to one worker according to the routing strategy.
+/// Implements the same ActorRef<A> interface as a single actor.
+pub struct PoolRef<A: Actor> { /* ... */ }
+
+impl ActorRuntime {
+    /// Spawn a pool of N identical worker actors.
+    /// Each worker runs independently with its own state.
+    /// Returns a PoolRef that distributes messages across workers.
+    fn spawn_pool<A: Actor>(
+        &self,
+        name: &str,
+        pool_config: PoolConfig,
+        factory: impl Fn() -> A + Send + 'static,
+    ) -> Result<PoolRef<A>, RuntimeError>;
+}
+```
+
+**Usage example:**
+
+```rust
+// Define a stateless worker
+struct ImageResizer {
+    quality: u32,
+}
+impl Actor for ImageResizer {}
+
+struct Resize { image: Vec<u8>, width: u32 }
+impl Message for Resize { type Reply = Vec<u8>; }
+
+#[async_trait]
+impl Handler<Resize> for ImageResizer {
+    async fn handle(&mut self, msg: Resize, _ctx: &mut ActorContext) -> Vec<u8> {
+        // CPU-bound work — benefits from parallel workers
+        resize_image(&msg.image, msg.width, self.quality)
+    }
+}
+
+// Spawn a pool of 8 workers
+let pool = runtime.spawn_pool(
+    "image-resizer",
+    PoolConfig {
+        pool_size: 8,
+        routing: PoolRouting::RoundRobin,
+        ..Default::default()
+    },
+    || ImageResizer { quality: 85 },
+)?;
+
+// Send work — distributed across 8 workers in parallel
+let result = pool.ask(Resize { image, width: 800 }).await?;
+```
+
+**Key-based (sticky) routing:**
+
+```rust
+/// For key-based routing, messages must implement this trait
+/// to extract the routing key.
+pub trait Keyed {
+    type Key: Hash + Eq + Clone + Send;
+    fn key(&self) -> Self::Key;
+}
+
+// Example: route by user_id — all messages for the same user
+// go to the same worker, preserving per-user ordering
+struct UserRequest { user_id: u64, action: String }
+
+impl Keyed for UserRequest {
+    type Key = u64;
+    fn key(&self) -> u64 { self.user_id }
+}
+```
+
+**Important:** Each worker in the pool is an **independent actor** with its own
+state. The sequential execution guarantee (§4.3) applies per worker — no two
+handlers run concurrently on the same worker instance. Parallelism comes from
+having multiple workers, each processing their own messages.
+
+**Adapter support:**
+
+| Adapter | Strategy | Detail |
+|---|:---:|---|
+| dactor-ractor | ✅ Library | ractor's `Factory` module with `Worker` trait, multiple routing strategies |
+| dactor-kameo | ✅ Library | kameo's `ActorPool` built-in abstraction |
+| dactor-coerce | ⚙️ Adapter | coerce has sharding primitives; adapter wraps as pool with routing |
+| dactor-mock | ⚙️ Adapter | mock runtime spawns N local actors with routing logic |
 
 ---
 
