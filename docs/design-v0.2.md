@@ -1197,13 +1197,49 @@ pub enum Disposition {
     /// — fire-and-forget has no error feedback. For `ask()`, the reply
     /// channel is dropped so the sender's `.await` yields a channel error.
     Drop,
-    /// Reject the message with a reason. The interceptor's `name()` is
-    /// automatically attached by the runtime. Semantics differ by send mode:
+    /// Reject the message with a reason. Only the reason string is provided
+    /// here — the runtime automatically attaches the interceptor's `name()`
+    /// when constructing the error for the caller. Semantics differ by send mode:
     /// - `tell()`: behaves like `Drop` (fire-and-forget has no error path)
     /// - `ask()`: sender receives `Err(RuntimeError::Rejected { interceptor, reason })`
     ///   immediately — giving a clear, actionable error
     Reject(String),
 }
+```
+
+**How the runtime constructs the `Rejected` error:**
+
+```rust
+// Inside the runtime's interceptor pipeline execution:
+for interceptor in &interceptors {
+    match interceptor.on_receive(&ctx, &mut headers) {
+        Disposition::Continue => continue,
+        Disposition::Drop => return drop_message(),
+        Disposition::Reject(reason) => {
+            // Runtime attaches the interceptor's name — the interceptor
+            // itself only provides the reason.
+            return Err(RuntimeError::Rejected {
+                interceptor: interceptor.name(),  // ← from Interceptor::name()
+                reason,
+            });
+        }
+    }
+}
+```
+
+**What the caller sees:**
+
+```rust
+match actor.ask(Transfer { amount: 1000 }).await {
+    Ok(receipt) => { /* success */ }
+    Err(RuntimeError::Rejected { interceptor, reason }) => {
+        // interceptor = "rate-limiter"
+        // reason = "exceeded 100 requests/sec for actor order-processor"
+        eprintln!("Rejected by '{}': {}", interceptor, reason);
+    }
+    Err(other) => { /* other errors */ }
+}
+```
 
 /// Metadata about the message and its target, provided to interceptors
 /// alongside the mutable headers. All fields are read-only.
