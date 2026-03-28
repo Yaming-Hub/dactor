@@ -2072,6 +2072,101 @@ Caller Node                                              Remote Node
 | **Runtime error** | `RuntimeError::Actor(ActorError)` | Handler panicked, unhandled exception | Handler panics — adapter captures and wraps as `ActorError` |
 | **Infrastructure error** | `RuntimeError::Send` / `NotSupported` | Network timeout, node down, serialization failure | Message never reached the actor or reply was lost |
 
+### 10.3 Sending to Unavailable Actors
+
+When sending a message (local or remote) to an actor that is not available,
+the behavior depends on the send mode and the reason for unavailability.
+
+**Three failure scenarios:**
+
+```mermaid
+graph LR
+    subgraph "Actor State"
+        NS[Not Started<br/>on_start in progress]
+        ST[Stopped<br/>was running, now dead]
+        NE[Does Not Exist<br/>never spawned / wrong ID]
+    end
+
+    subgraph "tell() behavior"
+        T_NS["Queued ✓<br/>delivered after on_start"]
+        T_ST["Err(Send) or Dead Letter"]
+        T_NE["Err(Send)"]
+    end
+
+    subgraph "ask() behavior"
+        A_NS["Blocks until on_start,<br/>then handled ✓"]
+        A_ST["Err(Actor: ActorNotFound)"]
+        A_NE["Err(Actor: ActorNotFound)"]
+    end
+
+    NS --> T_NS
+    NS --> A_NS
+    ST --> T_ST
+    ST --> A_ST
+    NE --> T_NE
+    NE --> A_NE
+```
+
+#### Scenario 1: Actor not yet started (`on_start` in progress)
+
+The actor has been spawned but `on_start()` has not completed.
+
+| Send mode | Behavior |
+|---|---|
+| `tell()` | Message is **queued** in the mailbox. Delivered after `on_start()` completes. Returns `Ok(())` — the caller is unaware of the delay. |
+| `ask()` | The future **blocks** until `on_start()` completes and the handler processes the message. If using `ask_timeout()`, the timeout includes the `on_start()` wait time. |
+| `stream()` | Same as `ask()` — the stream setup is queued until `on_start()` completes. |
+
+This is by design — `spawn()` returns an `ActorRef` immediately, and
+callers can start sending without waiting for initialization.
+
+#### Scenario 2: Actor has stopped (was running, now dead)
+
+The actor existed but has been stopped (graceful shutdown, error, or
+supervision decision).
+
+| Send mode | Behavior | Error |
+|---|---|---|
+| `tell()` | Returns `Err(RuntimeError::Send(...))`. The message is forwarded to the dead letter handler (§5.3). | `ActorSendError("actor stopped")` |
+| `ask()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Caller gets a structured error with the actor ID. |
+| `stream()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Same as `ask()`. |
+
+**Remote variant:** If the actor was on a remote node, the adapter may not
+immediately know it has stopped. The message is sent over the network, and
+the remote node replies with an error. The caller sees the same `ActorNotFound`
+error, but with higher latency. If the remote node itself is down, the caller
+sees `Err(RuntimeError::Send(...))` after a network timeout.
+
+#### Scenario 3: Actor does not exist (never spawned / wrong ID)
+
+The `ActorRef` points to an actor that was never created, or the ID is
+invalid (e.g., stale reference from a previous incarnation).
+
+| Send mode | Behavior | Error |
+|---|---|---|
+| `tell()` | Returns `Err(RuntimeError::Send(...))`. Message goes to dead letter handler. | `ActorSendError("actor not found")` |
+| `ask()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Immediate error — no network round-trip needed for local refs. |
+| `stream()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Same as `ask()`. |
+
+**How can this happen?**
+- Stale `ActorRef` from before a restart (new incarnation, different `ActorId.local`)
+- Serialized/deserialized `ActorRef` pointing to an actor that no longer exists
+- Bug: wrong actor name in `runtime.lookup()`
+
+**Remote variant:** The remote node looks up the actor ID in its registry
+and returns `ActorNotFound`. If the remote **node** doesn't exist (wrong
+`NodeId`), the caller gets a network-level error after timeout.
+
+#### Summary table
+
+| Scenario | `tell()` return | `ask()` return | Dead letter? |
+|---|---|---|---|
+| Not started (on_start pending) | `Ok(())` — queued | Blocks, then `Ok(reply)` | No |
+| Stopped | `Err(Send)` | `Err(Actor { ActorNotFound })` | Yes |
+| Never existed | `Err(Send)` | `Err(Actor { ActorNotFound })` | Yes |
+| Remote node down | `Err(Send)` | `Err(Send)` after timeout | Yes |
+| Remote actor stopped | `Err(Send)` | `Err(Actor { ActorNotFound })` | Yes (on remote) |
+
 ---
 
 ## 11. Observability
