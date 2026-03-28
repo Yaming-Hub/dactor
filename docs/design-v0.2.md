@@ -2706,19 +2706,20 @@ runtime.spawn_with_config("worker", args, deps, config)?;
 
 Ordering is a fundamental contract that actors rely on. dactor specifies:
 
-1. **Same sender → same actor:** Messages are delivered in send order (FIFO
-   within the same priority level). This matches all 6 surveyed frameworks.
+1. **Same sender → same actor (local):** Messages are delivered in send order
+   (FIFO within the same priority level). This matches all 6 surveyed frameworks.
 
 2. **Different senders → same actor:** No ordering guarantee between senders.
    Messages from sender A and sender B may interleave arbitrarily.
 
-3. **Priority mailbox:** Messages are ordered by priority first, then FIFO
-   within each priority level. A `High` message sent after a `Low` message
-   will be delivered first.
+3. **Priority mailbox (receiver-side):** Messages are ordered by priority
+   first, then FIFO within each priority level. A `HIGH` message sent after
+   a `LOW` message will be delivered first.
 
 4. **Timer-injected messages:** Timer messages (`send_after`, `send_interval`)
    enter the mailbox like any other message and follow mailbox ordering rules.
-   They have `Priority::Normal` unless sent via envelope with explicit priority.
+   They have `Priority::NORMAL` unless an outbound interceptor sets a
+   different priority.
 
 5. **Handler execution:** Handlers on the same actor execute **sequentially**
    (one at a time), never concurrently. This is the fundamental actor model
@@ -2728,7 +2729,126 @@ Ordering is a fundamental contract that actors rely on. dactor specifies:
    retries, and partitions can reorder messages. Applications requiring
    cross-node ordering should use sequence numbers or vector clocks.
 
-### 8.3 Actor Pool / Worker Factory
+7. **Outbound network priority:** When multiple actors on the same node send
+   messages to remote nodes, those messages compete for network I/O. The
+   adapter maintains a **per-destination outbound send queue** that respects
+   the `Priority` header — high-priority outbound messages are sent before
+   low-priority ones. This ensures end-to-end priority: sender-side outbound
+   queue (§8.3) → network → receiver-side mailbox priority queue (§8.1).
+
+### 8.3 Outbound Send Queue
+
+**Problem:** Priority in §8.1 only controls the *receiver's* mailbox ordering.
+If many actors on Node 1 call `tell()` to actors on Node 2, those outbound
+messages compete equally for the network connection — a `CRITICAL` message
+can get stuck behind thousands of `BACKGROUND` messages in the TCP send buffer.
+
+**How existing frameworks handle this:**
+
+| Framework | Outbound priority? | Mechanism |
+|---|:---:|---|
+| **Erlang/OTP** | ✅ Partial | EEP 76 priority messages: runtime dequeues priority messages before normal ones for sending to `dist_ctrl`. Once on TCP wire, order is fixed. |
+| **Akka** | ✅ Native | Artery transport has **priority lanes**: a control lane (system messages, heartbeats) and a data lane (user messages). Control lane is always sent first. Configurable lane count. |
+| **Ractor** | ⚠️ Partial | System messages (Stop) are prioritized over user messages via separate channel. No user-level outbound priority. |
+| **Kameo** | ❌ None | All outbound messages share one libp2p connection. No priority differentiation. |
+| **Coerce** | ❌ None | All outbound messages share one gRPC/TCP connection. No priority differentiation. |
+
+**Key insight from Akka:** The most battle-tested approach is **lane separation**
+— system/control messages always get their own fast path, while user messages
+go through a separate (potentially priority-ordered) lane. This ensures
+cluster health (heartbeats, watch notifications) is never blocked by
+application traffic.
+
+**dactor design:** The adapter maintains a **multi-lane outbound send queue
+per remote node**, inspired by Akka's Artery:
+
+```mermaid
+graph LR
+    subgraph "Node 1 (sender)"
+        A1["Actor A: tell(msg, CRITICAL)"] --> Q
+        A2["Actor B: tell(msg, BACKGROUND)"] --> Q
+        A3["System: heartbeat"] --> CL
+
+        subgraph Q["User Lane (priority-ordered)"]
+            direction TB
+            P1["CRITICAL"]
+            P2["NORMAL"]
+            P3["BACKGROUND"]
+        end
+
+        CL["Control Lane<br/>(always first)"]
+
+        CL -->|"sent first"| N["Network I/O"]
+        Q -->|"then by priority"| N
+    end
+    subgraph "Node 2 (receiver)"
+        N --> MB["Actor Mailbox"]
+    end
+```
+
+**Two lanes:**
+
+| Lane | Contents | Priority |
+|---|---|---|
+| **Control** | Heartbeats, `CancelRequest`, `ChildTerminated`, watch notifications, cluster protocol messages | Always sent first — never blocked by user traffic |
+| **User** | Application `tell()` / `ask()` / `stream()` messages | Priority-ordered using `Priority` header, with optional `FairnessPolicy` |
+
+**Configuration:**
+
+```rust
+/// Outbound queue configuration for remote sends.
+pub struct OutboundQueueConfig {
+    /// Maximum number of user messages buffered per remote node.
+    /// `None` = unbounded. Control lane is always unbounded.
+    pub user_lane_capacity: Option<usize>,
+    /// Fairness policy for the user lane (same trait as mailbox).
+    /// `None` = strict priority (default).
+    pub fairness: Option<Box<dyn FairnessPolicy>>,
+}
+```
+
+**Registration:**
+
+```rust
+runtime.set_outbound_queue_config(OutboundQueueConfig {
+    user_lane_capacity: Some(10_000),
+    fairness: Some(Box::new(WeightedFairQueuing { weight: 20 })),
+});
+```
+
+**End-to-end priority flow:**
+
+```
+Sender actor          Outbound Queue             Network        Receiver mailbox
+     │                     │                        │                 │
+     │ tell(msg)           │                        │                 │
+     │──► outbound         │                        │                 │
+     │    interceptor      │                        │                 │
+     │    stamps priority  │                        │                 │
+     │──────────────────►  │ User Lane              │                 │
+     │                     │ [CRITICAL, NORMAL, BG] │                 │
+     │                     │                        │                 │
+     │ (system heartbeat)  │ Control Lane           │                 │
+     │──────────────────►  │ [always first] ────────►── network ──►  │
+     │                     │                        │                 │
+     │                     │ CRITICAL next ─────────►── network ──►  │
+     │                     │ NORMAL next ───────────►── network ──►  │
+```
+
+**Local sends are unaffected:** When sender and receiver are on the same
+node, messages go directly into the receiver's mailbox — no outbound queue
+is involved. Priority is handled solely by the receiver's mailbox.
+
+**Adapter support:**
+
+| Adapter | Outbound priority | Detail |
+|---|:---:|---|
+| dactor-ractor | ⚙️ Adapter | ractor has partial system message priority; adapter adds user-lane priority queue before `ractor_cluster` send |
+| dactor-kameo | ⚙️ Adapter | kameo has no outbound priority; adapter wraps with two-lane queue before libp2p send |
+| dactor-coerce | ⚙️ Adapter | coerce has no outbound priority; adapter wraps with two-lane queue before gRPC send |
+| dactor-mock | ⚙️ Adapter | MockNetwork supports configurable outbound queue per link |
+
+### 8.4 Actor Pool / Worker Factory
 
 **Rationale:** A single actor processes messages sequentially — this is safe
 but limits throughput. When work is stateless or partitionable, a **pool of
