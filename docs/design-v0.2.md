@@ -2849,14 +2849,55 @@ sequenceDiagram
 node, messages go directly into the receiver's mailbox — no outbound queue
 is involved. Priority is handled solely by the receiver's mailbox.
 
-**Adapter support:**
+**Implementation: core crate, not adapters.**
 
-| Adapter | Outbound priority | Detail |
-|---|:---:|---|
-| dactor-ractor | ⚙️ Adapter | ractor has partial system message priority; adapter adds user-lane priority queue before `ractor_cluster` send |
-| dactor-kameo | ⚙️ Adapter | kameo has no outbound priority; adapter wraps with two-lane queue before libp2p send |
-| dactor-coerce | ⚙️ Adapter | coerce has no outbound priority; adapter wraps with two-lane queue before gRPC send |
-| dactor-mock | ⚙️ Adapter | MockNetwork supports configurable outbound queue per link |
+The two-lane outbound queue is implemented **once in the dactor core crate**
+— not duplicated across adapters. Since no underlying library (ractor, kameo,
+coerce) provides outbound priority natively, the logic is identical for all
+adapters. The adapter's only responsibility is providing a raw transport
+function:
+
+```rust
+/// Trait that adapters implement to provide raw network transport.
+/// The core crate handles queueing, priority, lane separation,
+/// and fairness on top of this.
+#[async_trait]
+pub trait NodeTransport: Send + Sync + 'static {
+    /// Send raw bytes to a remote node. The core crate calls this
+    /// after dequeuing from the appropriate lane.
+    async fn send_to_node(&self, target: NodeId, data: Vec<u8>) -> Result<(), ActorError>;
+}
+```
+
+```
+┌─────────────────────────────────────────────────┐
+│  dactor core crate                              │
+│                                                 │
+│  OutboundInterceptors → Two-Lane Queue          │
+│                         ├── Control Lane        │
+│                         └── User Lane (priority)│
+│                                │                │
+│                         FairnessPolicy          │
+│                                │                │
+│                         dequeue & serialize      │
+│                                │                │
+├─────────────────────────────────┼───────────────┤
+│  Adapter (thin layer)          │               │
+│                                ▼               │
+│                    NodeTransport::send_to_node() │
+│                    (ractor_cluster / libp2p /     │
+│                     gRPC / mock channel)         │
+└─────────────────────────────────────────────────┘
+```
+
+| Layer | Responsibility | Implemented in |
+|---|---|---|
+| Outbound interceptors | Stamp headers (trace, priority) | dactor core |
+| Lane separation | Control vs user lane routing | dactor core |
+| Priority ordering | Dequeue by `Priority` within user lane | dactor core |
+| Fairness policy | Prevent starvation across priority levels | dactor core |
+| Serialization | Encode message to bytes | dactor core |
+| Network transport | Send bytes to remote node | Adapter (via `NodeTransport`) |
 
 ### 8.4 Actor Pool / Worker Factory
 
