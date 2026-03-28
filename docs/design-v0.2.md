@@ -2770,339 +2770,52 @@ Ordering is a fundamental contract that actors rely on. dactor specifies:
    queue that respects the `Priority` header. Without this feature, outbound
    messages are sent in the order the adapter receives them (FIFO).
 
-### 8.3 Outbound Send Queue
+### 8.3 Network-Level Message Priority
 
-> ⚠️ **Optional feature.** The outbound send queue interposes between the
-> application and the adapter's native network layer. This adds value
-> (priority ordering, lane separation) but also adds risk — it re-wraps
-> networking code that the underlying library already handles, which may
-> introduce bugs or performance regressions.
->
-> **Default behavior (feature disabled):** Messages go directly to the
-> adapter's native send path. No priority ordering on the outbound side.
-> Priority is only enforced at the receiver's mailbox (§8.1).
->
-> **When enabled (`features = ["outbound-priority"]`):** The dactor core
-> interposes a two-lane priority queue between the application and the
-> adapter's `NodeTransport`. This provides end-to-end priority but
-> requires the adapter to implement `NodeTransport` instead of using
-> its native send API directly.
+**Problem:** Priority in §8.1 controls the *receiver's* mailbox ordering
+only. When messages travel across the network, they compete for I/O
+resources. A `CRITICAL` message can get stuck behind thousands of
+`BACKGROUND` messages in the network send buffer.
 
-**Problem:** Priority in §8.1 only controls the *receiver's* mailbox ordering.
-If many actors on Node 1 call `tell()` to actors on Node 2, those outbound
-messages compete equally for the network connection — a `CRITICAL` message
-can get stuck behind thousands of `BACKGROUND` messages in the TCP send buffer.
+**dactor's position:** As an abstraction framework, dactor does **not**
+implement or re-wrap the network layer. dactor defines **logical priority**
+(`Priority(u8)`) and enforces it at the mailbox level. Network-level
+prioritization is the **provider's responsibility**.
 
-**How existing frameworks handle this:**
+If the provider supports network-level priority natively, the adapter maps
+dactor's `Priority` to the provider's mechanism. If it doesn't, outbound
+messages are sent FIFO — priority is only enforced at the receiver's mailbox.
+
+**How existing frameworks handle outbound priority:**
 
 | Framework | Outbound priority? | Mechanism |
 |---|:---:|---|
-| **Erlang/OTP** | ✅ Partial | EEP 76 priority messages: runtime dequeues priority messages before normal ones for sending to `dist_ctrl`. Once on TCP wire, order is fixed. |
-| **Akka** | ✅ Native | Artery transport has **priority lanes**: a control lane (system messages, heartbeats) and a data lane (user messages). Control lane is always sent first. Configurable lane count. |
-| **Ractor** | ⚠️ Partial | System messages (Stop) are prioritized over user messages via separate channel. No user-level outbound priority. |
-| **Kameo** | ❌ None | All outbound messages share one libp2p connection. No priority differentiation. |
-| **Coerce** | ❌ None | All outbound messages share one gRPC/TCP connection. No priority differentiation. |
+| **Erlang/OTP** | ✅ Partial | EEP 76: runtime dequeues priority messages before normal ones for `dist_ctrl`. Once on TCP wire, order is fixed. |
+| **Akka** | ✅ Native | Artery transport: control lane (system) + data lane (user). Control always sent first. |
+| **Ractor** | ⚠️ Partial | System messages (Stop) prioritized via separate channel. No user-level outbound priority. |
+| **Kameo** | ❌ None | All outbound messages share one libp2p connection. |
+| **Coerce** | ❌ None | All outbound messages share one gRPC/TCP connection. |
 
-**Key insight from Akka:** The most battle-tested approach is **lane separation**
-— system/control messages always get their own fast path, while user messages
-go through a separate (potentially priority-ordered) lane. This ensures
-cluster health (heartbeats, watch notifications) is never blocked by
-application traffic.
+**Adapter mapping:**
 
-**dactor design:** The adapter maintains a **multi-lane outbound send queue
-per remote node**, inspired by Akka's Artery:
+| Adapter | Provider supports outbound priority? | Adapter behavior |
+|---|:---:|---|
+| dactor-ractor | ⚠️ System messages only | Maps dactor control messages to ractor's system channel. User-level priority: not supported on outbound. |
+| dactor-kameo | ❌ | No outbound priority. Messages sent FIFO. |
+| dactor-coerce | ❌ | No outbound priority. Messages sent FIFO. |
+| dactor-mock | ⚙️ Simulated | MockNetwork can simulate outbound priority for testing. |
 
-```mermaid
-graph LR
-    subgraph "Node 1 (sender)"
-        A1["Actor A: tell(msg, CRITICAL)"] --> Q
-        A2["Actor B: tell(msg, BACKGROUND)"] --> Q
-        A3["System: heartbeat"] --> CL
+**What this means for applications:**
 
-        subgraph Q["User Lane (priority-ordered)"]
-            direction TB
-            P1["CRITICAL"]
-            P2["NORMAL"]
-            P3["BACKGROUND"]
-        end
-
-        CL["Control Lane<br/>(always first)"]
-
-        CL -->|"sent first"| N["Network I/O"]
-        Q -->|"then by priority"| N
-    end
-    subgraph "Node 2 (receiver)"
-        N --> MB["Actor Mailbox"]
-    end
-```
-
-**Two lanes:**
-
-| Lane | Contents | Priority |
-|---|---|---|
-| **Control** | Heartbeats, `CancelRequest`, `ChildTerminated`, watch notifications, cluster protocol messages | Always sent first — never blocked by user traffic |
-| **User** | Application `tell()` / `ask()` / `stream()` messages | Priority-ordered using `MessageComparer` trait |
-
-**How custom priorities work within the user lane:**
-
-The user lane is a **single priority queue** ordered by the `Priority(u8)`
-value — not one sub-lane per priority level. All 256 possible priority values
-(including built-in constants and custom values) are handled uniformly:
-
-```
-User Lane (one priority queue):
-┌──────────────────────────────────────────────────┐
-│  Priority(0)   CRITICAL     ← dequeued first     │
-│  Priority(32)  custom                            │
-│  Priority(64)  HIGH                              │
-│  Priority(96)  custom                            │
-│  Priority(128) NORMAL                            │
-│  Priority(160) custom                            │
-│  Priority(192) LOW                               │
-│  Priority(255) BACKGROUND   ← dequeued last      │
-└──────────────────────────────────────────────────┘
-```
-
-There are only **two lanes** (control + user), not 256. The priority queue
-within the user lane sorts by `Priority(u8)` numerically. Custom priority
-values (e.g., `Priority(96)`) slot in between the named constants naturally
-— no special handling needed. The `MessageComparer` (§8.1) operates across
-all priority levels within the user lane to control ordering and prevent starvation.
-
-**Configuration:**
-
-```rust
-/// Outbound queue configuration for remote sends.
-pub struct OutboundQueueConfig {
-    /// Maximum number of user messages buffered per remote node.
-    /// `None` = unbounded. Control lane is always unbounded.
-    pub user_lane_capacity: Option<usize>,
-    /// Message comparer for the user lane (same trait as mailbox).
-    /// `None` = `StrictPriorityComparer` (default).
-    pub comparer: Option<Box<dyn MessageComparer>>,
-}
-```
-
-**Registration:**
-
-```rust
-runtime.set_outbound_queue_config(OutboundQueueConfig {
-    user_lane_capacity: Some(10_000),
-    comparer: Some(Box::new(AgingComparer { max_wait: Duration::from_secs(30) })),
-});
-```
-
-**End-to-end priority flow:**
-
-```mermaid
-sequenceDiagram
-    participant S as Sender Actor
-    participant OI as Outbound Interceptor
-    participant CL as Control Lane
-    participant UL as User Lane
-    participant N as Network
-    participant RM as Receiver Mailbox
-    participant H as Handler
-
-    S->>OI: tell(msg)
-    OI->>OI: stamp Priority header
-
-    alt System message (heartbeat, cancel, watch)
-        OI->>CL: enqueue
-        CL->>N: sent FIRST (always)
-    else User message
-        OI->>UL: enqueue by priority
-        Note over UL: CRITICAL → NORMAL → BACKGROUND
-        UL->>N: sent in priority order
-    end
-
-    N->>RM: deliver to receiver mailbox
-    Note over RM: priority-ordered dequeue
-    RM->>H: handle(msg)
-```
-
-**Local sends are unaffected:** When sender and receiver are on the same
-node, messages go directly into the receiver's mailbox — no outbound queue
-is involved. Priority is handled solely by the receiver's mailbox.
-
-**Implementation: core crate, not adapters.**
-
-The two-lane outbound queue is implemented **once in the dactor core crate**
-— not duplicated across adapters. Since no underlying library (ractor, kameo,
-coerce) provides outbound priority natively, the logic is identical for all
-adapters. The adapter's only responsibility is providing a raw transport
-function:
-
-```rust
-/// Trait that adapters implement to provide raw network transport.
-/// The core crate handles queueing, priority, lane separation,
-/// and fairness on top of this.
-#[async_trait]
-pub trait NodeTransport: Send + Sync + 'static {
-    /// Send raw bytes to a remote node. The core crate calls this
-    /// after dequeuing from the appropriate lane.
-    async fn send_to_node(&self, target: NodeId, data: Vec<u8>) -> Result<(), ActorError>;
-}
-```
-
-```mermaid
-graph TB
-    subgraph "dactor core crate"
-        OI[Outbound Interceptors] --> LS{Lane Separator}
-        LS -->|system msg| CL[Control Lane<br/>always first]
-        LS -->|user msg| UL[User Lane<br/>priority queue]
-        UL --> MC[MessageComparer<br/>ordering]
-        MC --> SER[Dequeue & Serialize]
-        CL --> SER
-    end
-    subgraph "Adapter (thin layer)"
-        SER --> NT["NodeTransport::send_to_node()<br/>(ractor_cluster / libp2p / gRPC / mock)"]
-    end
-```
-
-| Layer | Responsibility | Implemented in |
-|---|---|---|
-| Outbound interceptors | Stamp headers (trace, priority) | dactor core |
-| Lane separation | Control vs user lane routing | dactor core |
-| Priority ordering | Dequeue by `Priority` within user lane | dactor core |
-| Fairness policy | Prevent starvation across priority levels | dactor core |
-| Serialization | Encode message to bytes | dactor core |
-| Network transport | Send bytes to remote node | Adapter (via `NodeTransport`) |
-
-**Implementation detail: how the two-lane queue runs.**
-
-The two-lane queue is **not an actor** — it's a background tokio task per
-remote node connection, managed by the dactor core's `ConnectionManager`.
-This avoids circular dependencies (actors sending to the queue actor which
-sends to the network which delivers to actors).
-
-```mermaid
-graph TB
-    subgraph "dactor core: ConnectionManager"
-        CM[ConnectionManager] -->|"one per remote node"| NC1[NodeConnection to Node 2]
-        CM --> NC2[NodeConnection to Node 3]
-    end
-
-    subgraph "NodeConnection (per remote node)"
-        CL["Control Channel<br/>(unbounded mpsc)"]
-        UL["User Channel<br/>(priority BinaryHeap)"]
-        DL["Drain Loop<br/>(tokio task)"]
-        CL --> DL
-        UL --> DL
-        DL -->|"bytes"| NT["NodeTransport::send_to_node()"]
-    end
-```
-
-```rust
-/// Manages outbound connections to all remote nodes.
-/// Created once per runtime. NOT an actor — a plain struct with
-/// a HashMap of per-node connections.
-pub(crate) struct ConnectionManager {
-    connections: HashMap<NodeId, NodeConnection>,
-    transport: Box<dyn NodeTransport>,
-    config: OutboundQueueConfig,
-}
-
-/// Per-remote-node outbound connection. Contains the two-lane queue
-/// and a background drain task.
-struct NodeConnection {
-    /// Control lane — unbounded, always drained first.
-    control_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// User lane — priority-ordered, drained after control.
-    user_tx: mpsc::UnboundedSender<PriorityMessage>,
-    /// Handle to the background drain task.
-    drain_task: JoinHandle<()>,
-}
-
-struct PriorityMessage {
-    meta: QueuedMessageMeta,
-    data: Vec<u8>,
-}
-```
-
-**The drain loop** is the heart of the two-lane design. It's a `tokio::spawn`
-task that continuously drains both channels, always preferring the control
-lane:
-
-```rust
-/// Background task that drains both lanes and sends to the network.
-async fn drain_loop(
-    mut control_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    mut user_rx: mpsc::UnboundedReceiver<PriorityMessage>,
-    transport: Arc<dyn NodeTransport>,
-    target: NodeId,
-    comparer: Arc<dyn MessageComparer>,
-) {
-    let mut user_heap: BinaryHeap<PriorityMessage> = BinaryHeap::new();
-
-    loop {
-        // Phase 1: drain ALL control messages first (non-blocking)
-        while let Ok(data) = control_rx.try_recv() {
-            let _ = transport.send_to_node(target, data).await;
-        }
-
-        // Phase 2: collect any new user messages into the heap
-        while let Ok(msg) = user_rx.try_recv() {
-            user_heap.push(msg);  // ordered by MessageComparer
-        }
-
-        // Phase 3: send the highest-priority user message
-        if let Some(msg) = user_heap.pop() {
-            let _ = transport.send_to_node(target, msg.data).await;
-        }
-
-        // Phase 4: if both empty, wait for next message from either
-        if user_heap.is_empty() {
-            tokio::select! {
-                Some(data) = control_rx.recv() => {
-                    let _ = transport.send_to_node(target, data).await;
-                }
-                Some(msg) = user_rx.recv() => {
-                    user_heap.push(msg);
-                }
-                else => break, // both channels closed
-            }
-        }
-    }
-}
-```
-
-**Why NOT an actor:** If the drain loop were an actor, sending a message to
-a remote node would require sending a message to the queue actor first —
-adding latency and creating a bottleneck (the queue actor's single-threaded
-mailbox would serialize all outbound sends). Instead, the `control_tx` and
-`user_tx` channels are `mpsc::UnboundedSender` — any actor on any tokio
-task can push a message into them concurrently without waiting.
-
-**Two modes of operation:**
-
-```
-Feature DISABLED (default — safe, zero overhead):
-  actor.tell() → adapter's native send() → library's TCP/libp2p/gRPC
-  ↑ uses adapter's proven, battle-tested network code directly
-  ↑ no priority on outbound side; priority only at receiver mailbox
-
-Feature ENABLED (outbound-priority — adds priority, adds risk):
-  actor.tell() → core.enqueue(priority) → drain_loop → adapter.send()
-  ↑ dactor core interposes a priority queue
-  ↑ end-to-end priority, but re-wraps networking
-```
-
-**When to enable:** Applications with mixed-priority traffic where
-high-priority remote messages (health checks, cancellations) must not be
-delayed by bulk low-priority traffic. Most applications do NOT need this —
-receiver-side priority (§8.1) is sufficient.
-
-**Risk acknowledgment:** Interposing on the network path means dactor core
-handles buffering and ordering that the adapter library was designed to
-manage. This may cause:
-- Increased latency (extra queue hop)
-- Memory overhead (buffered messages in two places)
-- Subtle ordering bugs if the adapter's internal queue also reorders
-- Incompatibility with adapter-specific flow control or backpressure
-
-Applications should test thoroughly with the feature enabled before
-deploying to production.
+- **Receiver-side priority (§8.1) is always available** — the mailbox
+  priority queue works regardless of network ordering.
+- **End-to-end priority** depends on the provider. With Akka-style providers
+  that support outbound lanes, high-priority messages reach the receiver
+  faster. With providers that don't, all messages arrive FIFO and the
+  receiver's priority queue reorders them upon delivery.
+- For most applications, receiver-side priority is sufficient. Network-level
+  priority matters mainly under sustained high-throughput scenarios where
+  the send buffer is consistently full.
 
 ### 8.4 Actor Pool / Worker Factory
 
@@ -3455,28 +3168,35 @@ pub struct ErrorDetail {
 
 **How errors flow in different scenarios:**
 
-```
-Local ask() — same process:
-┌────────┐     ┌─────────┐
-│ Caller │────►│  Actor   │  handler returns Result<Reply, ActorError>
-│        │◄────│          │  or handler panics → converted to ActorError
-│ gets:  │     │          │    code: Internal
-│ Err(   │     │          │    message: panic message
-│  Actor │     │          │    chain: ["panicked at ..."]
-│  Error)│     └─────────┘
-└────────┘
+```mermaid
+sequenceDiagram
+    participant C as Caller
 
-Remote ask() — cross-node via dactor-mock or real network:
-┌────────┐     ┌──────────┐  serialize   ┌──────────┐     ┌─────────┐
-│ Caller │────►│ Adapter  │────────────►│ Network  │────►│  Actor  │
-│        │     │ (local)  │             │          │     │ (remote)│
-│        │     │          │◄────────────│          │◄────│         │
-│ gets:  │◄────│ deser.   │  ActorError │          │     │ returns │
-│ Err(   │     │ ActorErr │  as bytes   │          │     │ ActorErr│
-│  Actor │     └──────────┘             └──────────┘     └─────────┘
-│  Error)│
-└────────┘
-   ↑ Same ActorError type, fully deserialized — code, message, details, chain intact
+    rect rgb(230, 245, 230)
+        Note over C: Local ask — same process
+        participant A1 as Actor
+        C->>A1: ask(msg)
+        A1-->>C: Result::Err(ActorError)<br/>code: Internal<br/>message: panic message<br/>chain: panicked at ...
+    end
+```
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant Ad as Adapter (local)
+    participant N as Network
+    participant A2 as Actor (remote)
+
+    Note over C,A2: Remote ask — cross-node
+    C->>Ad: ask(msg)
+    Ad->>N: serialize msg
+    N->>A2: deliver
+    A2->>A2: handler returns Err(ActorError)
+    A2->>N: serialize ActorError
+    N->>Ad: deliver error bytes
+    Ad->>Ad: deserialize ActorError
+    Ad-->>C: Err(ActorError)
+    Note over C: Same ActorError type — code,<br/>message, details, chain intact
 ```
 
 **Conversion from standard Rust errors:**
