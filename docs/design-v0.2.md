@@ -2955,6 +2955,130 @@ graph TB
 | Serialization | Encode message to bytes | dactor core |
 | Network transport | Send bytes to remote node | Adapter (via `NodeTransport`) |
 
+**Implementation detail: how the two-lane queue runs.**
+
+The two-lane queue is **not an actor** — it's a background tokio task per
+remote node connection, managed by the dactor core's `ConnectionManager`.
+This avoids circular dependencies (actors sending to the queue actor which
+sends to the network which delivers to actors).
+
+```mermaid
+graph TB
+    subgraph "dactor core: ConnectionManager"
+        CM[ConnectionManager] -->|"one per remote node"| NC1[NodeConnection to Node 2]
+        CM --> NC2[NodeConnection to Node 3]
+    end
+
+    subgraph "NodeConnection (per remote node)"
+        CL["Control Channel<br/>(unbounded mpsc)"]
+        UL["User Channel<br/>(priority BinaryHeap)"]
+        DL["Drain Loop<br/>(tokio task)"]
+        CL --> DL
+        UL --> DL
+        DL -->|"bytes"| NT["NodeTransport::send_to_node()"]
+    end
+```
+
+```rust
+/// Manages outbound connections to all remote nodes.
+/// Created once per runtime. NOT an actor — a plain struct with
+/// a HashMap of per-node connections.
+pub(crate) struct ConnectionManager {
+    connections: HashMap<NodeId, NodeConnection>,
+    transport: Box<dyn NodeTransport>,
+    config: OutboundQueueConfig,
+}
+
+/// Per-remote-node outbound connection. Contains the two-lane queue
+/// and a background drain task.
+struct NodeConnection {
+    /// Control lane — unbounded, always drained first.
+    control_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// User lane — priority-ordered, drained after control.
+    user_tx: mpsc::UnboundedSender<PriorityMessage>,
+    /// Handle to the background drain task.
+    drain_task: JoinHandle<()>,
+}
+
+struct PriorityMessage {
+    meta: QueuedMessageMeta,
+    data: Vec<u8>,
+}
+```
+
+**The drain loop** is the heart of the two-lane design. It's a `tokio::spawn`
+task that continuously drains both channels, always preferring the control
+lane:
+
+```rust
+/// Background task that drains both lanes and sends to the network.
+async fn drain_loop(
+    mut control_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut user_rx: mpsc::UnboundedReceiver<PriorityMessage>,
+    transport: Arc<dyn NodeTransport>,
+    target: NodeId,
+    comparer: Arc<dyn MessageComparer>,
+) {
+    let mut user_heap: BinaryHeap<PriorityMessage> = BinaryHeap::new();
+
+    loop {
+        // Phase 1: drain ALL control messages first (non-blocking)
+        while let Ok(data) = control_rx.try_recv() {
+            let _ = transport.send_to_node(target, data).await;
+        }
+
+        // Phase 2: collect any new user messages into the heap
+        while let Ok(msg) = user_rx.try_recv() {
+            user_heap.push(msg);  // ordered by MessageComparer
+        }
+
+        // Phase 3: send the highest-priority user message
+        if let Some(msg) = user_heap.pop() {
+            let _ = transport.send_to_node(target, msg.data).await;
+        }
+
+        // Phase 4: if both empty, wait for next message from either
+        if user_heap.is_empty() {
+            tokio::select! {
+                Some(data) = control_rx.recv() => {
+                    let _ = transport.send_to_node(target, data).await;
+                }
+                Some(msg) = user_rx.recv() => {
+                    user_heap.push(msg);
+                }
+                else => break, // both channels closed
+            }
+        }
+    }
+}
+```
+
+**Why NOT an actor:** If the drain loop were an actor, sending a message to
+a remote node would require sending a message to the queue actor first —
+adding latency and creating a bottleneck (the queue actor's single-threaded
+mailbox would serialize all outbound sends). Instead, the `control_tx` and
+`user_tx` channels are `mpsc::UnboundedSender` — any actor on any tokio
+task can push a message into them concurrently without waiting.
+
+**Why NOT reusing the adapter's network layer directly:** Adapters like
+`ractor_cluster` have their own send queues, but they don't support
+priority ordering or lane separation. dactor wraps them:
+
+```
+Without dactor core queue:
+  actor.tell() → adapter.send() → ractor_cluster TCP send buffer (FIFO)
+  ↑ no priority control
+
+With dactor core queue:
+  actor.tell() → core.enqueue(priority) → drain_loop → adapter.send()
+  ↑ priority-ordered, control lane first
+```
+
+The adapter's `NodeTransport::send_to_node()` is the **last mile** — it
+receives already-prioritized, serialized bytes and just pushes them onto
+the wire. The adapter's own internal queue (if any) sees messages in the
+order dactor chose.
+
 ### 8.4 Actor Pool / Worker Factory
 
 **Rationale:** A single actor processes messages sequentially — this is safe
