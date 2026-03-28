@@ -2793,6 +2793,32 @@ graph LR
 | **Control** | Heartbeats, `CancelRequest`, `ChildTerminated`, watch notifications, cluster protocol messages | Always sent first — never blocked by user traffic |
 | **User** | Application `tell()` / `ask()` / `stream()` messages | Priority-ordered using `Priority` header, with optional `FairnessPolicy` |
 
+**How custom priorities work within the user lane:**
+
+The user lane is a **single priority queue** ordered by the `Priority(u8)`
+value — not one sub-lane per priority level. All 256 possible priority values
+(including built-in constants and custom values) are handled uniformly:
+
+```
+User Lane (one priority queue):
+┌──────────────────────────────────────────────────┐
+│  Priority(0)   CRITICAL     ← dequeued first     │
+│  Priority(32)  custom                            │
+│  Priority(64)  HIGH                              │
+│  Priority(96)  custom                            │
+│  Priority(128) NORMAL                            │
+│  Priority(160) custom                            │
+│  Priority(192) LOW                               │
+│  Priority(255) BACKGROUND   ← dequeued last      │
+└──────────────────────────────────────────────────┘
+```
+
+There are only **two lanes** (control + user), not 256. The priority queue
+within the user lane sorts by `Priority(u8)` numerically. Custom priority
+values (e.g., `Priority(96)`) slot in between the named constants naturally
+— no special handling needed. The `FairnessPolicy` (§8.1) operates across
+all priority levels within the user lane to prevent starvation.
+
 **Configuration:**
 
 ```rust
