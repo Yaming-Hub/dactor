@@ -1757,6 +1757,595 @@ pub enum Outcome {
 }
 ```
 
+### 3.15 Watch Notification Delivery
+
+**Problem:** When an actor calls `watch(target)`, how does it receive the
+`ChildTerminated` notification? Does the runtime inject a synthetic message,
+or must the actor explicitly implement a handler for it?
+
+**Decision:** The actor must implement `Handler<ChildTerminated>`. This is
+explicit, type-safe, and consistent with the Handler pattern — no magic
+injection.
+
+```rust
+/// Notification delivered when a watched actor terminates.
+/// Actors that call `watch()` must implement `Handler<ChildTerminated>`
+/// to receive these notifications.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildTerminated {
+    pub child_id: ActorId,
+    pub child_name: String,
+    /// `None` for graceful shutdown, `Some(reason)` for failure.
+    pub reason: Option<String>,
+}
+
+impl Message for ChildTerminated {
+    type Reply = ();
+}
+```
+
+**Usage:**
+
+```rust
+struct Supervisor {
+    children: Vec<ActorId>,
+}
+
+impl Actor for Supervisor {}
+
+#[async_trait]
+impl Handler<ChildTerminated> for Supervisor {
+    async fn handle(&mut self, msg: ChildTerminated, ctx: &mut ActorContext) {
+        tracing::warn!(child = %msg.child_id, reason = ?msg.reason, "child died");
+        self.children.retain(|id| *id != msg.child_id);
+        // Optionally restart the child
+    }
+}
+```
+
+If an actor calls `watch()` but does **not** implement `Handler<ChildTerminated>`,
+the notification is silently dropped (same as an unhandled message). This
+avoids forcing every actor to handle termination events.
+
+### 3.16 Dead Letter Handling
+
+**Problem:** Messages can be lost in several ways: actor stopped before
+consuming them, mailbox overflow with `DropNewest`/`DropOldest`, interceptor
+`Drop`/`Reject`, network failure. What happens to these messages?
+
+**Design:** dactor provides a configurable dead letter sink. Lost messages
+are forwarded to a `DeadLetterHandler` which can log, count, alert, or
+store them for debugging.
+
+```rust
+/// A handler for messages that could not be delivered.
+pub trait DeadLetterHandler: Send + Sync + 'static {
+    /// Called when a message is lost. The message body is type-erased
+    /// (serialized to bytes if possible, otherwise `None`).
+    fn on_dead_letter(&self, event: DeadLetterEvent);
+}
+
+/// Describes a message that was not delivered.
+#[derive(Debug)]
+pub struct DeadLetterEvent {
+    /// Why the message was not delivered.
+    pub reason: DeadLetterReason,
+    /// The target actor (may no longer exist).
+    pub target_actor: ActorId,
+    /// The target actor's name.
+    pub target_name: String,
+    /// The Rust type name of the message.
+    pub message_type: &'static str,
+    /// Headers from the envelope (if available).
+    pub headers: Option<Headers>,
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DeadLetterReason {
+    /// The target actor has stopped.
+    ActorStopped,
+    /// The mailbox was full and the overflow strategy discarded the message.
+    MailboxOverflow,
+    /// An interceptor dropped the message.
+    InterceptorDrop,
+    /// An interceptor rejected the message.
+    InterceptorReject { reason: String },
+    /// Network delivery failed (remote actor unreachable).
+    NetworkFailure { detail: String },
+}
+```
+
+**Registration:**
+
+```rust
+impl ActorRuntime {
+    /// Set the dead letter handler. Only one handler is active at a time.
+    /// Default: `LoggingDeadLetterHandler` which logs at WARN level.
+    fn set_dead_letter_handler(&self, handler: Box<dyn DeadLetterHandler>);
+}
+```
+
+**Built-in handlers:**
+
+```rust
+/// Logs dead letters at WARN level (default).
+pub struct LoggingDeadLetterHandler;
+
+/// Counts dead letters and exposes metrics.
+pub struct CountingDeadLetterHandler { /* AtomicU64 counters */ }
+
+/// Discards dead letters silently (for tests or high-throughput systems).
+pub struct NullDeadLetterHandler;
+```
+
+### 3.17 Message Ordering Guarantees
+
+Ordering is a fundamental contract that actors rely on. dactor specifies:
+
+1. **Same sender → same actor:** Messages are delivered in send order (FIFO
+   within the same priority level). This matches all 6 surveyed frameworks.
+
+2. **Different senders → same actor:** No ordering guarantee between senders.
+   Messages from sender A and sender B may interleave arbitrarily.
+
+3. **Priority mailbox:** Messages are ordered by priority first, then FIFO
+   within each priority level. A `High` message sent after a `Low` message
+   will be delivered first.
+
+4. **Timer-injected messages:** Timer messages (`send_after`, `send_interval`)
+   enter the mailbox like any other message and follow mailbox ordering rules.
+   They have `Priority::Normal` unless sent via envelope with explicit priority.
+
+5. **Handler execution:** Handlers on the same actor execute **sequentially**
+   (one at a time), never concurrently. This is the fundamental actor model
+   guarantee — no locking needed inside handlers.
+
+6. **Cross-node messages:** No ordering guarantee across nodes. Network latency,
+   retries, and partitions can reorder messages. Applications requiring
+   cross-node ordering should use sequence numbers or vector clocks.
+
+### 3.18 Remote Serialization Contract
+
+**Problem:** When messages cross node boundaries, they must be serialized.
+Not all messages need to be serializable (local-only actors don't need it).
+The design must make this explicit without forcing serialization on all users.
+
+**Design:** A marker trait `RemoteMessage` extends `Message` with serialization
+bounds. Only messages intended for remote actors need to implement it.
+
+```rust
+/// Marker for messages that can cross node boundaries.
+/// Requires serde Serialize + Deserialize in addition to Message.
+pub trait RemoteMessage: Message + Serialize + DeserializeOwned {}
+
+/// Blanket impl: any Message that is also Serialize + DeserializeOwned
+/// automatically implements RemoteMessage.
+impl<M> RemoteMessage for M
+where
+    M: Message + Serialize + DeserializeOwned,
+{}
+```
+
+**Compile-time enforcement:** When an adapter detects a cross-node send
+(the target `ActorId.node` differs from the local node), it requires the
+message to implement `RemoteMessage`. This is enforced at the adapter's
+`tell()` / `ask()` implementation:
+
+```rust
+// Inside adapter's cross-node send path:
+fn send_remote<M: RemoteMessage>(&self, target: ActorId, msg: M) -> Result<(), RuntimeError> {
+    let bytes = bincode::serialize(&msg)
+        .map_err(|e| RuntimeError::Send(ActorSendError(format!("serialization failed: {e}"))))?;
+    self.network.deliver(target, bytes)
+}
+```
+
+**Local sends** never serialize — messages are passed by move through channels.
+This means local-only messages can contain non-serializable types (`Arc`, channels,
+closures) without any issue.
+
+**Schema evolution:** dactor does not prescribe a versioning strategy. Recommended
+approaches (all compatible with serde):
+
+| Strategy | How | When |
+|---|---|---|
+| `#[serde(default)]` | New fields get defaults on old receivers | Adding fields |
+| `#[serde(rename)]` | Field renamed without breaking old format | Renaming fields |
+| `#[serde(deny_unknown_fields)]` | Strict: reject messages with unexpected fields | Strict compatibility |
+| Protobuf / flatbuffers | Use a schema-evolution-native format via custom `MessageCodec` | Complex evolution |
+| Envelope version header | Add a `SchemaVersion(u32)` header; handler checks before processing | Explicit versioning |
+
+### 3.19 Adapter Conformance Test Suite
+
+**Problem:** With multiple traits and capabilities, adapters risk subtle
+incompleteness — an adapter might forget to run interceptors on stream
+messages, or not call `on_complete` after handler errors.
+
+**Design:** dactor provides a shared conformance test suite in the core crate
+(behind `#[cfg(feature = "test-support")]`) that any adapter can import and
+run against its `ActorRuntime` implementation.
+
+```rust
+// In dactor::test_support::conformance
+
+/// Run the full adapter conformance test suite against a runtime.
+/// Each test exercises one capability and verifies correct behavior.
+///
+/// Usage in adapter crate's tests:
+/// ```rust
+/// use dactor::test_support::conformance;
+///
+/// #[tokio::test]
+/// async fn conformance() {
+///     let runtime = dactor_ractor::RactorRuntime::new();
+///     conformance::run_all(&runtime).await;
+/// }
+/// ```
+pub async fn run_all<R: ActorRuntime>(runtime: &R) {
+    test_tell_roundtrip(runtime).await;
+    test_ask_roundtrip(runtime).await;
+    test_ask_timeout(runtime).await;
+    test_lifecycle_hooks(runtime).await;
+    test_interceptor_pipeline(runtime).await;
+    test_interceptor_reject_ask(runtime).await;
+    test_interceptor_on_complete(runtime).await;
+    test_group_broadcast(runtime).await;
+    test_group_leave(runtime).await;
+    test_timer_interval(runtime).await;
+    test_timer_cancel(runtime).await;
+    test_stream_backpressure(runtime).await;
+    test_stream_cancellation(runtime).await;
+    test_dead_letter_handler(runtime).await;
+    test_message_ordering(runtime).await;
+    // Capability-gated tests:
+    if runtime.capabilities().watch {
+        test_watch_notification(runtime).await;
+    }
+    if runtime.capabilities().bounded_mailbox {
+        test_bounded_mailbox_overflow(runtime).await;
+    }
+    if runtime.capabilities().priority_mailbox {
+        test_priority_ordering(runtime).await;
+    }
+}
+```
+
+**Error mapping tables** — each adapter documents how it maps the underlying
+library's errors to dactor's `ErrorCode`:
+
+| dactor `ErrorCode` | ractor | kameo | coerce |
+|---|---|---|---|
+| `Internal` | `ActorProcessingErr` | Handler panic | Handler error |
+| `ActorNotFound` | Actor cell dead | `SendError::ActorNotRunning` | Actor not in system |
+| `Unavailable` | Spawn failure | Actor not started | Node unreachable |
+| `Timeout` | `call` timeout | `ask` timeout | `send` timeout |
+| `ResourceExhausted` | — | Mailbox full (`try_send` error) | — |
+| `InvalidArgument` | — (application-level) | — (application-level) | — (application-level) |
+| `PermissionDenied` | — (interceptor) | — (interceptor) | — (interceptor) |
+| `FailedPrecondition` | — (application-level) | — (application-level) | — (application-level) |
+| `Unimplemented` | `NotSupported` | `NotSupported` | `NotSupported` |
+| `Unknown` | Catch-all | Catch-all | Catch-all |
+
+### 3.20 Proc-Macro Error Handling
+
+The `dactor-macros` proc-macro crate must emit clear, actionable compile
+errors for patterns it cannot support. This section documents the expected
+error messages.
+
+**Unsupported patterns and their errors:**
+
+| Pattern | Error message |
+|---|---|
+| Generic method: `async fn foo<T>(&mut self, x: T)` | `#[dactor::messages] does not support generic methods. Use a concrete type or define a separate Message struct manually.` |
+| `impl Trait` return: `async fn foo(&self) -> impl Display` | `#[dactor::messages] requires concrete return types. Use a named type instead of impl Trait.` |
+| Non-Send type in params: `async fn foo(&mut self, x: Rc<u32>)` | `Message fields must be Send. Rc<u32> does not implement Send.` |
+| Non-`&self`/`&mut self` method: `fn foo(x: u64)` | `#[dactor::messages] methods must take &self or &mut self as the first parameter.` |
+| Sync (non-async) method: `fn foo(&self) -> u64` | `#[dactor::messages] methods must be async. Use: async fn foo(&self) -> u64` |
+| Multiple `#[dactor::lifecycle]` impls | `Only one #[dactor::lifecycle] block is allowed per actor.` |
+| `#[dactor::messages]` on non-impl block | `#[dactor::messages] can only be applied to impl blocks.` |
+
+**Diagnostic quality goals:**
+- Errors point to the exact span (method signature, parameter, return type)
+- Suggestions are actionable ("use X instead of Y")
+- No cryptic trait-bound errors leaked from generated code
+
+### 3.21 Runtime Observability
+
+**Problem:** In production, operators need visibility into actor system health:
+which actors are busiest, which fail most, what message sizes look like, how
+long handlers take. Building this into every actor's handler code is
+error-prone and repetitive.
+
+**Design:** dactor provides observability primarily through the **interceptor
+pipeline** (§3.2). Because interceptors see every message with full context
+(`InterceptContext`), they are the natural place to collect metrics. dactor
+also provides a built-in `MetricsInterceptor` and a `RuntimeMetrics` query
+API for common operational needs.
+
+#### 3.21.1 Built-in `MetricsInterceptor`
+
+A ready-to-use interceptor that tracks per-actor and per-message-type
+statistics. Users register it once; it collects everything automatically.
+
+```rust
+/// Built-in interceptor that collects runtime-level metrics.
+/// Register via `runtime.add_interceptor(Box::new(MetricsInterceptor::new()))`.
+pub struct MetricsInterceptor {
+    inner: Arc<MetricsStore>,
+}
+
+impl MetricsInterceptor {
+    pub fn new() -> Self { ... }
+
+    /// Access the collected metrics for querying.
+    pub fn metrics(&self) -> &MetricsStore { ... }
+}
+
+impl Interceptor for MetricsInterceptor {
+    fn on_receive(&self, ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+        self.inner.record_receive(ctx);
+        Disposition::Continue
+    }
+
+    fn on_complete(&self, ctx: &InterceptContext<'_>, _headers: &Headers, outcome: &Outcome) {
+        self.inner.record_complete(ctx, outcome);
+    }
+
+    fn on_stream_item(&self, ctx: &InterceptContext<'_>, _headers: &Headers, seq: u64) {
+        self.inner.record_stream_item(ctx, seq);
+    }
+}
+```
+
+#### 3.21.2 `MetricsStore` Query API
+
+```rust
+/// Queryable metrics collected by `MetricsInterceptor`.
+pub struct MetricsStore { /* internal concurrent maps */ }
+
+impl MetricsStore {
+    // ── Per-actor metrics ───────────────────────────────
+
+    /// Total messages received by each actor (sorted descending = busiest first).
+    pub fn busiest_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
+
+    /// Actors with the most handler errors (sorted descending = most failed first).
+    pub fn most_failed_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
+
+    /// Actors with the highest average handler latency.
+    pub fn slowest_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
+
+    /// Metrics for a specific actor.
+    pub fn actor(&self, id: ActorId) -> Option<ActorMetrics>;
+
+    // ── Per-message-type metrics ────────────────────────
+
+    /// Message types with the highest volume.
+    pub fn busiest_message_types(&self, top_n: usize) -> Vec<MessageTypeMetrics>;
+
+    // ── Global metrics ──────────────────────────────────
+
+    /// Total messages processed across all actors.
+    pub fn total_messages(&self) -> u64;
+
+    /// Total errors across all actors.
+    pub fn total_errors(&self) -> u64;
+
+    /// Reset all counters.
+    pub fn reset(&self);
+}
+
+/// Per-actor statistics.
+#[derive(Debug, Clone)]
+pub struct ActorMetrics {
+    pub actor_id: ActorId,
+    pub actor_name: String,
+    /// Total messages received (tell + ask + stream requests).
+    pub messages_received: u64,
+    /// Total handler errors.
+    pub errors: u64,
+    /// Total handler invocations that succeeded.
+    pub successes: u64,
+    /// Average handler latency.
+    pub avg_latency: Duration,
+    /// Maximum handler latency observed.
+    pub max_latency: Duration,
+    /// Total stream items emitted (if actor handles streams).
+    pub stream_items_emitted: u64,
+    /// Count of messages received per priority level.
+    pub by_priority: HashMap<Priority, u64>,
+    /// Count of remote vs local messages.
+    pub remote_messages: u64,
+    pub local_messages: u64,
+}
+
+/// Per-message-type statistics.
+#[derive(Debug, Clone)]
+pub struct MessageTypeMetrics {
+    pub message_type: String,
+    pub count: u64,
+    pub errors: u64,
+    pub avg_latency: Duration,
+}
+```
+
+#### 3.21.3 Custom Interceptor Examples
+
+The built-in `MetricsInterceptor` covers common needs. For specialized
+observability, users write custom interceptors:
+
+**Example: Message size tracking**
+
+```rust
+use std::mem;
+
+struct MessageSizeInterceptor {
+    sizes: Arc<Mutex<HashMap<String, Vec<usize>>>>,
+}
+
+impl Interceptor for MessageSizeInterceptor {
+    fn on_receive(&self, ctx: &InterceptContext<'_>, _headers: &mut Headers) -> Disposition {
+        // std::mem::size_of gives the stack size of the message type.
+        // For heap-allocated content, use a custom SizeOf header set by the sender.
+        let mut sizes = self.sizes.lock().unwrap();
+        sizes.entry(ctx.message_type.to_string())
+            .or_default()
+            .push(mem::size_of_val(ctx.message_type));  // illustrative
+        Disposition::Continue
+    }
+}
+
+// For accurate message size tracking with heap data, use a header:
+pub struct MessageSize(pub usize);
+impl HeaderValue for MessageSize { ... }
+
+// Sender sets it:
+let mut env = Envelope::from(my_large_message);
+env.headers.insert(MessageSize(serialized_bytes.len()));
+actor.tell_envelope(env)?;
+```
+
+**Example: Slow handler alerting**
+
+```rust
+use std::time::Instant;
+
+struct SlowHandlerInterceptor {
+    threshold: Duration,
+}
+
+impl Interceptor for SlowHandlerInterceptor {
+    fn on_receive(&self, _ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+        // Stash the start time in a header for on_complete to read.
+        headers.insert(HandlerStartTime(Instant::now()));
+        Disposition::Continue
+    }
+
+    fn on_complete(&self, ctx: &InterceptContext<'_>, headers: &Headers, outcome: &Outcome) {
+        if let Some(start) = headers.get::<HandlerStartTime>() {
+            let elapsed = start.0.elapsed();
+            if elapsed > self.threshold {
+                tracing::warn!(
+                    actor = ctx.actor_name,
+                    message = ctx.message_type,
+                    elapsed_ms = elapsed.as_millis(),
+                    "slow handler detected"
+                );
+            }
+        }
+    }
+}
+
+struct HandlerStartTime(Instant);
+impl HeaderValue for HandlerStartTime { ... }
+```
+
+**Example: Error rate circuit breaker**
+
+```rust
+struct CircuitBreakerInterceptor {
+    error_counts: Arc<DashMap<ActorId, AtomicU64>>,
+    threshold: u64,
+}
+
+impl Interceptor for CircuitBreakerInterceptor {
+    fn on_receive(&self, ctx: &InterceptContext<'_>, _headers: &mut Headers) -> Disposition {
+        let count = self.error_counts
+            .entry(ctx.actor_id)
+            .or_insert(AtomicU64::new(0));
+        if count.load(Ordering::Relaxed) >= self.threshold {
+            return Disposition::Reject(
+                format!("actor {} circuit breaker open ({} consecutive errors)",
+                    ctx.actor_name, self.threshold)
+            );
+        }
+        Disposition::Continue
+    }
+
+    fn on_complete(&self, ctx: &InterceptContext<'_>, _headers: &Headers, outcome: &Outcome) {
+        match outcome {
+            Outcome::Success => {
+                // Reset on success
+                if let Some(count) = self.error_counts.get(&ctx.actor_id) {
+                    count.store(0, Ordering::Relaxed);
+                }
+            }
+            Outcome::HandlerError { .. } => {
+                self.error_counts
+                    .entry(ctx.actor_id)
+                    .or_insert(AtomicU64::new(0))
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+**Example: OpenTelemetry tracing (via dcontext)**
+
+```rust
+use dcontext::{TraceContext, SpanContext};
+
+struct OtelInterceptor;
+
+impl Interceptor for OtelInterceptor {
+    fn on_receive(&self, ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+        // Extract trace context from headers (injected by sender)
+        let parent = headers.get::<TraceContext>();
+
+        // Create a child span for this handler invocation
+        let span = tracer::start_span(ctx.message_type)
+            .with_parent(parent)
+            .with_attribute("actor.id", ctx.actor_id.to_string())
+            .with_attribute("actor.name", ctx.actor_name)
+            .with_attribute("send.mode", format!("{:?}", ctx.send_mode))
+            .with_attribute("remote", ctx.remote)
+            .start();
+
+        // Stash the span in headers for on_complete to close it
+        headers.insert(SpanContext(span));
+        Disposition::Continue
+    }
+
+    fn on_complete(&self, _ctx: &InterceptContext<'_>, headers: &Headers, outcome: &Outcome) {
+        if let Some(span_ctx) = headers.get::<SpanContext>() {
+            match outcome {
+                Outcome::Success => span_ctx.0.set_status(StatusCode::Ok),
+                Outcome::HandlerError { error } => {
+                    span_ctx.0.set_status(StatusCode::Error);
+                    span_ctx.0.record_error(&error.message);
+                }
+                _ => {}
+            }
+            span_ctx.0.end();
+        }
+    }
+}
+```
+
+#### 3.21.4 Registering Multiple Interceptors
+
+Interceptors are composable. A typical production setup:
+
+```rust
+let metrics = MetricsInterceptor::new();
+let metrics_store = metrics.metrics().clone();  // for querying later
+
+runtime.add_interceptor(Box::new(OtelInterceptor))?;
+runtime.add_interceptor(Box::new(metrics))?;
+runtime.add_interceptor(Box::new(SlowHandlerInterceptor { threshold: Duration::from_secs(1) }))?;
+runtime.add_interceptor(Box::new(CircuitBreakerInterceptor::new(10)))?;
+
+// Later: query metrics
+let top_5_busiest = metrics_store.busiest_actors(5);
+let top_5_failing = metrics_store.most_failed_actors(5);
+```
+
+Interceptors execute in registration order. The pipeline is:
+`OTel → Metrics → SlowHandler → CircuitBreaker → Actor Handler → CircuitBreaker.on_complete → SlowHandler.on_complete → Metrics.on_complete → OTel.on_complete`
+
 ---
 
 ## 4. Module Reorganization
@@ -1794,9 +2383,13 @@ dactor/src/
 ├── cluster.rs           ← ClusterEvents, ClusterEvent, NodeId, SubscriptionId
 ├── timer.rs             ← TimerHandle
 ├── mailbox.rs           ← MailboxConfig, OverflowStrategy
-├── errors.rs            ← ActorSendError, GroupError, ClusterError, RuntimeError
+├── errors.rs            ← ActorSendError, GroupError, ClusterError, RuntimeError, ActorError
+├── dead_letter.rs       ← DeadLetterHandler, DeadLetterEvent, DeadLetterReason
+├── metrics.rs           ← MetricsInterceptor, MetricsStore, ActorMetrics
+├── remote.rs            ← RemoteMessage marker trait, serialization contract
 └── test_support/        ← #[cfg(feature = "test-support")]
     ├── mod.rs
+    ├── conformance.rs   ← Adapter conformance test suite
     ├── test_runtime.rs  ← TestRuntime, TestActorRef, TestClusterEvents
     └── test_clock.rs    ← TestClock
 ```
