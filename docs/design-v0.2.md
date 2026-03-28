@@ -2506,11 +2506,13 @@ pub enum MailboxConfig {
     ///
     /// Supported natively by: Akka (`PriorityMailbox`), Kameo (custom mailbox).
     /// Adapter-implemented for: ractor (priority queue wrapper).
+    ///
+    /// Message ordering within the queue is controlled by the
+    /// `MessageComparer` trait set via `SpawnConfig.comparer`.
+    /// Default: `StrictPriorityComparer` (lowest Priority(u8) first).
     Priority {
         /// Optional capacity limit. `None` = unbounded priority queue.
         capacity: Option<usize>,
-        /// How to determine message priority.
-        ordering: PriorityOrdering,
     },
 }
 
@@ -2527,15 +2529,6 @@ pub enum OverflowStrategy {
     DropOldest,
     /// Return an error to the sender.
     RejectWithError,
-}
-
-/// How messages are prioritized in a priority mailbox.
-#[derive(Debug, Clone)]
-pub enum PriorityOrdering {
-    /// Use the `Priority` header from the message envelope.
-    /// Messages without a `Priority` header get `Priority::Normal` (default).
-    ByHeader,
-    // Future: custom priority functions could be added here.
 }
 
 impl Default for MailboxConfig {
@@ -2625,66 +2618,101 @@ let slightly_below_normal = Priority(160);
 **Fairness and starvation:**
 
 Priority mailboxes risk starving low-priority messages when high-priority
-messages arrive continuously. dactor provides a **pluggable `FairnessPolicy`
-trait** — the application implements it to control the trade-off. If no
-policy is provided, the default is strict priority ordering (no fairness
-guarantee).
+messages arrive continuously. dactor provides a **pluggable `MessageComparer`
+trait** — a custom ordering function that the priority queue uses to decide
+which message to dequeue next. The default implementation compares by
+`Priority(u8)` value only. Applications can override with a richer
+comparison that factors in age, message type, sender, etc. to prevent
+starvation.
+
+This single trait replaces both priority ordering and fairness policy — they
+are the same concept: "given two queued messages, which one should be
+processed first?"
 
 ```rust
-/// Policy that controls how the priority mailbox balances between
-/// priority levels. Invoked by the runtime each time it picks the
-/// next message to deliver.
-///
-/// If not set (default), the mailbox uses strict priority ordering —
-/// the lowest Priority(u8) value is always dequeued first, which can
-/// starve lower-priority messages under sustained high-priority load.
-pub trait FairnessPolicy: Send + Sync + 'static {
-    /// Given the current mailbox state, decide which priority level
-    /// to dequeue from next.
-    ///
-    /// The runtime calls this before each message delivery. The policy
-    /// can inspect queue depths per priority level and decide which
-    /// level to serve.
-    fn select_next(&self, state: &MailboxState) -> Priority;
-}
-
-/// Snapshot of the mailbox's current queue depths, provided to
-/// the FairnessPolicy for decision-making.
-pub struct MailboxState {
-    /// Number of pending messages at each priority level.
-    /// Sorted by priority (index 0 = highest priority present).
-    pub levels: Vec<PriorityLevel>,
-    /// Total number of messages across all levels.
-    pub total_pending: usize,
-}
-
-pub struct PriorityLevel {
+/// Metadata about a queued message, provided to `MessageComparer`
+/// for ordering decisions. The comparer does NOT see the message body
+/// (which is type-erased in the queue) — it works with metadata only.
+pub struct QueuedMessageMeta {
+    /// The priority header value (default: `Priority::NORMAL`).
     pub priority: Priority,
-    pub pending: usize,
-    /// How long the oldest message at this level has been waiting.
-    pub oldest_wait: Duration,
+    /// How long this message has been waiting in the queue.
+    pub age: Duration,
+    /// Rust type name of the message.
+    pub message_type: &'static str,
+    /// The sender's node (if known).
+    pub origin_node: Option<NodeId>,
+    /// Whether this message was sent via ask (true) or tell (false).
+    pub is_ask: bool,
+}
+
+/// Trait that controls message ordering in a priority queue.
+/// Used by both the actor's inbound mailbox (§8.1) and the
+/// outbound send queue's user lane (§8.3).
+///
+/// The queue calls `compare()` to decide which of two messages
+/// should be dequeued first. Return `Ordering::Less` if `a` should
+/// be processed before `b`.
+///
+/// The default implementation (`StrictPriorityComparer`) compares
+/// by `Priority(u8)` only — lower value = higher priority.
+pub trait MessageComparer: Send + Sync + 'static {
+    fn compare(&self, a: &QueuedMessageMeta, b: &QueuedMessageMeta) -> std::cmp::Ordering;
 }
 ```
 
-**Built-in policies:**
+**Built-in comparers:**
 
 ```rust
-/// Strict priority — always dequeue the highest priority first.
-/// This is the default when no FairnessPolicy is set.
-pub struct StrictPriority;
+/// Default: strict priority ordering by Priority(u8) value.
+/// Lower value = dequeued first. FIFO within same priority.
+/// Can starve low-priority messages under sustained high-priority load.
+pub struct StrictPriorityComparer;
 
-/// Weighted fair queuing — serve `weight` messages from higher
-/// priority before serving 1 from the next level.
-pub struct WeightedFairQueuing {
-    /// How many high-priority messages to serve before one low-priority.
-    pub weight: usize,
+impl MessageComparer for StrictPriorityComparer {
+    fn compare(&self, a: &QueuedMessageMeta, b: &QueuedMessageMeta) -> Ordering {
+        a.priority.0.cmp(&b.priority.0)
+    }
 }
 
-/// Aging — promote messages that have waited longer than `max_wait`.
-/// If any level has a message older than `max_wait`, it is served next
-/// regardless of its priority.
-pub struct AgingPolicy {
+/// Weighted: serve `weight` high-priority messages, then 1 low-priority.
+/// Prevents complete starvation while still favoring high priority.
+pub struct WeightedComparer {
+    pub weight: usize,
+    // internal counter tracked by the queue
+}
+
+/// Aging: boost messages that have waited longer than `max_wait`.
+/// If a message has been queued longer than `max_wait`, it is treated
+/// as CRITICAL regardless of its original priority.
+pub struct AgingComparer {
     pub max_wait: Duration,
+}
+
+impl MessageComparer for AgingComparer {
+    fn compare(&self, a: &QueuedMessageMeta, b: &QueuedMessageMeta) -> Ordering {
+        let a_pri = if a.age > self.max_wait { 0 } else { a.priority.0 };
+        let b_pri = if b.age > self.max_wait { 0 } else { b.priority.0 };
+        a_pri.cmp(&b_pri)
+    }
+}
+```
+
+**Custom comparer example — ask-first policy:**
+
+```rust
+/// Prioritize ask() messages over tell() at the same priority level,
+/// because ask() has a caller waiting for a reply.
+struct AskFirstComparer;
+
+impl MessageComparer for AskFirstComparer {
+    fn compare(&self, a: &QueuedMessageMeta, b: &QueuedMessageMeta) -> Ordering {
+        // First by priority value
+        let pri = a.priority.0.cmp(&b.priority.0);
+        if pri != Ordering::Equal { return pri; }
+        // Then ask before tell (ask=true sorts before ask=false)
+        b.is_ask.cmp(&a.is_ask)
+    }
 }
 ```
 
@@ -2694,12 +2722,20 @@ pub struct AgingPolicy {
 let config = SpawnConfig {
     mailbox: MailboxConfig::Priority {
         capacity: Some(1000),
-        ordering: PriorityOrdering::ByHeader,
     },
-    fairness: Some(Box::new(WeightedFairQueuing { weight: 10 })),
+    comparer: Some(Box::new(AgingComparer { max_wait: Duration::from_secs(30) })),
     ..Default::default()
 };
 runtime.spawn_with_config("worker", args, deps, config)?;
+```
+
+**Also used by the outbound send queue (§8.3):**
+
+```rust
+runtime.set_outbound_queue_config(OutboundQueueConfig {
+    user_lane_capacity: Some(10_000),
+    comparer: Some(Box::new(WeightedComparer { weight: 20 })),
+});
 ```
 
 ### 8.2 Message Ordering Guarantees
@@ -2791,7 +2827,7 @@ graph LR
 | Lane | Contents | Priority |
 |---|---|---|
 | **Control** | Heartbeats, `CancelRequest`, `ChildTerminated`, watch notifications, cluster protocol messages | Always sent first — never blocked by user traffic |
-| **User** | Application `tell()` / `ask()` / `stream()` messages | Priority-ordered using `Priority` header, with optional `FairnessPolicy` |
+| **User** | Application `tell()` / `ask()` / `stream()` messages | Priority-ordered using `MessageComparer` trait |
 
 **How custom priorities work within the user lane:**
 
@@ -2816,8 +2852,8 @@ User Lane (one priority queue):
 There are only **two lanes** (control + user), not 256. The priority queue
 within the user lane sorts by `Priority(u8)` numerically. Custom priority
 values (e.g., `Priority(96)`) slot in between the named constants naturally
-— no special handling needed. The `FairnessPolicy` (§8.1) operates across
-all priority levels within the user lane to prevent starvation.
+— no special handling needed. The `MessageComparer` (§8.1) operates across
+all priority levels within the user lane to control ordering and prevent starvation.
 
 **Configuration:**
 
@@ -2827,9 +2863,9 @@ pub struct OutboundQueueConfig {
     /// Maximum number of user messages buffered per remote node.
     /// `None` = unbounded. Control lane is always unbounded.
     pub user_lane_capacity: Option<usize>,
-    /// Fairness policy for the user lane (same trait as mailbox).
-    /// `None` = strict priority (default).
-    pub fairness: Option<Box<dyn FairnessPolicy>>,
+    /// Message comparer for the user lane (same trait as mailbox).
+    /// `None` = `StrictPriorityComparer` (default).
+    pub comparer: Option<Box<dyn MessageComparer>>,
 }
 ```
 
@@ -2838,7 +2874,7 @@ pub struct OutboundQueueConfig {
 ```rust
 runtime.set_outbound_queue_config(OutboundQueueConfig {
     user_lane_capacity: Some(10_000),
-    fairness: Some(Box::new(WeightedFairQueuing { weight: 20 })),
+    comparer: Some(Box::new(AgingComparer { max_wait: Duration::from_secs(30) })),
 });
 ```
 
@@ -2903,7 +2939,7 @@ pub trait NodeTransport: Send + Sync + 'static {
 │                         ├── Control Lane        │
 │                         └── User Lane (priority)│
 │                                │                │
-│                         FairnessPolicy          │
+│                         MessageComparer          │
 │                                │                │
 │                         dequeue & serialize      │
 │                                │                │
