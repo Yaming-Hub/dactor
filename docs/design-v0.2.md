@@ -3097,15 +3097,32 @@ pub struct ActorError {
 
     /// Optional structured details — serializable key-value pairs
     /// for debugging, retry hints, validation errors, etc.
-    /// Kept as `Vec` rather than `HashMap` to preserve insertion order
-    /// and allow repeated keys.
     pub details: Vec<ErrorDetail>,
 
     /// Error chain — string representations of the causal chain
     /// (`source()` chain in Rust). The original error objects can't
     /// be serialized, but their Display strings can.
-    /// Index 0 is the immediate cause, index N is the root cause.
     pub chain: Vec<String>,
+
+    /// Optional typed payload — application-specific error data that
+    /// can be serialized across the wire. The `payload_type` identifies
+    /// how to interpret the bytes, so the receiver can deserialize it
+    /// back to the original error type.
+    ///
+    /// Example: a `ValidationErrors` struct serialized as bincode,
+    /// with `payload_type = "myapp.ValidationErrors"`.
+    pub payload: Option<ErrorPayload>,
+}
+
+/// Application-specific error data attached to an ActorError.
+/// The `type_name` tells the receiver how to deserialize `data`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorPayload {
+    /// Stable type name identifying the payload format
+    /// (e.g., "myapp.ValidationErrors", "myapp.RetryInfo").
+    pub type_name: String,
+    /// Serialized bytes of the application error type.
+    pub data: Vec<u8>,
 }
 
 /// Machine-readable error category, modeled after gRPC status codes
@@ -3163,6 +3180,177 @@ pub enum ErrorCode {
 pub struct ErrorDetail {
     pub key: String,
     pub value: String,
+}
+```
+
+**`ErrorCodec` — bidirectional error translation:**
+
+The runtime provides an `ErrorCodec` trait that applications implement to
+translate between their custom error types and `ActorError`. The codec works
+in both directions:
+
+- **Handler side (encoding):** Convert a custom error into `ActorError` with
+  a serialized payload
+- **Caller side (decoding):** Extract the payload from `ActorError` back into
+  the original custom error type
+
+```rust
+/// Bidirectional translator between application errors and ActorError.
+///
+/// Register with the runtime so that:
+/// 1. When a handler returns a custom error, the codec encodes it into
+///    ActorError.payload for wire transport
+/// 2. When a caller receives an ActorError with a known payload_type,
+///    the codec decodes it back to the original error type
+pub trait ErrorCodec: Send + Sync + 'static {
+    /// The application's custom error type.
+    type Error: Send + 'static;
+
+    /// Stable type name for wire identification.
+    /// Must match on both sender and receiver sides.
+    fn type_name(&self) -> &'static str;
+
+    /// Encode: custom error → ActorError with payload.
+    fn encode(&self, error: Self::Error) -> ActorError;
+
+    /// Decode: extract custom error from ActorError payload.
+    /// Returns `None` if the payload_type doesn't match or can't be decoded.
+    fn decode(&self, error: &ActorError) -> Option<Self::Error>;
+}
+```
+
+**Example: ValidationErrors codec**
+
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+struct ValidationErrors {
+    field_errors: Vec<FieldError>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FieldError {
+    field: String,
+    message: String,
+    code: String,
+}
+
+struct ValidationErrorCodec;
+
+impl ErrorCodec for ValidationErrorCodec {
+    type Error = ValidationErrors;
+
+    fn type_name(&self) -> &'static str { "myapp.ValidationErrors" }
+
+    fn encode(&self, error: ValidationErrors) -> ActorError {
+        ActorError::new(ErrorCode::InvalidArgument, "validation failed")
+            .with_payload(
+                self.type_name(),
+                bincode::serialize(&error).unwrap(),
+            )
+    }
+
+    fn decode(&self, error: &ActorError) -> Option<ValidationErrors> {
+        let payload = error.payload.as_ref()?;
+        if payload.type_name != self.type_name() { return None; }
+        bincode::deserialize(&payload.data).ok()
+    }
+}
+```
+
+**Registration:**
+
+```rust
+// Register on both handler side and caller side
+runtime.register_error_codec(Box::new(ValidationErrorCodec));
+```
+
+**Handler side — returning custom errors:**
+
+```rust
+#[async_trait]
+impl Handler<CreateUser> for UserService {
+    async fn handle(&mut self, msg: CreateUser, ctx: &mut ActorContext)
+        -> Result<UserId, ActorError>
+    {
+        let mut errors = Vec::new();
+        if msg.email.is_empty() {
+            errors.push(FieldError {
+                field: "email".into(),
+                message: "required".into(),
+                code: "REQUIRED".into(),
+            });
+        }
+        if !errors.is_empty() {
+            // The registered ErrorCodec encodes ValidationErrors
+            // into ActorError with payload automatically
+            return Err(ctx.encode_error(ValidationErrors { field_errors: errors }));
+        }
+        Ok(self.create(msg).await?)
+    }
+}
+```
+
+**Caller side — extracting custom errors:**
+
+```rust
+match user_service.ask(CreateUser { email: "".into() }, None).await {
+    Ok(user_id) => println!("Created: {user_id}"),
+    Err(RuntimeError::Actor(actor_err)) => {
+        // Try to decode the payload back to the original type
+        if let Some(validation) = runtime.decode_error::<ValidationErrors>(&actor_err) {
+            for field_err in &validation.field_errors {
+                eprintln!("  {}: {} ({})", field_err.field, field_err.message, field_err.code);
+            }
+        } else {
+            // Unknown error type — fall back to generic handling
+            eprintln!("Error [{}]: {}", actor_err.code, actor_err.message);
+        }
+    }
+    Err(other) => eprintln!("Runtime error: {other}"),
+}
+```
+
+**Wire flow:**
+
+```mermaid
+sequenceDiagram
+    participant H as Handler (Node 2)
+    participant EC1 as ErrorCodec (Node 2)
+    participant N as Network
+    participant EC2 as ErrorCodec (Node 1)
+    participant C as Caller (Node 1)
+
+    H->>EC1: ctx.encode_error(ValidationErrors)
+    EC1->>EC1: encode → ActorError with payload<br/>type_name: "myapp.ValidationErrors"<br/>data: [serialized bytes]
+    EC1->>N: serialize ActorError (including payload)
+    N->>EC2: deserialize ActorError
+    C->>EC2: runtime.decode_error::<ValidationErrors>(&err)
+    EC2->>EC2: check type_name match<br/>deserialize payload.data
+    EC2-->>C: Some(ValidationErrors { field_errors: [...] })
+```
+
+**Key points:**
+
+- `ErrorPayload.type_name` is a stable string identifier — both sides must
+  register a codec with the same `type_name` to encode/decode
+- If no codec is registered for a given `type_name`, the payload bytes are
+  preserved but opaque — the caller falls back to `ErrorCode` + `message`
+- Multiple codecs can be registered for different error types
+- Local calls can skip serialization — the codec is still useful for
+  consistent error creation, but the payload doesn't need to be
+  serialized/deserialized within the same process
+
+**How `ActorError` builds with payload:**
+
+```rust
+impl ActorError {
+    pub fn with_payload(mut self, type_name: &str, data: Vec<u8>) -> Self {
+        self.payload = Some(ErrorPayload {
+            type_name: type_name.to_string(),
+            data,
+        });
+        self
+    }
 }
 ```
 
