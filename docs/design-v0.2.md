@@ -164,9 +164,73 @@ pub struct RuntimeCapabilities {
     pub watch: bool,
     pub bounded_mailbox: bool,
     pub priority_mailbox: bool,
-    pub interceptors: bool,
+    pub inbound_interceptors: bool,
+    pub outbound_interceptors: bool,
+    pub remote_spawn: bool,
 }
 ```
+
+**Fail-fast on unsupported capabilities:**
+
+When application code calls a function the current adapter does not support,
+the call **must fail immediately** with `Err(RuntimeError::NotSupported)`.
+The application should treat this as a fatal configuration error — the
+adapter cannot fulfill the application's requirements.
+
+**Recommended startup pattern:**
+
+```rust
+fn validate_runtime(runtime: &impl ActorRuntime) -> Result<(), String> {
+    let caps = runtime.capabilities();
+
+    // Application requires these capabilities — fail fast if missing
+    if !caps.ask {
+        return Err("this application requires ask() support".into());
+    }
+    if !caps.inbound_interceptors {
+        return Err("this application requires interceptor support".into());
+    }
+    if !caps.watch {
+        return Err("this application requires watch/supervision support".into());
+    }
+
+    Ok(())
+}
+
+fn main() {
+    let runtime = dactor_ractor::RactorRuntime::new();
+
+    // Validate at startup — fail before any actors are spawned
+    validate_runtime(&runtime).expect("runtime does not meet requirements");
+
+    // Safe to proceed — all required capabilities are available
+    runtime.add_inbound_interceptor(Box::new(AuthInterceptor)).unwrap();
+    // ...
+}
+```
+
+**What happens if you skip validation and call unsupported functions:**
+
+| Call | Adapter doesn't support it | Result |
+|---|---|---|
+| `actor.ask(msg, None)` | `caps.ask == false` | `Err(RuntimeError::NotSupported { operation: "ask", ... })` |
+| `runtime.add_inbound_interceptor(...)` | `caps.inbound_interceptors == false` | `Err(RuntimeError::NotSupported { operation: "add_inbound_interceptor", ... })` |
+| `spawn_with_config(... config.mailbox = Bounded ...)` | `caps.bounded_mailbox == false` | `Err(RuntimeError::NotSupported { operation: "spawn_with_config", ... })` |
+| `runtime.watch(watcher, target)` | `caps.watch == false` | `Err(RuntimeError::NotSupported { operation: "watch", ... })` |
+
+All `NotSupported` errors include the `operation` name and `adapter` name
+(see §2.3) so the developer immediately knows which capability is missing
+and which adapter to switch to.
+
+**Design choice — `Err` not `panic`:** Unsupported operations return `Result`
+errors, not panics. This allows applications to:
+1. Gracefully degrade (skip optional features)
+2. Display actionable error messages
+3. Run capability checks in test harnesses
+
+If the application considers a missing capability **fatal**, it can
+`.expect()` or `.unwrap()` the result to turn it into a panic at the
+call site — the choice is the application's, not the framework's.
 
 ---
 
