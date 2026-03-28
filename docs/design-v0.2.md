@@ -233,10 +233,8 @@ classDiagram
     class ActorRef~A: Actor~ {
         +id() ActorId
         +tell(M)
-        +ask(M) M::Reply
-        +ask_with(M, CancellationToken) M::Reply
-        +stream(M, buffer) BoxStream
-        +stream_with(M, buffer, CancellationToken) BoxStream
+        +ask(M, Option~CancellationToken~) M::Reply
+        +stream(M, buffer, Option~CancellationToken~) BoxStream
         +is_alive() bool
     }
     class ActorRuntime {
@@ -700,12 +698,6 @@ pub trait ActorRef<M: Send + 'static>: Clone + Send + Sync + 'static {
 
     /// Fire-and-forget: deliver a raw message.
     fn tell(&self, msg: M) -> Result<(), ActorSendError>;
-
-    /// Fire-and-forget with an envelope (headers + body).
-    /// Adapters that don't support envelopes may ignore headers and
-    /// forward only the body, or return `NotSupported` if the envelope
-    /// cannot be delivered at all.
-    fn tell_envelope(&self, envelope: Envelope<M>) -> Result<(), RuntimeError>;
 
     /// Check if the actor is still alive.
     /// Returns `Err(NotSupported)` if the adapter cannot determine liveness.
@@ -1537,13 +1529,15 @@ pub trait OutboundInterceptor: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
     /// Called before a message is sent. Inspect or modify headers,
-    /// optionally reject the send.
+    /// optionally inspect the message body via downcasting,
+    /// or reject the send.
     fn on_send(
         &self,
         ctx: &OutboundContext<'_>,
         headers: &mut Headers,
+        message: &dyn Any,
     ) -> Disposition {
-        let _ = ctx;
+        let _ = (ctx, message);
         Disposition::Continue
     }
 }
@@ -1580,7 +1574,7 @@ struct TraceContextPropagator;
 impl OutboundInterceptor for TraceContextPropagator {
     fn name(&self) -> &'static str { "trace-propagator" }
 
-    fn on_send(&self, _ctx: &OutboundContext<'_>, headers: &mut Headers) -> Disposition {
+    fn on_send(&self, _ctx: &OutboundContext<'_>, headers: &mut Headers, _message: &dyn Any) -> Disposition {
         // Capture the current trace context and inject it into headers
         if let Some(current_span) = tracing::Span::current().context() {
             headers.insert(TraceContext::from_span(&current_span));
@@ -1598,7 +1592,7 @@ struct CorrelationIdInjector;
 impl OutboundInterceptor for CorrelationIdInjector {
     fn name(&self) -> &'static str { "correlation-id" }
 
-    fn on_send(&self, _ctx: &OutboundContext<'_>, headers: &mut Headers) -> Disposition {
+    fn on_send(&self, _ctx: &OutboundContext<'_>, headers: &mut Headers, _message: &dyn Any) -> Disposition {
         // Only inject if not already present (don't overwrite forwarded IDs)
         if headers.get::<CorrelationId>().is_none() {
             headers.insert(CorrelationId(uuid::Uuid::new_v4().to_string()));
@@ -1751,21 +1745,9 @@ support this as the primary operation.
 impl<A: Actor> ActorRef<A> {
     /// Fire-and-forget: deliver a message to the actor's mailbox.
     /// Only available for messages with `Reply = ()`.
+    /// Outbound interceptors run automatically before delivery,
+    /// stamping headers (trace context, correlation IDs, etc.).
     pub fn tell<M>(&self, msg: M) -> Result<(), ActorSendError>
-    where
-        A: Handler<M>,
-        M: Message<Reply = ()>;
-
-    /// Fire-and-forget with an envelope (headers + body).
-    pub fn tell_envelope<M>(&self, envelope: Envelope<M>) -> Result<(), RuntimeError>
-    where
-        A: Handler<M>,
-        M: Message<Reply = ()>;
-
-    /// Fire-and-forget with priority.
-    pub fn tell_with_priority<M>(
-        &self, msg: M, priority: Priority,
-    ) -> Result<(), RuntimeError>
     where
         A: Handler<M>,
         M: Message<Reply = ()>;
@@ -1777,8 +1759,10 @@ impl<A: Actor> ActorRef<A> {
 - Returns immediately — does not wait for the handler to execute
 - Returns `Ok(())` on successful mailbox delivery, `Err` if the actor is stopped
 - No reply channel — the sender has no way to know if the handler succeeded
-- If an interceptor returns `Reject`, it behaves the same as `Drop` (no error
-  path for fire-and-forget — the rejection goes to the dead letter handler)
+- Outbound interceptors enrich headers automatically — no need for manual
+  envelope construction
+- If an inbound interceptor returns `Reject`, it behaves the same as `Drop`
+  (no error path for fire-and-forget — the rejection goes to the dead letter handler)
 
 **Example:**
 
@@ -1786,17 +1770,19 @@ impl<A: Actor> ActorRef<A> {
 struct LogEvent { level: String, message: String }
 impl Message for LogEvent { type Reply = (); }
 
-// Fire-and-forget — caller doesn't wait
+// Fire-and-forget — outbound interceptors auto-inject trace context,
+// correlation ID, etc. No manual envelope needed.
 logger.tell(LogEvent {
     level: "INFO".into(),
     message: "user logged in".into(),
 }).unwrap();
 
-// With priority:
-logger.tell_with_priority(
-    LogEvent { level: "ERROR".into(), message: "disk full".into() },
-    Priority::Critical,
-).unwrap();
+// Priority is set via an outbound interceptor, not a separate method:
+// e.g., PriorityInterceptor checks message type and sets Priority header
+logger.tell(LogEvent {
+    level: "ERROR".into(),
+    message: "disk full".into(),
+}).unwrap();
 ```
 
 ### 6.2 Ask (Request-Reply)
@@ -1814,16 +1800,10 @@ use tokio_util::sync::CancellationToken;
 
 impl<A: Actor> ActorRef<A> {
     /// Request-reply: send a message and await the reply.
-    pub async fn ask<M>(&self, msg: M) -> Result<M::Reply, RuntimeError>
-    where
-        A: Handler<M>,
-        M: Message;
-
-    /// Request-reply with a cancellation token.
-    /// The token can represent a timeout, an explicit cancel signal,
-    /// or a parent scope's cancellation — all with the same API.
-    pub async fn ask_with<M>(
-        &self, msg: M, cancel: CancellationToken,
+    /// Pass `None` for no cancellation, or `Some(token)` for
+    /// timeout / explicit cancel / hierarchical scope cancellation.
+    pub async fn ask<M>(
+        &self, msg: M, cancel: Option<CancellationToken>,
     ) -> Result<M::Reply, RuntimeError>
     where
         A: Handler<M>,
@@ -1831,48 +1811,33 @@ impl<A: Actor> ActorRef<A> {
 }
 ```
 
-**Why `CancellationToken` instead of `_timeout` methods:**
+**Cancellation via `CancellationToken`:**
 
-| Approach | Pros | Cons |
-|---|---|---|
-| `ask_timeout(msg, Duration)` | Simple for timeout-only cases | Only supports time-based cancellation |
-| `ask_with(msg, CancellationToken)` | Supports timeout, explicit cancel, hierarchical cancel, scope-based cancel — all with one API | Slightly more verbose for simple timeout |
-
-A `CancellationToken` subsumes timeout — you can create one from a duration:
+A `CancellationToken` (from `tokio_util::sync`) is the standard Rust async
+cancellation primitive. It subsumes timeouts, explicit cancels, and
+hierarchical scope cancellation — all with one parameter:
 
 ```rust
 use tokio_util::sync::CancellationToken;
 
 // ── Simple ask (no cancellation) ────────────────────────────
-let balance = account.ask(GetBalance).await?;
+let balance = account.ask(GetBalance, None).await?;
 
 // ── Ask with timeout ────────────────────────────────────────
-let token = CancellationToken::new();
-let token_clone = token.clone();
-tokio::spawn(async move {
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    token_clone.cancel();
-});
-let balance = account.ask_with(GetBalance, token).await?;
-
-// ── Convenience: timeout helper ─────────────────────────────
 // dactor provides a helper to create a token that auto-cancels after a duration:
-let balance = account.ask_with(GetBalance, cancel_after(Duration::from_secs(5))).await?;
+let balance = account.ask(GetBalance, Some(cancel_after(Duration::from_secs(5)))).await?;
 
 // ── Explicit cancellation (e.g., user pressed "Cancel") ─────
 let token = CancellationToken::new();
 let token_for_ui = token.clone();
 // UI thread: token_for_ui.cancel() when user clicks Cancel
-let balance = account.ask_with(GetBalance, token).await?;
+let balance = account.ask(GetBalance, Some(token)).await?;
 
 // ── Hierarchical: cancel all child operations ───────────────
 let parent_token = CancellationToken::new();
-let child1 = parent_token.child_token();
-let child2 = parent_token.child_token();
-// ask two actors with independent child tokens
 let (r1, r2) = tokio::join!(
-    actor1.ask_with(Query1, child1),
-    actor2.ask_with(Query2, child2),
+    actor1.ask(Query1, Some(parent_token.child_token())),
+    actor2.ask(Query2, Some(parent_token.child_token())),
 );
 // Cancel everything if the parent scope ends:
 parent_token.cancel();  // both child tokens are also cancelled
@@ -1901,6 +1866,69 @@ pub fn cancel_after(duration: Duration) -> CancellationToken {
 | Token cancelled during handler execution | `Err(RuntimeError::Actor(ActorError { code: Timeout }))` — handler continues to completion but reply is discarded |
 | Token never cancelled, handler succeeds | `Ok(reply)` |
 | Token never cancelled, handler fails | `Err(RuntimeError::Actor(error))` |
+
+**Remote cancellation:**
+
+`CancellationToken` is an in-process primitive — it **cannot be serialized**
+or sent over the wire. For remote `ask()` calls, the adapter handles
+cancellation at the protocol layer:
+
+```mermaid
+sequenceDiagram
+    participant C as Caller (Node 1)
+    participant A as Adapter (Node 1)
+    participant N as Network
+    participant R as Remote Runtime (Node 2)
+    participant H as Handler (Node 2)
+
+    C->>A: ask(msg, Some(cancel_token))
+    A->>N: send request (request_id=42)
+    N->>R: deliver
+    R->>H: handle(msg)
+
+    Note over C: token.cancel() triggered
+    A->>N: send CancelRequest { request_id: 42 }
+    N->>R: deliver cancel
+    R->>R: drop reply channel for request 42
+
+    H-->>R: reply (discarded — already cancelled)
+    A-->>C: Err(Timeout)
+```
+
+The flow:
+
+1. **Caller** calls `ask(msg, Some(token))`. The adapter assigns a
+   `request_id` and sends the request over the network.
+2. **Caller** cancels the token (timeout or explicit). The adapter detects
+   this (via `select!` on `token.cancelled()`) and sends a **`CancelRequest`**
+   wire message with the `request_id` to the remote node.
+3. **Remote node** receives the `CancelRequest`, drops the reply channel
+   for that `request_id`. When the handler completes, the reply is discarded.
+4. **Caller** gets `Err(Timeout)` immediately — does not wait for the
+   remote handler to finish.
+
+```rust
+/// Wire message sent to remote node to cancel an in-flight ask/stream.
+/// This is an adapter-internal protocol message, not user-facing.
+#[derive(Serialize, Deserialize)]
+struct CancelRequest {
+    request_id: u64,
+}
+```
+
+**Key points:**
+
+- The `CancellationToken` stays local — only a `CancelRequest` wire message
+  crosses the network
+- Cancellation is **best-effort** — the remote handler may have already
+  completed before the cancel arrives (race condition is inherent in
+  distributed systems)
+- For `stream()`, the `CancelRequest` causes the remote node to close the
+  stream channel, which makes the actor's `StreamSender::send()` return
+  `ConsumerDropped`
+- If the network is down, the caller's token cancellation still returns
+  `Err(Timeout)` immediately — the caller is never blocked waiting for
+  a cancel acknowledgment
 
 ### 6.3 Streaming (Request-Stream)
 
@@ -1989,25 +2017,17 @@ impl<A: Actor> ActorRef<A> {
     /// `buffer` controls the channel capacity (backpressure). A typical
     /// default is 16 or 32.
     ///
+    /// Pass `None` for no cancellation, or `Some(token)` to cancel the
+    /// stream externally. When the token is cancelled, the stream closes
+    /// and the actor's `StreamSender::send()` returns `ConsumerDropped`.
+    ///
     /// Returns `Err(RuntimeError::NotSupported)` if the adapter doesn't
     /// support streaming.
     pub fn stream<M>(
         &self,
         msg: M,
         buffer: usize,
-    ) -> Result<BoxStream<M::Reply>, RuntimeError>
-    where
-        A: Handler<M>,
-        M: Message;
-
-    /// Stream with a cancellation token.
-    /// When the token is cancelled, the stream closes and the actor's
-    /// `StreamSender::send()` returns `ConsumerDropped`.
-    pub fn stream_with<M>(
-        &self,
-        msg: M,
-        buffer: usize,
-        cancel: CancellationToken,
+        cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, RuntimeError>
     where
         A: Handler<M>,
@@ -2050,7 +2070,7 @@ dropped, closing the channel. The actor's next `tx.send()` returns
 use tokio_stream::StreamExt;
 
 async fn get_logs(log_actor: &ActorRef<LogServer>) {
-    let mut stream = log_actor.stream(GetLogs { since: yesterday() }, 32).unwrap();
+    let mut stream = log_actor.stream(GetLogs { since: yesterday() }, 32, None).unwrap();
 
     while let Some(entry) = stream.next().await {
         println!("{}: {}", entry.timestamp, entry.message);
@@ -4421,7 +4441,6 @@ For each feature and each adapter, there are exactly three possibilities:
 | Capability | dactor-ractor | dactor-kameo | dactor-coerce | Notes |
 |---|:---:|:---:|:---:|---|
 | `tell()` | ✅ Library | ✅ Library | ✅ Library | ractor `cast()` / kameo `tell().try_send()` / coerce `notify()` |
-| `tell_envelope()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has envelopes; adapter unwraps, runs interceptors, forwards body |
 | `ask()` | ✅ Library | ✅ Library | ✅ Library | ractor `call()` / kameo `ask()` / coerce `send()` |
 | `stream()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has streaming; adapter creates `mpsc` channel shim |
 | `ActorRef::id()` | ✅ Library | ✅ Library | ✅ Library | Each library provides actor identity |
@@ -4455,7 +4474,6 @@ For each feature and each adapter, there are exactly three possibilities:
 | Feature | Strategy | Implementation Detail |
 |---------|:---:|---|
 | `tell()` | ✅ Library | `ractor::ActorRef::cast()` |
-| `tell_envelope()` | ⚙️ Adapter | ractor has no envelope concept; adapter runs interceptor chain on headers, forwards `body` to `cast()` |
 | `ask()` | ✅ Library | `ractor::ActorRef::call()` |
 | `stream()` | ⚙️ Adapter | ractor has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
 | `ActorRef::id()` | ✅ Library | `ractor::ActorRef::get_id()` → `ActorId` |
@@ -4479,7 +4497,6 @@ For each feature and each adapter, there are exactly three possibilities:
 | Feature | Strategy | Implementation Detail |
 |---------|:---:|---|
 | `tell()` | ✅ Library | `kameo::ActorRef::tell().try_send()` |
-| `tell_envelope()` | ⚙️ Adapter | kameo has no envelope concept; adapter runs interceptor chain on headers, forwards `body` to `tell()` |
 | `ask()` | ✅ Library | `kameo::ActorRef::ask()` |
 | `stream()` | ⚙️ Adapter | kameo has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
 | `ActorRef::id()` | ✅ Library | `kameo::actor::ActorId` → `ActorId` |
@@ -4503,7 +4520,6 @@ For each feature and each adapter, there are exactly three possibilities:
 | Feature | Strategy | Implementation Detail |
 |---------|:---:|---|
 | `tell()` | ✅ Library | `coerce::ActorRef::notify()` |
-| `tell_envelope()` | ⚙️ Adapter | coerce has no envelope concept; adapter runs interceptor chain on headers, forwards `body` to `notify()` |
 | `ask()` | ✅ Library | `coerce::ActorRef::send()` — returns `Result` with reply |
 | `stream()` | ⚙️ Adapter | coerce has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
 | `ActorRef::id()` | ✅ Library | coerce actors have identity via `ActorId` |
@@ -4674,7 +4690,7 @@ dactor/src/
 
 ## 17. Open Questions
 
-1. **Should `Envelope<M>` be the only way to send messages?** Or should `tell(M)` auto-wrap in an envelope with empty headers? → **Proposed: both.** `tell(msg)` wraps automatically; `tell_envelope(env)` gives full control.
+1. **Should `Envelope<M>` be the only way to send messages?** → **Resolved: No.** `tell(msg)` is the only send method. Outbound interceptors handle header injection automatically. `Envelope<M>` remains as an internal transport type between interceptors and the runtime — not exposed to callers.
 
 2. **Should interceptors be per-runtime or per-actor?** → **Proposed: both.** Global interceptors via `runtime.add_inbound_interceptor()`, per-actor via `SpawnConfig`.
 
