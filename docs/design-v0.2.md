@@ -2360,6 +2360,43 @@ pub struct OneForAll;       // restart all children when one fails
 pub struct RestForOne;      // restart the failed child and all after it
 ```
 
+**When the adapter does not support supervision:**
+
+Supervision involves two capabilities: `watch` (monitoring actor termination)
+and `ErrorAction::Restart` / `Escalate` (reacting to failures). If the
+adapter doesn't support these natively and can't implement them as shims,
+the framework degrades as follows:
+
+| Feature | Adapter supports | Adapter doesn't support |
+|---|---|---|
+| `watch()` / `unwatch()` | Delivers `ChildTerminated` to watcher | Returns `Err(NotSupported)` — app should check `caps.watch` at startup |
+| `ErrorAction::Restart` | Runtime re-creates actor via `Actor::create(args, deps)` → `on_start()` | Actor is **stopped** instead — `Restart` degrades to `Stop`. A warning is logged: `"adapter does not support restart, stopping actor"` |
+| `ErrorAction::Escalate` | Runtime forwards failure to parent supervisor | Actor is **stopped** instead — `Escalate` degrades to `Stop`. Warning logged. |
+| `SupervisionStrategy` | Applied when child fails | Ignored — strategies have no effect without `watch` support |
+| `Handler<ChildTerminated>` | Notifications delivered | Never invoked — no watch means no termination notifications |
+
+**Recommended startup validation:**
+
+```rust
+let caps = runtime.capabilities();
+if !caps.watch {
+    tracing::warn!("adapter does not support supervision — actors will stop on error, not restart");
+    // Application can decide: continue without supervision, or fail fast
+}
+```
+
+**Design rationale — degrade to Stop, don't panic:**
+
+When `Restart` or `Escalate` is requested but the adapter can't fulfill it,
+the safest behavior is to stop the actor. This avoids:
+- Silent infinite loops (if restart were silently ignored)
+- Panics that bring down the whole runtime
+- Undefined behavior from partial restart support
+
+The application's `on_error()` still runs, and the dead letter handler
+receives any unprocessed messages. The warning log makes the degradation
+visible to operators.
+
 **DeathWatch** — any actor can watch another:
 
 ```rust
