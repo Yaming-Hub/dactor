@@ -3144,50 +3144,125 @@ pub struct PoolRef<A: Actor> { /* ... */ }
 
 impl ActorRuntime {
     /// Spawn a pool of N identical worker actors.
-    /// Each worker runs independently with its own state.
-    /// Returns a PoolRef that distributes messages across workers.
+    ///
+    /// All workers share the same `Args` (cloned for each). Each worker
+    /// gets its own `Deps` via the `deps_factory` — called N times to
+    /// produce per-worker dependencies (separate DB connections, unique
+    /// actor refs, etc.).
+    ///
+    /// On worker restart, the runtime calls `deps_factory` again to get
+    /// fresh deps, then `Actor::create(args.clone(), new_deps)`.
     fn spawn_pool<A: Actor>(
         &self,
         name: &str,
         pool_config: PoolConfig,
-        factory: impl Fn() -> A + Send + 'static,
-    ) -> Result<PoolRef<A>, RuntimeError>;
+        args: A::Args,
+        deps_factory: impl Fn(usize) -> A::Deps + Send + 'static,
+    ) -> Result<PoolRef<A>, RuntimeError>
+    where
+        A::Args: Clone;
 }
 ```
 
-**Usage example:**
+**How Args and Deps work in a pool:**
+
+| | `Args` | `Deps` |
+|---|---|---|
+| **Shared or per-worker?** | Shared — cloned for each worker | Per-worker — `deps_factory(worker_index)` called N times |
+| **On restart** | Same `Args` (cloned again) | Fresh `Deps` (factory called again) |
+| **Remote spawn** | `Args` serialized once, cloned on remote | `DepsFactory` resolved on remote node |
 
 ```rust
-// Define a stateless worker
-struct ImageResizer {
-    quality: u32,
+// deps_factory receives the worker index (0..pool_size)
+// so each worker can get unique resources
+deps_factory: impl Fn(usize) -> A::Deps
+```
+
+**Usage examples:**
+
+```rust
+// ── Tier 1: No deps (Deps = ()) ─────────────────────────────
+
+struct ImageResizer { quality: u32 }
+
+impl Actor for ImageResizer {
+    type Args = Self;       // Args = Self, simple
+    type Deps = ();         // no local deps
+    fn create(args: Self, _deps: ()) -> Self { args }
 }
-impl Actor for ImageResizer {}
 
-struct Resize { image: Vec<u8>, width: u32 }
-impl Message for Resize { type Reply = Vec<u8>; }
+let pool = runtime.spawn_pool(
+    "image-resizer",
+    PoolConfig { pool_size: 8, routing: PoolRouting::RoundRobin, ..Default::default() },
+    ImageResizer { quality: 85 },   // Args — cloned 8 times
+    |_worker_index| (),              // no deps
+)?;
+```
 
-#[async_trait]
-impl Handler<Resize> for ImageResizer {
-    async fn handle(&mut self, msg: Resize, _ctx: &mut ActorContext) -> Vec<u8> {
-        // CPU-bound work — benefits from parallel workers
-        resize_image(&msg.image, msg.width, self.quality)
+```rust
+// ── Tier 2: Per-worker deps (each gets own DB connection) ───
+
+#[derive(Clone, Serialize, Deserialize)]
+struct QueryWorkerArgs {
+    db_url: String,
+    max_rows: usize,
+}
+
+struct QueryWorkerDeps {
+    conn: DbConnection,  // non-serializable, per-worker
+}
+
+struct QueryWorker {
+    args: QueryWorkerArgs,
+    deps: QueryWorkerDeps,
+}
+
+impl Actor for QueryWorker {
+    type Args = QueryWorkerArgs;
+    type Deps = QueryWorkerDeps;
+    fn create(args: QueryWorkerArgs, deps: QueryWorkerDeps) -> Self {
+        QueryWorker { args, deps }
     }
 }
 
-// Spawn a pool of 8 workers
 let pool = runtime.spawn_pool(
-    "image-resizer",
-    PoolConfig {
-        pool_size: 8,
-        routing: PoolRouting::RoundRobin,
-        ..Default::default()
+    "query-pool",
+    PoolConfig { pool_size: 4, ..Default::default() },
+    QueryWorkerArgs { db_url: "postgres://localhost/mydb".into(), max_rows: 1000 },
+    |worker_index| {
+        // Each worker gets its own DB connection
+        let conn = DbConnection::connect(&format!("postgres://localhost/mydb?pool={}", worker_index));
+        QueryWorkerDeps { conn }
     },
-    || ImageResizer { quality: 85 },
 )?;
+```
 
-// Send work — distributed across 8 workers in parallel
-let result = pool.ask(Resize { image, width: 800 }).await?;
+```rust
+// ── Tier 3: Per-worker deps with shared resources ───────────
+
+struct ProcessorDeps {
+    metrics: Arc<MetricsCollector>,     // shared across all workers
+    output: ActorRef<OutputCollector>,  // shared
+    worker_id: usize,                   // unique per worker
+}
+
+let metrics = Arc::new(MetricsCollector::new());
+let output = runtime.spawn("output", OutputCollectorArgs {}, ())?;
+
+let pool = runtime.spawn_pool(
+    "processor-pool",
+    PoolConfig { pool_size: 16, routing: PoolRouting::LeastLoaded, ..Default::default() },
+    ProcessorArgs { batch_size: 100 },
+    {
+        let metrics = metrics.clone();
+        let output = output.clone();
+        move |worker_index| ProcessorDeps {
+            metrics: metrics.clone(),   // Arc clone — shared
+            output: output.clone(),     // ActorRef clone — shared
+            worker_id: worker_index,    // unique per worker
+        }
+    },
+)?;
 ```
 
 **Key-based (sticky) routing:**
