@@ -373,6 +373,69 @@ arguments** (or a factory function) and calls `on_start()` again. This means
 the actor's initial state (connection_string, pool_size) is preserved but
 runtime state (conn) is reset — matching Erlang's restart semantics.
 
+**Actor lifecycle ordering guarantee:**
+
+Messages are **never** delivered before `on_start()` completes. The runtime
+guarantees this strict ordering:
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant R as Runtime
+    participant A as Actor
+
+    C->>R: runtime.spawn("name", MyActor { ... })
+    R->>A: create actor task
+    R-->>C: return ActorRef<MyActor>
+    Note over C: ActorRef is usable immediately
+
+    C->>R: actor.tell(Msg1)
+    Note over R: Msg1 queued in mailbox
+
+    C->>R: actor.tell(Msg2)
+    Note over R: Msg2 queued in mailbox
+
+    R->>A: on_start(&mut self, ctx)
+    Note over A: async init (e.g., DB connect)
+    A-->>R: on_start() returns
+
+    R->>A: handle(Msg1, ctx)
+    A-->>R: reply
+
+    R->>A: handle(Msg2, ctx)
+    A-->>R: reply
+```
+
+The rules are:
+
+1. **`on_start()` runs first** — before any handler. Messages sent to the
+   actor between `spawn()` and `on_start()` completion are buffered in the
+   mailbox and delivered in order after `on_start()` returns.
+
+2. **`on_start()` failure** — if `on_start()` panics or returns an error,
+   the actor enters the error path (`on_error()` is called). Buffered
+   messages are either delivered after recovery (if `Resume`/`Restart`)
+   or forwarded to the dead letter handler (if `Stop`).
+
+3. **Handlers run sequentially** — one at a time, after `on_start()`. No
+   concurrent handler execution on the same actor (fundamental actor model
+   guarantee).
+
+4. **`on_stop()` runs last** — after all handlers complete and the actor is
+   shutting down. No messages are delivered after `on_stop()` begins.
+
+5. **Restart cycle** — on restart: `on_stop()` → re-create actor →
+   `on_start()` → resume processing queued messages.
+
+The complete lifecycle is:
+
+```
+spawn() → on_start() → [handle messages]* → on_stop() → dropped
+                ↑                    |
+                |   on_error() → Restart
+                +--------------------+
+```
+
 ### 4.2 Message Trait
 
 ```rust
