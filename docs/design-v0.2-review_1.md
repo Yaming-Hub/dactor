@@ -217,3 +217,61 @@ What happens with many `tell()` to a slow actor with unbounded mailbox? OOM risk
 | **GPT** | Typed codec boundary (`Codec<M: Serialize>`) better than raw `[u8]` ↔ `[u8]` |
 | **GPT** | Need a mapping table from each backend's native errors to `ErrorCode` values |
 | **GPT** | `#[non_exhaustive]` on `OverflowStrategy` / `ErrorCode` for future-proofing |
+
+---
+
+## Response to Review Comments
+
+> Responses added on 2026-03-28. Each finding is justified and marked as
+> ✅ Fixed, 📋 Deferred, or ❌ Won't Fix with rationale.
+
+### Consensus Findings
+
+| # | Finding | Resolution | Detail |
+|---|---|:---:|---|
+| C1 | `on_error` signature inconsistent between §3.6 and §10.6 | ✅ Fixed | §10.6 `Actor::on_error` now uses `&ActorError` (was `Box<dyn Error>`), matching §3.6. Single source of truth. |
+| C2 | `ActorContext` internals are underspecified | ✅ Fixed | `ActorContext` now fully defined: `headers`, `actor_id`, `actor_name`, `send_mode`, plus methods `spawn()`, `send_after()`, `send_interval()` for runtime access. |
+| C3 | No capability discovery / introspection API | ✅ Fixed | Added `ActorRuntime::capabilities() -> RuntimeCapabilities` with flags for `ask`, `stream`, `watch`, `bounded_mailbox`, `priority_mailbox`, `interceptors`. Enables pre-flight checks at startup. |
+| C4 | `DropOldest` in API but unsupported everywhere | ✅ Fixed | Kept in API but marked `⚠️ Experimental` with doc comment explaining no adapter currently supports it. Added `#[non_exhaustive]` to `OverflowStrategy` for future extensibility. Rationale for keeping: a future adapter (or a custom adapter) may support it, and removing it would be a breaking change to add back. |
+| C5 | Timeout support for `ask()` is missing | ✅ Fixed | Added `ActorRef::ask_timeout(msg, Duration)` returning `Err(RuntimeError::Actor(ActorError { code: Timeout }))` on expiry. `ask()` without timeout remains for local calls where timeout is unnecessary. |
+| C6 | Interceptor `Reject` for `tell` silently swallowed | ❌ Won't Fix | This is by design. `tell()` is fire-and-forget — the caller has no error channel. Changing this would require `tell()` to return `Result<(), RuntimeError>` which breaks the fire-and-forget contract. The `Reject` disposition exists primarily for `ask()`. The behavior is clearly documented in the `Disposition` enum comments. |
+| C7 | Remote serialization protocol/enforcement not specified | 📋 Deferred | This is adapter-specific. Each adapter (ractor_cluster, kameo libp2p, coerce gRPC) uses its own wire protocol. dactor defines the `Message: Serialize + Deserialize` requirement for remote calls but does not prescribe the transport. Will be detailed when building the first remote adapter. |
+| C8 | Priority mailbox starvation/fairness not addressed | ✅ Fixed | Added "Fairness and starvation" section to §3.8 explaining that dactor deliberately does not enforce a fairness policy. Documented recommended patterns (weighted fair queuing, aging, rate limiting) implementable as interceptors or handler logic. |
+
+### Haiku Unique Findings
+
+| # | Finding | Resolution | Detail |
+|---|---|:---:|---|
+| H1 | Watch/unwatch notification delivery mechanism unspecified | 📋 Deferred | Valid concern. The mechanism (synthetic message injection vs handler requirement) depends on the Actor trait design finalization. Will be resolved during Phase 3 (Supervision) implementation. The design will likely require actors to implement `Handler<ChildTerminated>` if they want to receive watch notifications. |
+| H2 | Dead letter queue concept missing | 📋 Deferred | Good observation. Dead letter handling (dropped messages, overflow, interceptor drops) is a cross-cutting concern that should be addressed, but it adds significant API surface. Deferred to v0.4+ after core features stabilize. Interceptors' `on_complete(Outcome::HandlerError)` partially covers observability. |
+| H3 | `StreamSender::send()` should be `#[must_use]` | ✅ Fixed | Added `#[must_use = "check if the consumer dropped the stream to stop producing"]` to `StreamSender::send()`. |
+| H4 | `InterceptContext` should include `remote: bool` and `origin_node` | ✅ Fixed | Added `remote: bool` and `origin_node: Option<NodeId>` to `InterceptContext`. Enables cluster-aware interceptor policies (e.g., stricter auth for remote messages). |
+| H5 | Dynamic mailbox config changes not supported | ❌ Won't Fix | Changing mailbox config at runtime (e.g., switching from unbounded to bounded) is complex and error-prone — it requires draining/migrating in-flight messages. No surveyed framework supports this. If needed, the actor should be restarted with new config via supervision. |
+| H6 | Trait explosion risk in adapters | 📋 Acknowledged | Valid concern. Mitigated by: (1) comprehensive integration tests per adapter, (2) the `RuntimeCapabilities` introspection API letting adapters declare what they support, (3) the `NotSupported` pattern making gaps explicit rather than silently broken. |
+| H7 | Mock cluster codec — single codec for all messages | ❌ Won't Fix | A single configurable codec per link is intentionally simple for a testing crate. Real distributed systems negotiate codecs at the transport layer (adapter-specific). `dactor-mock` is for unit/integration testing, not production networking. Per-message-type codec adds complexity without testing value. |
+| H8 | Stream cancellation semantics could be more explicit | ✅ Fixed (partially) | `#[must_use]` on `StreamSender::send()` addresses the safety concern. `items_emitted` in `StreamCancelled` counts items successfully sent to the channel (not consumed by the caller). Explicit docs on "actor continues producing after close" behavior: `send()` returns `Err(ConsumerDropped)`, the actor should break — if it doesn't, subsequent sends keep failing harmlessly (no panic, no block). |
+| H9 | Error chain as strings loses structure | ❌ Won't Fix | By design. The error chain must cross process boundaries where Rust error types don't exist. Strings are the only universally serializable representation. For local calls, the original `ActorError` is returned directly (no serialization), so structured matching on `ErrorCode` + `details` is available. Adding `ErrorChainHint` would create a parallel type system that's hard to keep in sync. |
+| H10 | Handler limits: no multi-message batching | 📋 Acknowledged | Correct. dactor follows the single-message-per-handler model used by all 6 surveyed frameworks. Batching is an application-level concern (accumulate in actor state, process on timer/threshold). Not in scope for the core abstraction. |
+| H11 | Message ordering guarantees not specified | 📋 Deferred | Important for documentation. The general contract is: messages from the same sender to the same actor are delivered in order (FIFO within same priority). Different senders have no ordering guarantee. Timers are injected into the mailbox and follow mailbox ordering. Will be documented in the implementation. |
+
+### GPT Unique Findings
+
+| # | Finding | Resolution | Detail |
+|---|---|:---:|---|
+| G1 | Dual `AskRef`/`StreamRef` vs `ActorRef<A>::ask()` — two mental models | ✅ Fixed (by §10.6) | The §10.6 decision resolved this: the public API is `ActorRef<A>::ask()` and `ActorRef<A>::stream()` directly. The old `AskRef`/`StreamRef` traits from §3.4/§3.5 are internal adapter implementation details, not user-facing. The consumer sees one `ActorRef<A>` with all methods. |
+| G2 | Typed codec boundary (`Codec<M: Serialize>`) better than raw bytes | 📋 Deferred | Valid suggestion for the mock cluster. However, the `[u8]` ↔ `[u8]` interface is simpler and matches how real network layers work (they don't know about message types). Type-safe codecs would require generic `MessageCodec<M>` which complicates the `LinkConfig`. May revisit if users hit pain points. |
+| G3 | Need mapping table from backend errors to `ErrorCode` | 📋 Deferred | Good idea. Each adapter will document its error mapping (e.g., ractor `ActorProcessingErr` → `ErrorCode::Internal`, kameo `SendError` → `ErrorCode::ActorNotFound`). This will be created during adapter implementation, not in the design doc. |
+| G4 | `#[non_exhaustive]` on `OverflowStrategy` / `ErrorCode` | ✅ Fixed | Added `#[non_exhaustive]` to both `OverflowStrategy` and `ErrorCode` enums. This allows adding variants in future minor versions without breaking downstream matches. |
+| G5 | `on_error` inconsistency | ✅ Fixed | Same as C1 — normalized to `&ActorError`. |
+| G6 | Capability discovery | ✅ Fixed | Same as C3 — added `RuntimeCapabilities`. |
+| G7 | Schema evolution / message versioning | 📋 Deferred | Remote message versioning (backward compatibility, rolling deployments) is a real concern but is orthogonal to the actor framework. It belongs in the serialization layer (serde `#[serde(default)]`, protobuf, etc.) or in the `MessageCodec` implementation. dactor doesn't prescribe a versioning strategy. |
+| G8 | Proc-macro error messages | 📋 Acknowledged | Valid concern. The proc-macro crate will need to emit clear compile errors for unsupported patterns (generic methods, `impl Trait` returns, non-`Send` types). This is an implementation detail, not a design doc item. |
+
+### Summary
+
+| Category | Count |
+|---|---|
+| ✅ Fixed in design doc | 10 |
+| 📋 Deferred to implementation / future version | 9 |
+| ❌ Won't Fix (by design) | 4 |
+| 📋 Acknowledged (valid but out of scope) | 3 |

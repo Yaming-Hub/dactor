@@ -334,6 +334,10 @@ pub struct InterceptContext<'a> {
     pub message_type: &'static str,
     /// Whether this is a `tell` (fire-and-forget) or `ask` (request-reply).
     pub send_mode: SendMode,
+    /// Whether this message arrived from a remote node (cross-network).
+    pub remote: bool,
+    /// The node that sent this message. `None` for local sends.
+    pub origin_node: Option<NodeId>,
 }
 
 /// How the message was sent — lets interceptors vary behavior
@@ -581,6 +585,7 @@ pub struct StreamSender<T: Send + 'static> {
 impl<T: Send + 'static> StreamSender<T> {
     /// Send an item to the stream consumer.
     /// Returns `Err` if the consumer has dropped the stream.
+    #[must_use = "check if the consumer dropped the stream to stop producing"]
     pub async fn send(&self, item: T) -> Result<(), StreamSendError> {
         self.inner.send(item).await
             .map_err(|_| StreamSendError::ConsumerDropped)
@@ -879,12 +884,16 @@ pub enum MailboxConfig {
     },
 }
 
+#[non_exhaustive]
 pub enum OverflowStrategy {
     /// Block the sender until space is available.
     Block,
     /// Drop the newest message (the one being sent).
     DropNewest,
     /// Drop the oldest message in the mailbox.
+    /// ⚠️ **Experimental:** No current adapter supports this natively.
+    /// All adapters return `NotSupported`. Retained for future adapters
+    /// that may provide efficient queue eviction.
     DropOldest,
     /// Return an error to the sender.
     RejectWithError,
@@ -963,6 +972,20 @@ impl Default for Priority {
 | dactor-ractor | ⚙️ Adapter | ractor has no priority mailbox; adapter wraps with `BinaryHeap`-based priority channel |
 | dactor-kameo | ✅ Library | kameo supports custom mailbox implementations; adapter plugs in priority queue mailbox |
 | dactor-mock | ⚙️ Adapter | mock runtime implements priority queue directly |
+
+**Fairness and starvation:**
+
+Priority mailboxes risk starving low-priority messages when high-priority
+messages arrive continuously. dactor does **not** enforce a fairness policy
+at the framework level — this is deliberately left to the application because
+the right policy varies by use case. However, recommended patterns include:
+
+- **Weighted fair queuing:** process N high-priority messages then 1 low-priority
+- **Aging:** promote messages that have waited longer than a threshold
+- **Rate limiting:** cap high-priority throughput to guarantee low-priority progress
+
+These can be implemented as interceptors or within the actor's handler logic.
+Future versions may offer built-in fairness strategies as opt-in policies.
 
 ### 3.9 Spawn Configuration
 
@@ -1097,6 +1120,24 @@ pub trait ActorRuntime: Send + Sync + 'static {
     /// Register a global interceptor applied to all actors.
     /// Returns `Err(NotSupported)` if the adapter doesn't support interceptors.
     fn add_interceptor(&self, interceptor: Box<dyn Interceptor>) -> Result<(), RuntimeError>;
+
+    // ── Capability Introspection ────────────────────────
+    /// Query which capabilities this runtime supports.
+    /// Callers can pre-flight requirements at startup rather than
+    /// discovering `NotSupported` errors mid-flight.
+    fn capabilities(&self) -> RuntimeCapabilities;
+}
+
+/// Describes which optional capabilities a runtime adapter supports.
+/// Returned by `ActorRuntime::capabilities()`.
+#[derive(Debug, Clone)]
+pub struct RuntimeCapabilities {
+    pub ask: bool,
+    pub stream: bool,
+    pub watch: bool,
+    pub bounded_mailbox: bool,
+    pub priority_mailbox: bool,
+    pub interceptors: bool,
 }
 ```
 
@@ -1520,6 +1561,7 @@ pub struct ActorError {
 /// Machine-readable error category, modeled after gRPC status codes
 /// but tailored for actor systems.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// The actor's handler returned an error or panicked.
     /// Analogous to gRPC `INTERNAL`.
@@ -2192,7 +2234,7 @@ pub trait Actor: Send + 'static {
     fn on_stop(&mut self) {}
 
     /// Called when a handler panics or returns an error.
-    fn on_error(&mut self, _error: Box<dyn std::error::Error + Send>) -> ErrorAction {
+    fn on_error(&mut self, _error: &ActorError) -> ErrorAction {
         ErrorAction::Stop
     }
 }
@@ -2246,6 +2288,17 @@ impl<A: Actor> ActorRef<A> {
         M: Message,
     { ... }
 
+    /// Request-reply with explicit timeout.
+    /// Returns `Err(RuntimeError::Actor(ActorError { code: Timeout, .. }))`
+    /// if the actor does not reply within the given duration.
+    pub async fn ask_timeout<M>(
+        &self, msg: M, timeout: Duration,
+    ) -> Result<M::Reply, RuntimeError>
+    where
+        A: Handler<M>,
+        M: Message,
+    { ... }
+
     /// Fire-and-forget with an envelope (headers + body).
     pub fn tell_envelope<M>(&self, envelope: Envelope<M>) -> Result<(), RuntimeError>
     where
@@ -2270,12 +2323,30 @@ impl<A: Actor> Sync for ActorRef<A> {}
 
 // ─── ActorContext ───────────────────────────────────────────
 
-/// Context passed to handlers, providing access to the runtime,
-/// the actor's own ref, and message headers.
+/// Context passed to handlers, providing access to the actor's identity,
+/// message metadata, and runtime operations.
 pub struct ActorContext {
     /// The headers from the incoming message envelope.
     pub headers: Headers,
-    // ... access to runtime, self-ref, etc.
+    /// The actor's own unique identity.
+    pub actor_id: ActorId,
+    /// The name the actor was spawned with.
+    pub actor_name: String,
+    /// How the message was sent (Tell, Ask, Stream).
+    pub send_mode: SendMode,
+}
+
+impl ActorContext {
+    /// Spawn a child actor (delegates to the runtime).
+    pub fn spawn<A: Actor>(&self, name: &str, actor: A) -> ActorRef<A> { ... }
+
+    /// Schedule a one-shot message to an actor.
+    pub fn send_after<A, M>(&self, target: &ActorRef<A>, delay: Duration, msg: M)
+    where A: Handler<M>, M: Message<Reply = ()> { ... }
+
+    /// Schedule a recurring message to an actor.
+    pub fn send_interval<A, M>(&self, target: &ActorRef<A>, interval: Duration, msg: M)
+    where A: Handler<M>, M: Message<Reply = ()> + Clone { ... }
 }
 
 // ─── ActorRuntime (revised) ─────────────────────────────────
