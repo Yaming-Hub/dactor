@@ -2205,6 +2205,130 @@ sequenceDiagram
 - The remote node must have the **same actor type** compiled in (same
   Rust type, compatible binary)
 
+**How serialization actually works:**
+
+Remote spawn involves two challenges that remote *messaging* does not:
+(1) the actor's initial state must be serialized and sent, and (2) the remote
+node must know how to reconstruct the actor and register all its `Handler<M>`
+impls — which are Rust trait impls, not data.
+
+The solution is a **type registry** combined with serialized state:
+
+```mermaid
+sequenceDiagram
+    participant C as Caller (Node 1)
+    participant R as Local Runtime
+    participant N as Network
+    participant R2 as Remote Runtime (Node 3)
+    participant TR as Type Registry (Node 3)
+    participant A as Actor Instance
+
+    Note over C: spawn_with_config("counter", Counter{count:0}, {node:3})
+
+    R->>R: 1. Serialize Counter{count:0} via serde → bytes
+    R->>R: 2. Build SpawnRequest:<br/>  type_name: "my_crate::Counter"<br/>  actor_bytes: [serialized state]<br/>  name: "counter"<br/>  config: SpawnConfig
+    R->>N: 3. Send SpawnRequest over network
+
+    N->>R2: 4. Receive SpawnRequest
+    R2->>TR: 5. Lookup "my_crate::Counter" in type registry
+    TR-->>R2: 6. Returns ActorFactory<Counter>
+
+    R2->>R2: 7. factory.deserialize(actor_bytes) → Counter{count:0}
+    R2->>A: 8. Local spawn(Counter{count:0}) — same as local spawn
+    A->>A: 9. on_start() runs
+
+    R2->>N: 10. Return ActorId{node:3, local:42}
+    N->>R: 11. Build remote ActorRef<Counter>
+    R-->>C: 12. Return ActorRef (routes to Node 3)
+```
+
+**Step-by-step:**
+
+1. **Serialize the actor struct** — the local runtime calls `serde` to
+   serialize the `Counter { count: 0 }` struct into bytes. The codec is
+   configurable (default: `bincode` for speed, or `serde_json` for
+   debuggability). Only the struct's data fields are serialized — `Handler`
+   trait impls are not data and cannot be serialized.
+
+2. **Build a `SpawnRequest`** — a wire message containing:
+   ```rust
+   #[derive(Serialize, Deserialize)]
+   struct SpawnRequest {
+       /// Fully-qualified Rust type name (e.g., "my_crate::Counter").
+       /// Used to look up the factory on the remote node.
+       type_name: String,
+       /// Serialized actor initial state.
+       actor_bytes: Vec<u8>,
+       /// Actor name.
+       name: String,
+       /// Spawn configuration (mailbox, interceptors are NOT serialized —
+       /// interceptors are per-node config, not portable).
+       config: RemoteSpawnConfig,
+   }
+
+   #[derive(Serialize, Deserialize)]
+   struct RemoteSpawnConfig {
+       mailbox: MailboxConfig,
+       // Note: interceptors and target_node are NOT included —
+       // interceptors are local to the spawning node, and target_node
+       // has already been consumed to route the request.
+   }
+   ```
+
+3. **Remote type registry** — each node maintains a registry of actor types
+   it can spawn. When the remote node receives a `SpawnRequest`, it looks
+   up the `type_name` in the registry to find an `ActorFactory`:
+
+   ```rust
+   /// Registry of actor types that can be spawned on this node.
+   /// Populated at startup (or via plugin loading).
+   pub struct TypeRegistry {
+       factories: HashMap<String, Box<dyn ErasedActorFactory>>,
+   }
+
+   /// Factory that can reconstruct an actor from serialized bytes.
+   /// One per actor type — registered at startup.
+   pub trait ActorFactory<A: Actor>: Send + Sync + 'static {
+       /// Deserialize actor state from bytes.
+       fn deserialize(&self, bytes: &[u8]) -> Result<A, ActorError>;
+   }
+
+   // Registration at startup:
+   runtime.register_remote_actor::<Counter>();
+   runtime.register_remote_actor::<Worker>();
+   ```
+
+   The `register_remote_actor::<A>()` call generates a factory that knows
+   how to `bincode::deserialize::<A>(bytes)` and how to wire up all the
+   `Handler<M>` impls — because the Rust type `A` with all its trait impls
+   is compiled into the binary on both nodes.
+
+4. **Reconstruct and spawn locally** — the factory deserializes the bytes
+   back into a `Counter { count: 0 }` and calls the normal local
+   `runtime.spawn("counter", counter)`. From this point, the actor is a
+   regular local actor on the remote node.
+
+5. **Return the `ActorId`** — the remote node sends back the assigned
+   `ActorId { node: 3, local: 42 }`, and the caller wraps it in a remote
+   `ActorRef` that routes subsequent `tell()`/`ask()` calls over the network.
+
+**What is NOT serialized:**
+
+| Component | Serialized? | Why |
+|---|:---:|---|
+| Actor struct fields (`count`, `label`, etc.) | ✅ | Data — serde handles this |
+| `Handler<M>` trait impls | ❌ | Code — compiled into both binaries |
+| `Actor` lifecycle hooks | ❌ | Code — compiled into both binaries |
+| `Interceptors` in SpawnConfig | ❌ | Per-node config — not portable |
+| `on_start()` side effects (DB connections) | ❌ | Re-executed on remote via `on_start()` |
+
+**Key insight:** The remote node must have the **same Rust binary** (or at
+least the same actor types compiled in). Remote spawn is not "send arbitrary
+code" — it's "send initial state to a node that already knows how to run
+this actor type." This is the same model used by Erlang (both nodes must
+have the same module loaded) and Akka (both nodes must have the same class
+on the classpath).
+
 **Actor trait bound for remote-spawnable actors:**
 
 ```rust
