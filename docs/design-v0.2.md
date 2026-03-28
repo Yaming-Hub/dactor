@@ -2818,21 +2818,31 @@ runtime.set_outbound_queue_config(OutboundQueueConfig {
 
 **End-to-end priority flow:**
 
-```
-Sender actor          Outbound Queue             Network        Receiver mailbox
-     │                     │                        │                 │
-     │ tell(msg)           │                        │                 │
-     │──► outbound         │                        │                 │
-     │    interceptor      │                        │                 │
-     │    stamps priority  │                        │                 │
-     │──────────────────►  │ User Lane              │                 │
-     │                     │ [CRITICAL, NORMAL, BG] │                 │
-     │                     │                        │                 │
-     │ (system heartbeat)  │ Control Lane           │                 │
-     │──────────────────►  │ [always first] ────────►── network ──►  │
-     │                     │                        │                 │
-     │                     │ CRITICAL next ─────────►── network ──►  │
-     │                     │ NORMAL next ───────────►── network ──►  │
+```mermaid
+sequenceDiagram
+    participant S as Sender Actor
+    participant OI as Outbound Interceptor
+    participant CL as Control Lane
+    participant UL as User Lane
+    participant N as Network
+    participant RM as Receiver Mailbox
+    participant H as Handler
+
+    S->>OI: tell(msg)
+    OI->>OI: stamp Priority header
+
+    alt System message (heartbeat, cancel, watch)
+        OI->>CL: enqueue
+        CL->>N: sent FIRST (always)
+    else User message
+        OI->>UL: enqueue by priority
+        Note over UL: CRITICAL → NORMAL → BACKGROUND
+        UL->>N: sent in priority order
+    end
+
+    N->>RM: deliver to receiver mailbox
+    Note over RM: priority-ordered dequeue
+    RM->>H: handle(msg)
 ```
 
 **Local sends are unaffected:** When sender and receiver are on the same
