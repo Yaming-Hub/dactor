@@ -2435,6 +2435,19 @@ metrics, tracing, auth) without modifying actor code.
 pub enum Disposition {
     /// Continue to the next interceptor / deliver the message.
     Continue,
+    /// Delay the message by the specified duration before proceeding.
+    ///
+    /// **Inbound (on_receive):** The message remains in the mailbox at its
+    /// current position — it does NOT change queue order. The runtime sleeps
+    /// for the delay, then continues the interceptor chain. Other messages
+    /// already in the queue are not affected.
+    ///
+    /// **Outbound (on_send):** The delay occurs before the message is sent,
+    /// blocking the caller's `tell()`/`ask()`/`stream()`/`feed()` call for
+    /// the specified duration. This provides natural caller-side throttling.
+    ///
+    /// Multiple interceptors can each return `Delay` — delays are cumulative.
+    Delay(Duration),
     /// Drop the message silently. For `tell()`, the sender sees `Ok(())`
     /// — fire-and-forget has no error feedback. For `ask()`, the reply
     /// channel is dropped so the sender's `.await` yields a channel error.
@@ -2445,6 +2458,8 @@ pub enum Disposition {
     /// - `tell()`: behaves like `Drop` (fire-and-forget has no error path)
     /// - `ask()`: sender receives `Err(RuntimeError::Rejected { interceptor, reason })`
     ///   immediately — giving a clear, actionable error
+    /// - `stream()` / `feed()`: sender receives `Err(RuntimeError::Rejected { .. })`
+    ///   before any stream items flow
     Reject(String),
 }
 ```
@@ -2453,9 +2468,14 @@ pub enum Disposition {
 
 ```rust
 // Inside the runtime's interceptor pipeline execution:
+let mut total_delay = Duration::ZERO;
 for interceptor in &interceptors {
     match interceptor.on_receive(&ctx, &mut headers) {
         Disposition::Continue => continue,
+        Disposition::Delay(duration) => {
+            total_delay += duration;  // cumulative
+            continue;
+        }
         Disposition::Drop => return drop_message(),
         Disposition::Reject(reason) => {
             // Runtime attaches the interceptor's name — the interceptor
@@ -2467,6 +2487,10 @@ for interceptor in &interceptors {
         }
     }
 }
+if !total_delay.is_zero() {
+    tokio::time::sleep(total_delay).await;
+}
+// deliver message to handler
 ```
 
 **What the caller sees:**
@@ -2501,12 +2525,14 @@ pub struct InboundContext<'a> {
 }
 
 /// How the message was sent — lets interceptors vary behavior
-/// (e.g., `Reject` is only meaningful for `Ask`).
+/// (e.g., `Reject` is only meaningful for `Ask`; `Delay` on outbound
+/// throttles the caller's send call).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendMode {
     Tell,
     Ask,
     Stream,
+    Feed,
 }
 
 /// An interceptor that can observe or modify messages in transit.
@@ -3188,8 +3214,12 @@ dactor-throttle = "0.1"
 **Built-in throttling interceptors:**
 
 ```rust
-/// Per-actor rate limiter — rejects messages if an actor exceeds
+/// Per-actor rate limiter — throttles messages if an actor exceeds
 /// the configured send rate within a sliding window.
+///
+/// Uses `Disposition::Delay` to slow down the caller rather than
+/// rejecting outright. Falls back to `Reject` if the rate is
+/// severely exceeded (> 2× the limit).
 pub struct ActorRateLimiter {
     /// Max messages per actor per window.
     max_rate: u64,
@@ -3208,11 +3238,17 @@ impl OutboundInterceptor for ActorRateLimiter {
         let window = self.state
             .entry(ctx.target_id.clone())
             .or_insert(SlidingWindow::new(self.window));
-        if window.increment() > self.max_rate {
+        let count = window.increment();
+        if count > self.max_rate * 2 {
+            // Severely over limit — reject immediately
             Disposition::Reject(format!(
-                "actor {} exceeded {} msgs/{}s",
-                ctx.target_name.unwrap_or("?"), self.max_rate, self.window.as_secs()
+                "actor {} exceeded {}× rate limit",
+                ctx.target_name.unwrap_or("?"), self.max_rate
             ))
+        } else if count > self.max_rate {
+            // Over limit — delay the caller to smooth out the burst
+            let backoff_ms = ((count - self.max_rate) * 10).min(1000);
+            Disposition::Delay(Duration::from_millis(backoff_ms))
         } else {
             Disposition::Continue
         }
@@ -3237,7 +3273,7 @@ pub struct PeerPressureThrottle {
 pub struct PressureThresholds {
     /// Below this RTT: no throttling.
     pub healthy: Duration,        // e.g., 10ms
-    /// Above healthy, below this: soft throttle (reject low-priority).
+    /// Above healthy, below this: soft throttle (delay low-priority).
     pub moderate: Duration,       // e.g., 100ms
     /// Above this: hard throttle (reject all but CRITICAL).
     pub severe: Duration,         // e.g., 500ms
@@ -3261,9 +3297,12 @@ impl OutboundInterceptor for PeerPressureThrottle {
             .unwrap_or(Priority::NORMAL);
 
         if rtt > self.thresholds.severe && priority.0 > Priority::CRITICAL.0 {
+            // Severe pressure — reject non-critical messages
             Disposition::Reject("peer under severe pressure".into())
         } else if rtt > self.thresholds.moderate && priority.0 > Priority::HIGH.0 {
-            Disposition::Reject("peer under moderate pressure".into())
+            // Moderate pressure — delay low-priority messages proportionally
+            let delay_ms = rtt.as_millis().saturating_sub(self.thresholds.healthy.as_millis());
+            Disposition::Delay(Duration::from_millis(delay_ms as u64))
         } else {
             Disposition::Continue
         }
