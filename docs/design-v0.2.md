@@ -1958,6 +1958,166 @@ pub struct CountingDeadLetterHandler { /* AtomicU64 counters */ }
 pub struct NullDeadLetterHandler;
 ```
 
+### 5.5 Outbound Throttling (`dactor-throttle`)
+
+**Problem:** Without network-level priority (§8.3), a chatty actor can
+flood the outbound path and overwhelm peer nodes. dactor's core doesn't
+implement throttling (consistent with "delegate, don't own"), but outbound
+interceptors have the ability to `Reject` messages — which is all that's
+needed to build throttling as an extension.
+
+**Design:** `dactor-throttle` is a **separate crate** — an optional
+dependency with zero cost if not used. It provides ready-made outbound
+interceptors for common throttling patterns.
+
+```toml
+# Only add if you need throttling
+[dependencies]
+dactor-throttle = "0.1"
+```
+
+**Built-in throttling interceptors:**
+
+```rust
+/// Per-actor rate limiter — rejects messages if an actor exceeds
+/// the configured send rate within a sliding window.
+pub struct ActorRateLimiter {
+    /// Max messages per actor per window.
+    max_rate: u64,
+    /// Sliding window duration.
+    window: Duration,
+    /// Per-actor sliding window state.
+    state: DashMap<ActorId, SlidingWindow>,
+}
+
+impl OutboundInterceptor for ActorRateLimiter {
+    fn name(&self) -> &'static str { "actor-rate-limiter" }
+
+    fn on_send(
+        &self, ctx: &OutboundContext<'_>, _headers: &mut Headers, _msg: &dyn Any,
+    ) -> Disposition {
+        let window = self.state
+            .entry(ctx.target_id.clone())
+            .or_insert(SlidingWindow::new(self.window));
+        if window.increment() > self.max_rate {
+            Disposition::Reject(format!(
+                "actor {} exceeded {} msgs/{}s",
+                ctx.target_name.unwrap_or("?"), self.max_rate, self.window.as_secs()
+            ))
+        } else {
+            Disposition::Continue
+        }
+    }
+}
+```
+
+```rust
+/// Peer pressure monitor — periodically measures round-trip time to
+/// each peer node and dynamically adjusts throttling based on observed
+/// latency. When a peer is under pressure (high RTT), outbound messages
+/// to actors on that node are throttled.
+pub struct PeerPressureThrottle {
+    /// RTT thresholds for throttling levels.
+    thresholds: PressureThresholds,
+    /// Current measured RTT per peer node.
+    peer_rtt: Arc<DashMap<NodeId, Duration>>,
+    /// Background task handle for periodic probing.
+    probe_task: JoinHandle<()>,
+}
+
+pub struct PressureThresholds {
+    /// Below this RTT: no throttling.
+    pub healthy: Duration,        // e.g., 10ms
+    /// Above healthy, below this: soft throttle (reject low-priority).
+    pub moderate: Duration,       // e.g., 100ms
+    /// Above this: hard throttle (reject all but CRITICAL).
+    pub severe: Duration,         // e.g., 500ms
+}
+
+impl OutboundInterceptor for PeerPressureThrottle {
+    fn name(&self) -> &'static str { "peer-pressure-throttle" }
+
+    fn on_send(
+        &self, ctx: &OutboundContext<'_>, headers: &mut Headers, _msg: &dyn Any,
+    ) -> Disposition {
+        if !ctx.remote { return Disposition::Continue; }  // local: no throttle
+
+        let rtt = self.peer_rtt
+            .get(&ctx.target_id.node)
+            .map(|r| *r)
+            .unwrap_or(Duration::ZERO);
+
+        let priority = headers.get::<Priority>()
+            .copied()
+            .unwrap_or(Priority::NORMAL);
+
+        if rtt > self.thresholds.severe && priority.0 > Priority::CRITICAL.0 {
+            Disposition::Reject("peer under severe pressure".into())
+        } else if rtt > self.thresholds.moderate && priority.0 > Priority::HIGH.0 {
+            Disposition::Reject("peer under moderate pressure".into())
+        } else {
+            Disposition::Continue
+        }
+    }
+}
+```
+
+**How the peer pressure monitor works:**
+
+```mermaid
+graph LR
+    subgraph "dactor-throttle (background)"
+        PM[Probe Task] -->|"periodic ask(Ping)"| PN[Peer Nodes]
+        PN -->|"Pong + latency"| PM
+        PM -->|"update RTT"| RTT["peer_rtt DashMap"]
+    end
+    subgraph "Outbound path"
+        A[Actor tell/ask] --> OI[PeerPressureThrottle]
+        OI -->|"check RTT"| RTT
+        OI -->|"Continue or Reject"| P[Provider send]
+    end
+```
+
+The probe task runs independently — it periodically sends lightweight
+`ask()` messages to a system actor on each peer node (or uses the
+provider's native health ping) and records the round-trip time. The
+outbound interceptor reads this RTT (lock-free via `DashMap`) and
+makes throttling decisions per message based on current peer pressure.
+
+**Registration:**
+
+```rust
+use dactor_throttle::{ActorRateLimiter, PeerPressureThrottle, PressureThresholds};
+
+// Per-actor rate limiting
+runtime.add_outbound_interceptor(Box::new(ActorRateLimiter {
+    max_rate: 1000,
+    window: Duration::from_secs(1),
+    state: DashMap::new(),
+}))?;
+
+// Peer pressure-based throttling
+let throttle = PeerPressureThrottle::new(
+    &runtime,
+    PressureThresholds {
+        healthy: Duration::from_millis(10),
+        moderate: Duration::from_millis(100),
+        severe: Duration::from_millis(500),
+    },
+);
+runtime.add_outbound_interceptor(Box::new(throttle))?;
+```
+
+**Why a separate crate, not built-in:**
+
+| Consideration | Decision |
+|---|---|
+| Core simplicity | Throttling policy is opinionated — different apps need different strategies |
+| Zero cost | Apps that don't need throttling pay nothing (no dependency, no code) |
+| Customizable | Users can write their own outbound interceptors with custom logic |
+| Composable | Multiple throttling interceptors can be stacked |
+| Consistent with dactor principles | "Delegate, don't own" — core provides the hook (outbound interceptor + Reject), extension provides the policy |
+
 ---
 
 ## 6. Communication Patterns
