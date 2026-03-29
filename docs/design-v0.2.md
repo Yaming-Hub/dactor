@@ -3676,32 +3676,97 @@ sequenceDiagram
 
 ### 10.5 Node Join Protocol
 
-When a new node joins the cluster (via `ClusterDiscovery`), the runtime
-must exchange system actor references so the nodes can communicate:
+When `ClusterDiscovery` detects a new node, the dactor runtime must:
+1. **Tell the adapter to establish a transport connection** — the adapter
+   owns the network, so dactor must ask it to connect
+2. **Exchange system actor references** — so both nodes can send runtime
+   messages to each other
+
+**Step 1: Adapter connection — the `AdapterCluster` trait:**
+
+Each provider has its own mechanism for connecting to peer nodes. The adapter
+must implement a trait that dactor calls when discovery reports a new node:
+
+```rust
+/// Trait that adapters implement to manage transport-level connections.
+/// Called by the dactor runtime when ClusterDiscovery reports node changes.
+#[async_trait]
+pub trait AdapterCluster: Send + Sync + 'static {
+    /// Establish a transport connection to a new peer node.
+    /// The adapter uses its library's native connection mechanism.
+    async fn connect(&self, node_id: NodeId, addr: NodeAddr) -> Result<(), ActorError>;
+
+    /// Disconnect from a peer node (graceful leave or failure).
+    async fn disconnect(&self, node_id: NodeId) -> Result<(), ActorError>;
+}
+```
+
+**How each provider connects:**
+
+| Provider | What `connect()` does | Connection mechanism |
+|---|---|---|
+| **ractor** | Calls `ractor_cluster::client_connect(addr)` | Creates a `NodeSession` actor — TCP connection with authentication, PG sync |
+| **kameo** | Dials peer via libp2p swarm | `swarm.dial(multiaddr)` — P2P connection via Kademlia DHT |
+| **coerce** | Adds peer to `RemoteActorSystem` | `cluster_worker.listen_addr()` — protobuf-based transport, K8s peer list |
+
+**How each provider handles disconnect:**
+
+| Provider | What `disconnect()` does | Detection |
+|---|---|---|
+| **ractor** | Drops `NodeSession` — TCP close, actor deregistration, PG cleanup | Session drop / TCP close → automatic `nodedown` |
+| **kameo** | Peer removed from swarm | DHT records expire, connection drop detected by libp2p |
+| **coerce** | Node removed from `RemoteActorSystem` | System topic publishes node-left event, health check failure |
+
+**Step 2: Handshake — exchange system actor refs:**
+
+After the adapter establishes the transport connection, dactor performs a
+handshake to exchange system actor references:
 
 ```mermaid
 sequenceDiagram
-    participant N1 as Node 1 (existing)
     participant CD as ClusterDiscovery
-    participant N2 as Node 2 (joining)
+    participant R1 as dactor Runtime (Node 1)
+    participant A1 as Adapter (Node 1)
+    participant A2 as Adapter (Node 2)
+    participant R2 as dactor Runtime (Node 2)
 
-    CD-->>N1: node_joined(NodeId(2), addr)
-    CD-->>N2: node_joined(NodeId(1), addr)
+    CD-->>R1: node_joined(NodeId(2), addr)
 
-    N1->>N2: Handshake { my_system_actors: { spawn: ref, cancel: ref, watch: ref, health: ref } }
-    N2->>N1: Handshake { my_system_actors: { spawn: ref, cancel: ref, watch: ref, health: ref } }
+    R1->>A1: adapter.connect(NodeId(2), addr)
+    A1->>A2: establish transport (TCP / libp2p / gRPC)
+    A2-->>A1: connection established
 
-    Note over N1: NodeDirectory now has Node 2's system actors
-    Note over N2: NodeDirectory now has Node 1's system actors
+    R1->>R2: Handshake { system_actors: { spawn, cancel, watch, health } }
+    R2-->>R1: Handshake { system_actors: { spawn, cancel, watch, health } }
 
-    N1->>N2: HealthMonitor → Ping
-    N2->>N1: HealthMonitor → Pong
-    Note over N1,N2: Nodes are now fully connected
+    Note over R1: NodeDirectory stores Node 2's system actor refs
+    Note over R2: NodeDirectory stores Node 1's system actor refs
+
+    R1->>R2: HealthMonitor → Ping
+    R2-->>R1: HealthMonitor → Pong
+    Note over R1,R2: Nodes fully connected
 ```
 
-The `Handshake` message itself is sent via the adapter's transport (using
-`NodeAddr` from discovery). After handshake, all subsequent communication
-uses the exchanged system actor `ActorRef`s.
+**Node leave flow:**
+
+```mermaid
+sequenceDiagram
+    participant CD as ClusterDiscovery
+    participant R1 as dactor Runtime (Node 1)
+    participant A1 as Adapter (Node 1)
+    participant WM as WatchManager (Node 1)
+    participant App as Application Actors
+
+    CD-->>R1: node_left(NodeId(2), Failed)
+
+    R1->>A1: adapter.disconnect(NodeId(2))
+    Note over A1: closes transport, cleans up sessions
+
+    R1->>R1: remove Node 2 from NodeDirectory
+    R1->>WM: notify watchers of actors on Node 2
+    WM->>App: ChildTerminated { reason: "node left" }
+    R1->>App: ClusterEvent::NodeLeft(NodeId(2))
+```
 
 ---
 
