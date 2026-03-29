@@ -277,7 +277,7 @@ call site — the choice is the application's, not the framework's.
 
 ---
 
-## 4. Core API Design
+## 4. Actor & Runtime
 
 dactor adopts the **Kameo/Coerce pattern** as its primary consumer interface:
 `ActorRef<A>` is typed to the actor struct (not the message), each message
@@ -1658,6 +1658,230 @@ pub fn cancel_after(duration: Duration) -> CancellationToken {
     token
 }
 ```
+
+---
+
+### 4.13 Actor Pool / Worker Factory
+
+**Rationale:** A single actor processes messages sequentially — this is safe
+but limits throughput. When work is stateless or partitionable, a **pool of
+worker actors** can process messages in parallel. This is supported by 4+ of
+the 6 surveyed frameworks, qualifying under the superset rule.
+
+| Framework | Mechanism | Routing Strategies |
+|---|---|---|
+| **Erlang/OTP** | `poolboy` library, supervisor-managed worker pools | Checkout/checkin, FIFO |
+| **Akka** | `Routers.pool(N)` with configurable routing | RoundRobin, Random, SmallestMailbox, Broadcast, ConsistentHashing |
+| **Ractor** | `Factory` module with `Worker` trait | RoundRobin, KeyPersistent (sticky), StickyQueuer, Custom |
+| **Kameo** | `ActorPool` built-in abstraction | Round-robin, least-connections |
+| **Actix** | `SyncArbiter::start(N, \|\| MyActor)` for N instances | Round-robin (implicit) |
+| **Coerce** | Sharding primitives, custom routing | Shard-key-based distribution |
+
+**dactor API:**
+
+```rust
+/// Routing strategy for distributing messages across pool workers.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum PoolRouting {
+    /// Distribute messages evenly across workers in order.
+    RoundRobin,
+    /// Route to the worker with the fewest queued messages.
+    LeastLoaded,
+    /// Route randomly.
+    Random,
+    /// Route by a key — all messages with the same key go to the same
+    /// worker, preserving per-key ordering (sticky sessions).
+    KeyBased,
+}
+
+/// Configuration for an actor pool.
+pub struct PoolConfig {
+    /// Number of worker instances.
+    pub pool_size: usize,
+    /// How to distribute messages across workers.
+    pub routing: PoolRouting,
+    /// Per-worker spawn configuration (mailbox, interceptors).
+    pub worker_config: SpawnConfig,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            pool_size: num_cpus::get(),
+            routing: PoolRouting::RoundRobin,
+            worker_config: SpawnConfig::default(),
+        }
+    }
+}
+```
+
+**Spawning a pool:**
+
+```rust
+/// A handle to a pool of actors. Sending a message to the pool
+/// routes it to one worker according to the routing strategy.
+/// Implements the same ActorRef<A> interface as a single actor.
+pub struct PoolRef<A: Actor> { /* ... */ }
+
+impl ActorRuntime {
+    /// Spawn a pool of N identical worker actors.
+    ///
+    /// All workers share the same `Args` (cloned for each). Each worker
+    /// gets its own `Deps` via the `deps_factory` — called N times to
+    /// produce per-worker dependencies (separate DB connections, unique
+    /// actor refs, etc.).
+    ///
+    /// On worker restart, the runtime calls `deps_factory` again to get
+    /// fresh deps, then `Actor::create(args.clone(), new_deps)`.
+    fn spawn_pool<A: Actor>(
+        &self,
+        name: &str,
+        pool_config: PoolConfig,
+        args: A::Args,
+        deps_factory: impl Fn(usize) -> A::Deps + Send + 'static,
+    ) -> Result<PoolRef<A>, RuntimeError>
+    where
+        A::Args: Clone;
+}
+```
+
+**How Args and Deps work in a pool:**
+
+| | `Args` | `Deps` |
+|---|---|---|
+| **Shared or per-worker?** | Shared — cloned for each worker | Per-worker — `deps_factory(worker_index)` called N times |
+| **On restart** | Same `Args` (cloned again) | Fresh `Deps` (factory called again) |
+| **Remote spawn** | `Args` serialized once, cloned on remote | `DepsFactory` resolved on remote node |
+
+```rust
+// deps_factory receives the worker index (0..pool_size)
+// so each worker can get unique resources
+deps_factory: impl Fn(usize) -> A::Deps
+```
+
+**Usage examples:**
+
+```rust
+// ── Tier 1: No deps (Deps = ()) ─────────────────────────────
+
+struct ImageResizer { quality: u32 }
+
+impl Actor for ImageResizer {
+    type Args = Self;       // Args = Self, simple
+    type Deps = ();         // no local deps
+    fn create(args: Self, _deps: ()) -> Self { args }
+}
+
+let pool = runtime.spawn_pool(
+    "image-resizer",
+    PoolConfig { pool_size: 8, routing: PoolRouting::RoundRobin, ..Default::default() },
+    ImageResizer { quality: 85 },   // Args — cloned 8 times
+    |_worker_index| (),              // no deps
+)?;
+```
+
+```rust
+// ── Tier 2: Per-worker deps (each gets own DB connection) ───
+
+#[derive(Clone, Serialize, Deserialize)]
+struct QueryWorkerArgs {
+    db_url: String,
+    max_rows: usize,
+}
+
+struct QueryWorkerDeps {
+    conn: DbConnection,  // non-serializable, per-worker
+}
+
+struct QueryWorker {
+    args: QueryWorkerArgs,
+    deps: QueryWorkerDeps,
+}
+
+impl Actor for QueryWorker {
+    type Args = QueryWorkerArgs;
+    type Deps = QueryWorkerDeps;
+    fn create(args: QueryWorkerArgs, deps: QueryWorkerDeps) -> Self {
+        QueryWorker { args, deps }
+    }
+}
+
+let pool = runtime.spawn_pool(
+    "query-pool",
+    PoolConfig { pool_size: 4, ..Default::default() },
+    QueryWorkerArgs { db_url: "postgres://localhost/mydb".into(), max_rows: 1000 },
+    |worker_index| {
+        // Each worker gets its own DB connection
+        let conn = DbConnection::connect(&format!("postgres://localhost/mydb?pool={}", worker_index));
+        QueryWorkerDeps { conn }
+    },
+)?;
+```
+
+```rust
+// ── Tier 3: Per-worker deps with shared resources ───────────
+
+struct ProcessorDeps {
+    metrics: Arc<MetricsCollector>,     // shared across all workers
+    output: ActorRef<OutputCollector>,  // shared
+    worker_id: usize,                   // unique per worker
+}
+
+let metrics = Arc::new(MetricsCollector::new());
+let output = runtime.spawn("output", OutputCollectorArgs {}, ())?;
+
+let pool = runtime.spawn_pool(
+    "processor-pool",
+    PoolConfig { pool_size: 16, routing: PoolRouting::LeastLoaded, ..Default::default() },
+    ProcessorArgs { batch_size: 100 },
+    {
+        let metrics = metrics.clone();
+        let output = output.clone();
+        move |worker_index| ProcessorDeps {
+            metrics: metrics.clone(),   // Arc clone — shared
+            output: output.clone(),     // ActorRef clone — shared
+            worker_id: worker_index,    // unique per worker
+        }
+    },
+)?;
+```
+
+**Key-based (sticky) routing:**
+
+```rust
+/// For key-based routing, messages must implement this trait
+/// to extract the routing key.
+pub trait Keyed {
+    type Key: Hash + Eq + Clone + Send;
+    fn key(&self) -> Self::Key;
+}
+
+// Example: route by user_id — all messages for the same user
+// go to the same worker, preserving per-user ordering
+struct UserRequest { user_id: u64, action: String }
+
+impl Keyed for UserRequest {
+    type Key = u64;
+    fn key(&self) -> u64 { self.user_id }
+}
+```
+
+**Important:** Each worker in the pool is an **independent actor** with its own
+state. The sequential execution guarantee (§4.3) applies per worker — no two
+handlers run concurrently on the same worker instance. Parallelism comes from
+having multiple workers, each processing their own messages.
+
+**Adapter support:**
+
+| Adapter | Strategy | Detail |
+|---|:---:|---|
+| dactor-ractor | ✅ Library | ractor's `Factory` module with `Worker` trait, multiple routing strategies |
+| dactor-kameo | ✅ Library | kameo's `ActorPool` built-in abstraction |
+| dactor-coerce | ⚙️ Adapter | coerce has sharding primitives; adapter wraps as pool with routing |
+| dactor-mock | ⚙️ Adapter | mock runtime spawns N local actors with routing logic |
+
+---
 
 ---
 
@@ -3230,228 +3454,6 @@ messages are sent FIFO — priority is only enforced at the receiver's mailbox.
 - For most applications, receiver-side priority is sufficient. Network-level
   priority matters mainly under sustained high-throughput scenarios where
   the send buffer is consistently full.
-
-### 5.9 Actor Pool / Worker Factory
-
-**Rationale:** A single actor processes messages sequentially — this is safe
-but limits throughput. When work is stateless or partitionable, a **pool of
-worker actors** can process messages in parallel. This is supported by 4+ of
-the 6 surveyed frameworks, qualifying under the superset rule.
-
-| Framework | Mechanism | Routing Strategies |
-|---|---|---|
-| **Erlang/OTP** | `poolboy` library, supervisor-managed worker pools | Checkout/checkin, FIFO |
-| **Akka** | `Routers.pool(N)` with configurable routing | RoundRobin, Random, SmallestMailbox, Broadcast, ConsistentHashing |
-| **Ractor** | `Factory` module with `Worker` trait | RoundRobin, KeyPersistent (sticky), StickyQueuer, Custom |
-| **Kameo** | `ActorPool` built-in abstraction | Round-robin, least-connections |
-| **Actix** | `SyncArbiter::start(N, \|\| MyActor)` for N instances | Round-robin (implicit) |
-| **Coerce** | Sharding primitives, custom routing | Shard-key-based distribution |
-
-**dactor API:**
-
-```rust
-/// Routing strategy for distributing messages across pool workers.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum PoolRouting {
-    /// Distribute messages evenly across workers in order.
-    RoundRobin,
-    /// Route to the worker with the fewest queued messages.
-    LeastLoaded,
-    /// Route randomly.
-    Random,
-    /// Route by a key — all messages with the same key go to the same
-    /// worker, preserving per-key ordering (sticky sessions).
-    KeyBased,
-}
-
-/// Configuration for an actor pool.
-pub struct PoolConfig {
-    /// Number of worker instances.
-    pub pool_size: usize,
-    /// How to distribute messages across workers.
-    pub routing: PoolRouting,
-    /// Per-worker spawn configuration (mailbox, interceptors).
-    pub worker_config: SpawnConfig,
-}
-
-impl Default for PoolConfig {
-    fn default() -> Self {
-        Self {
-            pool_size: num_cpus::get(),
-            routing: PoolRouting::RoundRobin,
-            worker_config: SpawnConfig::default(),
-        }
-    }
-}
-```
-
-**Spawning a pool:**
-
-```rust
-/// A handle to a pool of actors. Sending a message to the pool
-/// routes it to one worker according to the routing strategy.
-/// Implements the same ActorRef<A> interface as a single actor.
-pub struct PoolRef<A: Actor> { /* ... */ }
-
-impl ActorRuntime {
-    /// Spawn a pool of N identical worker actors.
-    ///
-    /// All workers share the same `Args` (cloned for each). Each worker
-    /// gets its own `Deps` via the `deps_factory` — called N times to
-    /// produce per-worker dependencies (separate DB connections, unique
-    /// actor refs, etc.).
-    ///
-    /// On worker restart, the runtime calls `deps_factory` again to get
-    /// fresh deps, then `Actor::create(args.clone(), new_deps)`.
-    fn spawn_pool<A: Actor>(
-        &self,
-        name: &str,
-        pool_config: PoolConfig,
-        args: A::Args,
-        deps_factory: impl Fn(usize) -> A::Deps + Send + 'static,
-    ) -> Result<PoolRef<A>, RuntimeError>
-    where
-        A::Args: Clone;
-}
-```
-
-**How Args and Deps work in a pool:**
-
-| | `Args` | `Deps` |
-|---|---|---|
-| **Shared or per-worker?** | Shared — cloned for each worker | Per-worker — `deps_factory(worker_index)` called N times |
-| **On restart** | Same `Args` (cloned again) | Fresh `Deps` (factory called again) |
-| **Remote spawn** | `Args` serialized once, cloned on remote | `DepsFactory` resolved on remote node |
-
-```rust
-// deps_factory receives the worker index (0..pool_size)
-// so each worker can get unique resources
-deps_factory: impl Fn(usize) -> A::Deps
-```
-
-**Usage examples:**
-
-```rust
-// ── Tier 1: No deps (Deps = ()) ─────────────────────────────
-
-struct ImageResizer { quality: u32 }
-
-impl Actor for ImageResizer {
-    type Args = Self;       // Args = Self, simple
-    type Deps = ();         // no local deps
-    fn create(args: Self, _deps: ()) -> Self { args }
-}
-
-let pool = runtime.spawn_pool(
-    "image-resizer",
-    PoolConfig { pool_size: 8, routing: PoolRouting::RoundRobin, ..Default::default() },
-    ImageResizer { quality: 85 },   // Args — cloned 8 times
-    |_worker_index| (),              // no deps
-)?;
-```
-
-```rust
-// ── Tier 2: Per-worker deps (each gets own DB connection) ───
-
-#[derive(Clone, Serialize, Deserialize)]
-struct QueryWorkerArgs {
-    db_url: String,
-    max_rows: usize,
-}
-
-struct QueryWorkerDeps {
-    conn: DbConnection,  // non-serializable, per-worker
-}
-
-struct QueryWorker {
-    args: QueryWorkerArgs,
-    deps: QueryWorkerDeps,
-}
-
-impl Actor for QueryWorker {
-    type Args = QueryWorkerArgs;
-    type Deps = QueryWorkerDeps;
-    fn create(args: QueryWorkerArgs, deps: QueryWorkerDeps) -> Self {
-        QueryWorker { args, deps }
-    }
-}
-
-let pool = runtime.spawn_pool(
-    "query-pool",
-    PoolConfig { pool_size: 4, ..Default::default() },
-    QueryWorkerArgs { db_url: "postgres://localhost/mydb".into(), max_rows: 1000 },
-    |worker_index| {
-        // Each worker gets its own DB connection
-        let conn = DbConnection::connect(&format!("postgres://localhost/mydb?pool={}", worker_index));
-        QueryWorkerDeps { conn }
-    },
-)?;
-```
-
-```rust
-// ── Tier 3: Per-worker deps with shared resources ───────────
-
-struct ProcessorDeps {
-    metrics: Arc<MetricsCollector>,     // shared across all workers
-    output: ActorRef<OutputCollector>,  // shared
-    worker_id: usize,                   // unique per worker
-}
-
-let metrics = Arc::new(MetricsCollector::new());
-let output = runtime.spawn("output", OutputCollectorArgs {}, ())?;
-
-let pool = runtime.spawn_pool(
-    "processor-pool",
-    PoolConfig { pool_size: 16, routing: PoolRouting::LeastLoaded, ..Default::default() },
-    ProcessorArgs { batch_size: 100 },
-    {
-        let metrics = metrics.clone();
-        let output = output.clone();
-        move |worker_index| ProcessorDeps {
-            metrics: metrics.clone(),   // Arc clone — shared
-            output: output.clone(),     // ActorRef clone — shared
-            worker_id: worker_index,    // unique per worker
-        }
-    },
-)?;
-```
-
-**Key-based (sticky) routing:**
-
-```rust
-/// For key-based routing, messages must implement this trait
-/// to extract the routing key.
-pub trait Keyed {
-    type Key: Hash + Eq + Clone + Send;
-    fn key(&self) -> Self::Key;
-}
-
-// Example: route by user_id — all messages for the same user
-// go to the same worker, preserving per-user ordering
-struct UserRequest { user_id: u64, action: String }
-
-impl Keyed for UserRequest {
-    type Key = u64;
-    fn key(&self) -> u64 { self.user_id }
-}
-```
-
-**Important:** Each worker in the pool is an **independent actor** with its own
-state. The sequential execution guarantee (§4.3) applies per worker — no two
-handlers run concurrently on the same worker instance. Parallelism comes from
-having multiple workers, each processing their own messages.
-
-**Adapter support:**
-
-| Adapter | Strategy | Detail |
-|---|:---:|---|
-| dactor-ractor | ✅ Library | ractor's `Factory` module with `Worker` trait, multiple routing strategies |
-| dactor-kameo | ✅ Library | kameo's `ActorPool` built-in abstraction |
-| dactor-coerce | ⚙️ Adapter | coerce has sharding primitives; adapter wraps as pool with routing |
-| dactor-mock | ⚙️ Adapter | mock runtime spawns N local actors with routing logic |
-
----
 
 ## 6. Actor Lifecycle & Supervision
 
