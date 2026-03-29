@@ -742,19 +742,25 @@ a central coordinator.
 ```rust
 /// Unique identifier for a node in the cluster.
 ///
-/// `NodeId` is assigned by the **dactor runtime** (not the provider) when
-/// a node starts or when a peer joins via `ClusterDiscovery`. The adapter
-/// maintains a bidirectional mapping between dactor's `NodeId` and the
-/// provider's native node identity (ractor node name, kameo `PeerId`,
-/// coerce node tag).
+/// `NodeId` wraps a `String` that is the **provider's native node identity**
+/// converted to a string by the adapter. This avoids inventing a separate
+/// ID scheme — the provider already guarantees unique, consistent identity.
 ///
-/// This indirection allows dactor to use a compact, serializable, uniform
-/// ID regardless of how the underlying provider identifies nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct NodeId(pub u64);
+/// Examples:
+///   ractor: "node1@host:4697"
+///   kameo:  "12D3KooWRF..." (PeerId as base58)
+///   coerce: "node-east-1"
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NodeId(pub String);
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Globally unique identifier for an actor across all nodes in a cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorId {
     /// The node that spawned this actor.
     pub node: NodeId,
@@ -769,81 +775,59 @@ impl fmt::Display for ActorId {
 }
 ```
 
-**How `NodeId` is assigned — cluster-wide consistency:**
+**How `NodeId` works — no negotiation needed:**
 
-`NodeId` must be the **same value on every machine** in the cluster for a
-given physical node. If Node A sees a peer as `NodeId(2)` but Node B sees
-the same peer as `NodeId(3)`, then `ActorId { node: NodeId(2), local: 42 }`
-serialized from Node A would be unresolvable on Node B.
-
-**Design:** Each node chooses its own `NodeId` at startup (from configuration
-or auto-generated) and announces it during the handshake. All peers record
-the announced value — so the `NodeId` is **self-assigned and propagated**,
-not locally assigned by each observer.
-
-| Provider | Native identity | Format | Mapping |
-|---|---|---|---|
-| **ractor** | Node name | `String` (`"node1@host"`) | Adapter maintains `HashMap<NodeId, String>` |
-| **kameo** | libp2p `PeerId` | 32-byte public key hash | Adapter maintains `HashMap<NodeId, PeerId>` |
-| **coerce** | Node tag | `String` (`"node-east-1"`) | Adapter maintains `HashMap<NodeId, String>` |
-
-**Assignment flow:**
-
-```mermaid
-sequenceDiagram
-    participant N1 as Node 1 (starting)
-    participant N2 as Node 2 (existing)
-
-    Note over N1: Startup: read NodeId from config<br/>or generate (e.g., hash of hostname + pid)
-    Note over N1: self.node_id = NodeId(1)
-
-    N1->>N2: Handshake { my_node_id: NodeId(1), native_id: "node1@host" }
-    N2->>N2: record: NodeId(1) ↔ "node1@host"
-    N2->>N1: Handshake { my_node_id: NodeId(2), native_id: "node2@host" }
-    N1->>N1: record: NodeId(2) ↔ "node2@host"
-
-    Note over N1,N2: Both nodes now agree:<br/>Node 1 = NodeId(1), Node 2 = NodeId(2)
-```
-
-**Who assigns which:**
-
-| Value | Assigned by | When | Consistent? |
-|---|---|---|---|
-| Local `NodeId` | **The node itself** (from config or auto-gen) | At startup | ✅ Self-assigned, announced to all peers |
-| Peer's `NodeId` | **The peer** (received during handshake) | During `connect()` | ✅ Same value everywhere |
-| Native identity | Provider | At adapter init | Adapter-local |
-| Mapping NodeId ↔ native | Adapter | During handshake | Adapter-local |
-
-**How to ensure uniqueness:** The `NodeId` value must be unique across the
-cluster. Recommended approaches:
-
-| Approach | How | When |
-|---|---|---|
-| **Config-assigned** | Operator sets `node_id = 1` in config file | Static clusters |
-| **Hash-based** | `hash(hostname + port + pid)` → truncate to u64 | Dynamic clusters |
-| **UUID-based** | Generate UUID v7, use lower 64 bits | Ephemeral nodes |
-| **K8s ordinal** | StatefulSet pod ordinal (pod-0 → 0, pod-1 → 1) | Kubernetes |
-
-The `ClusterDiscovery` trait can provide a suggested `NodeId` in the
-`node_joined` event if the infrastructure layer assigns node identities
-(e.g., K8s ordinals).
-
-**The adapter's `NodeIdMapper`:**
+`NodeId` wraps the provider's native identity as a string. The adapter
+converts between `NodeId` and the provider's native type:
 
 ```rust
-/// Maintained by each adapter to translate between dactor's NodeId
-/// and the provider's native node identity.
-pub(crate) struct NodeIdMapper {
-    to_native: HashMap<NodeId, NativeNodeId>,
-    from_native: HashMap<NativeNodeId, NodeId>,
+/// Adapter implements this to convert between NodeId and native identity.
+pub trait NodeIdConverter {
+    /// Convert provider's native node identity to NodeId.
+    fn to_node_id(&self, native: &Self::NativeId) -> NodeId;
+
+    /// Convert NodeId back to provider's native identity.
+    fn from_node_id(&self, node_id: &NodeId) -> Self::NativeId;
+
+    /// The native identity type for this provider.
+    type NativeId;
+}
+
+// Example: ractor adapter
+impl NodeIdConverter for RactorAdapter {
+    type NativeId = String;  // ractor node name
+    fn to_node_id(&self, name: &String) -> NodeId {
+        NodeId(name.clone())  // direct wrap
+    }
+    fn from_node_id(&self, node_id: &NodeId) -> String {
+        node_id.0.clone()
+    }
+}
+
+// Example: kameo adapter
+impl NodeIdConverter for KameoAdapter {
+    type NativeId = libp2p::PeerId;
+    fn to_node_id(&self, peer_id: &PeerId) -> NodeId {
+        NodeId(peer_id.to_base58())  // convert to string
+    }
+    fn from_node_id(&self, node_id: &NodeId) -> PeerId {
+        PeerId::from_str(&node_id.0).unwrap()
+    }
 }
 ```
 
-When the adapter needs to send a message to `NodeId(2)`, it looks up the
-native identity in its `NodeIdMapper` and uses the provider's send API.
-When the provider receives a message from a native peer, the adapter
-looks up the corresponding `NodeId` to route it into dactor's system.
+**Why String, not u64:**
 
+| Approach | Pros | Cons |
+|---|---|---|
+| `NodeId(u64)` | Compact, `Copy` | Needs negotiation protocol, collision risk, no natural mapping to provider IDs |
+| `NodeId(String)` | Direct wrap of provider identity, no negotiation, no collision, consistent by definition | Slightly larger, requires `Clone` not `Copy` |
+
+Since the provider already guarantees unique, consistent identity across the
+cluster, wrapping it as a string eliminates the entire negotiation problem.
+The `ActorId` is slightly larger but the trade-off is worth the simplicity.
+
+```rust
 /// A reference to a running actor of type `A`.
 ///
 /// `ActorRef<A>` is typed to the ACTOR, not the message. You can send
@@ -3787,8 +3771,8 @@ sequenceDiagram
     R->>CD: start discovery
     CD-->>R: node_joined(addr)
     R->>A: adapter.connect(addr)
-    Note over A: provider handles native node join<br/>+ NodeId negotiation
-    A-->>R: connected, NodeId(2) assigned
+    Note over A: provider handles native node join
+    A-->>R: connected, NodeId from provider identity
     R->>R: store NodeId(2) mapping in NodeDirectory
 
     R-->>App: Runtime ready
@@ -4853,10 +4837,9 @@ When `ClusterDiscovery` detects a new node, the flow is:
    (TCP connect, libp2p dial, gRPC handshake) using its native protocol
 4. Provider's native node join completes — system actors on both nodes
    can now communicate using the provider's native messaging
-5. **NodeId negotiation** — each node announces its self-assigned
-   `NodeId` via system actors (which are native provider actors)
-6. Adapter reports the negotiated `NodeId` back to the dactor runtime
-7. Runtime stores the `NodeId` mapping in the `NodeDirectory`
+5. Adapter converts the provider's native identity to `NodeId(String)`
+6. Adapter reports the `NodeId` back to the dactor runtime
+7. Runtime stores the `NodeId` in the `NodeDirectory`
 
 **Key principle:** dactor never touches the network. The provider handles
 all transport. System actors are native provider actors that communicate
@@ -4877,13 +4860,12 @@ sequenceDiagram
     Note over P: provider handles TCP/libp2p/gRPC
 
     P-->>A: connection established
-    Note over SA: system actors on both nodes can<br/>now communicate via provider messaging
 
-    SA->>SA: NodeId negotiation
-    A-->>R: connected, peer NodeId(2) confirmed
+    A->>A: wrap provider native identity as NodeId
+    A-->>R: connected, peer NodeId("node2@host")
 
-    R->>R: NodeDirectory stores NodeId(2)
-    R->>R: emit ClusterEvent::NodeJoined(NodeId(2))
+    R->>R: NodeDirectory stores NodeId
+    R->>R: emit ClusterEvent::NodeJoined
 ```
 
 **The `AdapterCluster` trait:**
@@ -4893,7 +4875,7 @@ sequenceDiagram
 pub trait AdapterCluster: Send + Sync + 'static {
     /// Tell the provider to connect to a new peer node.
     /// The provider handles all networking natively.
-    /// Returns the negotiated NodeId of the peer.
+    /// Returns the NodeId derived from the provider's native identity.
     async fn connect(&self, addr: NodeAddr) -> Result<NodeId, ActorError>;
 
     /// Tell the provider to disconnect from a peer node.
@@ -4906,11 +4888,11 @@ pub trait AdapterCluster: Send + Sync + 'static {
 
 **What each provider does inside `connect()`:**
 
-| Provider | Native join process | NodeId negotiation |
+| Provider | Native join process | NodeId derivation |
 |---|---|---|
-| **ractor** | `client_connect(addr)` creates `NodeSession` (TCP + auth) | System actor exchanges `NodeId` via ractor messaging |
-| **kameo** | `swarm.dial(multiaddr)` establishes libp2p connection | System actor exchanges `NodeId` via kameo messaging |
-| **coerce** | `RemoteActorSystem` cluster worker connects via protobuf | System actor exchanges `NodeId` via coerce messaging |
+| **ractor** | `client_connect(addr)` creates `NodeSession` (TCP + auth) | Adapter wraps ractor node name as NodeId(String) |
+| **kameo** | `swarm.dial(multiaddr)` establishes libp2p connection | Adapter wraps PeerId.to_base58() as NodeId(String) |
+| **coerce** | `RemoteActorSystem` cluster worker connects via protobuf | Adapter wraps coerce node tag as NodeId(String) |
 
 **Node leave flow:**
 
