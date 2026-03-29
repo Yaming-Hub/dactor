@@ -2165,53 +2165,74 @@ impl Handler<ExpensiveQuery> for Worker {
 #### 6.4.2 Remote Cancellation
 
 `CancellationToken` is an in-process primitive — it **cannot be serialized**.
-For remote calls, the adapter bridges local and remote tokens via a
-`CancelRequest` **control message**:
+For remote calls, the runtime's local `CancelManager` system actor sends a
+`CancelRequest` to the remote node's `CancelManager` system actor (see §10.2).
+This uses the adapter's existing remote messaging — no separate transport.
 
 ```mermaid
 sequenceDiagram
     participant C as Caller (Node 1)
-    participant A as Adapter (Node 1)
-    participant N as Network
-    participant R as Remote Runtime (Node 2)
+    participant R as Runtime (Node 1)
+    participant CM1 as CancelManager (Node 1)
+    participant CM2 as CancelManager (Node 2)
     participant H as Handler (Node 2)
 
-    C->>A: ask(msg, Some(cancel_token))
-    A->>N: send Request { id: 42, msg }
-    N->>R: deliver
-    R->>R: create local_token for request 42
-    R->>H: handle(msg, ctx) where ctx.cancel = local_token
-
-    Note over H: handler runs, checks ctx.cancelled()<br/>at .await points
+    C->>R: ask(msg, Some(cancel_token))
+    R->>R: assign request_id=42, create local tracking
+    R->>H: deliver message to handler (via adapter messaging)
+    Note over H: handler runs, checks ctx.cancelled()
 
     Note over C: caller's token.cancel() triggered
-    A->>N: send CancelRequest { id: 42 } [CONTROL CHANNEL]
-    N->>R: deliver via control channel (bypasses mailbox)
-    R->>R: local_token.cancel()
+    R->>CM1: cancel request_id=42
+    CM1->>CM2: tell(CancelRequest { request_id: 42 })
+    Note over CM1,CM2: sent via adapter's remote actor messaging<br/>with Priority::CRITICAL
+    CM2->>CM2: lookup request_id=42 → local_token.cancel()
 
     Note over H: next .await wakes via select!<br/>→ returns Err(Cancelled)
 
     H-->>R: Err(Cancelled)
-    R->>N: forward error
-    A-->>C: Err(Cancelled)
+    R-->>C: Err(Cancelled)
 ```
 
-**`CancelRequest` uses a dedicated control channel, not the actor's mailbox.**
-This is critical — if the cancel message were delivered through the normal
-mailbox, it would be queued behind all other pending messages and could not
-reach the handler in time. The control channel is a separate, unbounded,
-highest-priority path that the runtime monitors independently of the
-actor's message processing.
+**`CancelRequest` is sent as a `Priority::CRITICAL` message to the remote
+`CancelManager` system actor.** Since `CancelManager` has its own mailbox
+(separate from the target actor's mailbox), the cancel is not blocked by
+the target actor's message queue.
+
+On the remote node, `CancelManager` maintains a map of `request_id →
+local CancellationToken`. When it receives a `CancelRequest`, it calls
+`token.cancel()`, which wakes the handler's `select!` at the next `.await`
+point.
 
 ```rust
-/// Control message sent to remote node to cancel an in-flight operation.
-/// Delivered via a dedicated control channel, NOT through the actor's
-/// mailbox — ensuring it is processed immediately regardless of mailbox
-/// depth or priority configuration.
+/// System actor that handles cancellation requests on this node.
+/// One per node, spawned automatically by the runtime.
+pub(crate) struct CancelManager {
+    active_requests: HashMap<u64, CancellationToken>,
+}
+
+impl Actor for CancelManager {
+    type Args = ();
+    type Deps = ();
+    fn create(_args: (), _deps: ()) -> Self {
+        CancelManager { active_requests: HashMap::new() }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
-struct CancelRequest {
-    /// The request_id assigned by the adapter when the ask/stream was initiated.
-    request_id: u64,
+pub(crate) struct CancelRequest {
+    pub request_id: u64,
+}
+
+impl Message for CancelRequest { type Reply = (); }
+
+#[async_trait]
+impl Handler<CancelRequest> for CancelManager {
+    async fn handle(&mut self, msg: CancelRequest, _ctx: &mut ActorContext) {
+        if let Some(token) = self.active_requests.remove(&msg.request_id) {
+            token.cancel();
+        }
+    }
 }
 ```
 
@@ -3536,9 +3557,157 @@ pub enum Outcome {
 
 ---
 
-## 10. Remote Actors
+## 10. Framework Runtime
 
-### 10.1 Serialization Contract
+The dactor runtime is the infrastructure layer that sits between application
+actors and the adapter. It manages system actors, internal registries, and
+node-to-node coordination — all using the adapter's existing actor messaging
+infrastructure. The runtime doesn't own the network or the actor execution
+engine; it uses the adapter for both.
+
+### 10.1 Architecture
+
+```mermaid
+graph TB
+    subgraph "dactor Runtime (per node)"
+        subgraph "System Actors (auto-spawned)"
+            SM[SpawnManager]
+            CM[CancelManager]
+            WM[WatchManager]
+            HM[HealthMonitor]
+        end
+        subgraph "Internal Registries"
+            TR[TypeRegistry<br/>actor factories]
+            HR[HeaderRegistry<br/>header deserializers]
+            ER[ErrorCodecRegistry<br/>error translators]
+            ND[NodeDirectory<br/>peer system actor refs]
+        end
+        subgraph "Core Services"
+            OI[Outbound Interceptors]
+            II[Inbound Interceptors]
+            DL[Dead Letter Handler]
+            MS[MessageSerializer]
+        end
+    end
+    subgraph "Adapter"
+        AR[ActorRuntime impl<br/>spawn, tell, ask]
+    end
+    subgraph "Application"
+        A1[Actor A]
+        A2[Actor B]
+    end
+
+    A1 & A2 --> OI --> AR
+    AR --> II --> A1 & A2
+    SM & CM & WM & HM --> AR
+```
+
+### 10.2 System Actors
+
+System actors are regular actors (implement `Actor` + `Handler<M>`) that the
+runtime spawns automatically during node startup. They handle runtime-level
+operations as normal messages, using the adapter's existing cross-node
+messaging — **no separate network transport needed**.
+
+| System Actor | Responsibility | Messages it handles |
+|---|---|---|
+| `SpawnManager` | Processes remote spawn requests | `SpawnRequest` → `ActorId` |
+| `CancelManager` | Processes remote cancellation requests | `CancelRequest` → `()` |
+| `WatchManager` | Manages watch/unwatch subscriptions, delivers `ChildTerminated` | `WatchRequest`, `UnwatchRequest`, `ChildTerminated` |
+| `HealthMonitor` | Heartbeat ping/pong with peer nodes | `Ping` → `Pong` |
+
+**Why system actors, not a separate transport:**
+
+- **Reuses existing infrastructure** — the adapter already handles cross-node
+  actor messaging. No new network code in dactor.
+- **Location-transparent** — system actors have `ActorRef`s like any other
+  actor. Sending a `SpawnRequest` to a remote `SpawnManager` works exactly
+  like any remote `tell()`/`ask()`.
+- **Interceptors work** — system messages flow through the same interceptor
+  pipeline, so they get tracing, metrics, and logging for free.
+- **Priority** — system actor messages can use `Priority::CRITICAL` via
+  outbound interceptors (on adapters that support outbound priority, §8.3).
+- **Testable** — `dactor-mock` can observe, delay, and fault-inject system
+  actor messages.
+
+### 10.3 Internal Registries
+
+| Registry | Purpose | Populated by |
+|---|---|---|
+| `TypeRegistry` | Maps type name → `ActorFactory` for remote spawn (§10.5) | `runtime.register_remote_actor::<A>()` at startup |
+| `HeaderRegistry` | Maps header name → deserializer for `Headers::from_wire()` (§5.1) | `registry.register::<H>()` at startup |
+| `ErrorCodecRegistry` | Maps error type name → `ErrorCodec` for encode/decode (§9.1) | `runtime.register_error_codec()` at startup |
+| `NodeDirectory` | Maps `NodeId` → peer system actor `ActorRef`s | Auto-populated on cluster join (§11.1) |
+
+### 10.4 Startup Sequence
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant R as Runtime
+    participant A as Adapter
+    participant SA as System Actors
+    participant CD as ClusterDiscovery
+
+    App->>R: RuntimeBuilder::new()
+    App->>R: .adapter(RactorRuntime::new())
+    App->>R: .message_serializer(BincodeSerializer)
+    App->>R: .register_remote_actor::<MyActor>()
+    App->>R: .register_error_codec(MyCodec)
+    App->>R: .add_inbound_interceptor(LoggingInterceptor)
+    App->>R: .add_outbound_interceptor(TracePropagator)
+    App->>R: .cluster_discovery(KubernetesDiscovery::new(...))
+    App->>R: .build()
+
+    R->>A: initialize adapter
+    R->>SA: spawn SpawnManager
+    R->>SA: spawn CancelManager
+    R->>SA: spawn WatchManager
+    R->>SA: spawn HealthMonitor
+
+    R->>CD: start discovery
+    CD-->>R: node_joined(NodeId(2))
+    R->>R: exchange system actor refs with Node 2
+    R->>R: store in NodeDirectory
+
+    R-->>App: Runtime ready
+    App->>R: runtime.spawn("my-actor", args, deps)
+```
+
+### 10.5 Node Join Protocol
+
+When a new node joins the cluster (via `ClusterDiscovery`), the runtime
+must exchange system actor references so the nodes can communicate:
+
+```mermaid
+sequenceDiagram
+    participant N1 as Node 1 (existing)
+    participant CD as ClusterDiscovery
+    participant N2 as Node 2 (joining)
+
+    CD-->>N1: node_joined(NodeId(2), addr)
+    CD-->>N2: node_joined(NodeId(1), addr)
+
+    N1->>N2: Handshake { my_system_actors: { spawn: ref, cancel: ref, watch: ref, health: ref } }
+    N2->>N1: Handshake { my_system_actors: { spawn: ref, cancel: ref, watch: ref, health: ref } }
+
+    Note over N1: NodeDirectory now has Node 2's system actors
+    Note over N2: NodeDirectory now has Node 1's system actors
+
+    N1->>N2: HealthMonitor → Ping
+    N2->>N1: HealthMonitor → Pong
+    Note over N1,N2: Nodes are now fully connected
+```
+
+The `Handshake` message itself is sent via the adapter's transport (using
+`NodeAddr` from discovery). After handshake, all subsequent communication
+uses the exchanged system actor `ActorRef`s.
+
+---
+
+## 11. Remote Actors
+
+### 11.1 Serialization Contract
 
 **Problem:** When messages cross node boundaries, they must be serialized.
 Not all messages need to be serializable (local-only actors don't need it).
@@ -3889,7 +4058,14 @@ choice of `MessageSerializer` affects what evolution strategies are available:
 | Custom protobuf | Native field numbering, backward/forward compat | Best evolution, more setup |
 | Custom MessagePack | Similar to JSON but binary + compact | Good middle ground |
 
-### 10.2 Remote Actor Spawning
+### 11.2 Runtime Operations via System Actors
+
+All remote runtime operations (spawn, cancel, watch, health) are handled
+by **system actors** — see §10.2 for the complete design. System actors
+use the adapter's existing remote messaging, so dactor needs no separate
+network transport.
+
+### 11.3 Remote Actor Spawning
 
 All three backend libraries (ractor, kameo, coerce) support spawning actors
 on remote nodes. dactor exposes this via `SpawnConfig::target_node`.
@@ -4121,7 +4297,7 @@ where
 | Network partition | `spawn_with_config()` blocks until timeout, then returns `Err` |
 | Actor type not registered on remote | Remote node returns error; caller gets `Err(RuntimeError::Actor(ActorError { code: Unimplemented }))` |
 
-### 10.3 Serializable Actor References
+### 11.4 Serializable Actor References
 
 **Question:** Can I send an `ActorRef` to another machine and use it to call
 the actor from there?
@@ -4226,7 +4402,7 @@ impl<A: Actor> Deserialize for ActorRef<A> {
   practice, the adapter provides a custom deserializer or the ref is
   reconstructed post-deserialization.
 
-### 10.4 Remote Actor Call Example
+### 11.5 Remote Actor Call Example
 
 **Remote actor call example:**
 
@@ -4362,7 +4538,7 @@ Caller Node                                              Remote Node
 | **Runtime error** | `RuntimeError::Actor(ActorError)` | Handler panicked, unhandled exception | Handler panics — adapter captures and wraps as `ActorError` |
 | **Infrastructure error** | `RuntimeError::Send` / `NotSupported` | Network timeout, node down, serialization failure | Message never reached the actor or reply was lost |
 
-### 10.5 Sending to Unavailable Actors
+### 11.6 Sending to Unavailable Actors
 
 When sending a message (local or remote) to an actor that is not available,
 the behavior depends on the send mode and the reason for unavailability.
@@ -4459,7 +4635,7 @@ and returns `ActorNotFound`. If the remote **node** doesn't exist (wrong
 
 ---
 
-## 11. Cluster Management
+## 12. Cluster Management
 
 **Problem:** In production deployments (Kubernetes, VMSS, cloud auto-scaling),
 nodes come and go dynamically. The actor framework needs to know when nodes
@@ -4659,9 +4835,9 @@ runtime.set_health_config(HealthConfig {
 
 ---
 
-## 12. Observability
+## 13. Observability
 
-### 12.1 Overview
+### 13.1 Overview
 
 **Problem:** In production, operators need visibility into actor system health:
 which actors are busiest, which fail most, what message sizes look like, how
@@ -4674,7 +4850,7 @@ pipeline** (§3.2). Because interceptors see every message with full context
 also provides a built-in `MetricsInterceptor` and a `RuntimeMetrics` query
 API for common operational needs.
 
-#### 12.2 Built-in `MetricsInterceptor`
+#### 13.2 Built-in `MetricsInterceptor`
 
 A ready-to-use interceptor that tracks per-actor and per-message-type
 statistics. Users register it once; it collects everything automatically.
@@ -4710,7 +4886,7 @@ impl InboundInterceptor for MetricsInterceptor {
 }
 ```
 
-#### 12.3 `MetricsStore` Query API
+#### 13.3 `MetricsStore` Query API
 
 ```rust
 /// Queryable metrics collected by `MetricsInterceptor`.
@@ -4782,7 +4958,7 @@ pub struct MessageTypeMetrics {
 }
 ```
 
-#### 12.4 Custom Interceptor Examples
+#### 13.4 Custom Interceptor Examples
 
 The built-in `MetricsInterceptor` covers common needs. For specialized
 observability, users write custom interceptors:
@@ -4942,7 +5118,7 @@ impl InboundInterceptor for OtelInterceptor {
 }
 ```
 
-#### 12.5 Registering Multiple Interceptors
+#### 13.5 Registering Multiple Interceptors
 
 Interceptors are composable. A typical production setup:
 
@@ -4965,9 +5141,9 @@ Interceptors execute in registration order. The pipeline is:
 
 ---
 
-## 13. Testing
+## 14. Testing
 
-### 13.1 Feature-Gated Test Support
+### 14.1 Feature-Gated Test Support
 
 **Rationale:** `TestClock`, `TestRuntime`, `TestClusterEvents` are test
 utilities. They should not be compiled into production binaries.
@@ -4992,7 +5168,7 @@ Downstream crates use:
 dactor = { version = "0.2", features = ["test-support"] }
 ```
 
-### 13.2 Mock Cluster Crate (`dactor-mock`)
+### 14.2 Mock Cluster Crate (`dactor-mock`)
 
 **Rationale:** The existing `test_support` module in the `dactor` core crate
 provides `TestRuntime` — a single-node, in-memory mock useful for unit-testing
@@ -5331,7 +5507,7 @@ bincode = "1"          # default codec
 | **Inspection** | N/A | In-flight count, dropped count, corrupted count, `flush()` |
 | **Use case** | Unit testing single actors | Integration testing cluster behavior, chaos testing |
 
-### 13.3 Adapter Conformance Test Suite
+### 14.3 Adapter Conformance Test Suite
 
 **Problem:** With multiple traits and capabilities, adapters risk subtle
 incompleteness — an adapter might forget to run interceptors on stream
@@ -5391,9 +5567,9 @@ library's errors to dactor's `ErrorCode`:
 
 ---
 
-## 14. Developer Experience
+## 15. Developer Experience
 
-### 14.1 Proc-Macro for Reduced Boilerplate (`dactor-macros`)
+### 15.1 Proc-Macro for Reduced Boilerplate (`dactor-macros`)
 
 The trait-based API (§10.6) is explicit and type-safe but requires repetitive
 boilerplate — each message needs a struct, a `Message` impl, and a `Handler`
@@ -5580,7 +5756,7 @@ members = ["dactor", "dactor-macros", "dactor-ractor", "dactor-kameo", "dactor-c
 | `pub async fn bar(&mut self, x: u64)` | `struct Bar { x: u64 }` + `impl Message` + `impl Handler<Bar>` |
 | `pub async fn baz(&self) -> String` | `struct Baz;` + `impl Message { type Reply = String }` + `impl Handler<Baz>` |
 
-### 14.2 Closure-based Actors (Backward Compatibility)
+### 15.2 Closure-based Actors (Backward Compatibility)
 
 **Backward compatibility with closures:**
 
@@ -5611,7 +5787,7 @@ fn spawn_fn<M, H>(&self, name: &str, handler: H) -> ActorRef<ClosureActor<M>>
 where M: Send + 'static, H: FnMut(M) + Send + 'static;
 ```
 
-### 14.3 Proc-Macro Error Handling
+### 15.3 Proc-Macro Error Handling
 
 The `dactor-macros` proc-macro crate must emit clear, actionable compile
 errors for patterns it cannot support. This section documents the expected
@@ -5636,9 +5812,9 @@ error messages.
 
 ---
 
-## 15. Adapter Support
+## 16. Adapter Support
 
-### 15.1 Capability Summary Matrix
+### 16.1 Capability Summary Matrix
 
 For each feature and each adapter, there are exactly three possibilities:
 
@@ -5669,7 +5845,7 @@ For each feature and each adapter, there are exactly three possibilities:
 | Cluster events | ⚙️ Adapter | ⚙️ Adapter | ✅ Library | ractor/kameo: adapter callback system; coerce: native cluster membership |
 
 
-### 15.2 Strategy Key
+### 16.2 Strategy Key
 
 For each feature and each adapter, there are exactly three possibilities:
 
@@ -5677,7 +5853,7 @@ For each feature and each adapter, there are exactly three possibilities:
 - ⚙️ **Adapter Implemented** — the library does *not* support this; the adapter crate implements it with custom logic
 - ❌ **Not Supported** — returns `RuntimeError::NotSupported` at runtime
 
-### 15.3 dactor-ractor
+### 16.3 dactor-ractor
 
 | Feature | Strategy | Implementation Detail |
 |---------|:---:|---|
@@ -5700,7 +5876,7 @@ For each feature and each adapter, there are exactly three possibilities:
 | Processing groups | ✅ Library | ractor has native `pg` module — maps `join_group` / `leave_group` / `broadcast_group` to `ractor::pg` API |
 | Cluster events | ⚙️ Adapter | ractor has no unified cluster events; adapter provides `RactorClusterEvents` callback system (implemented in v0.1) |
 
-### 15.4 dactor-kameo
+### 16.4 dactor-kameo
 
 | Feature | Strategy | Implementation Detail |
 |---------|:---:|---|
@@ -5723,7 +5899,7 @@ For each feature and each adapter, there are exactly three possibilities:
 | Processing groups | ⚙️ Adapter | kameo has no processing groups; adapter maintains type-erased registry (implemented in v0.1) |
 | Cluster events | ⚙️ Adapter | kameo has no unified cluster events; adapter provides `KameoClusterEvents` callback system (implemented in v0.1) |
 
-### 15.5 dactor-coerce
+### 16.5 dactor-coerce
 
 | Feature | Strategy | Implementation Detail |
 |---------|:---:|---|
@@ -5748,9 +5924,9 @@ For each feature and each adapter, there are exactly three possibilities:
 
 ---
 
-## 16. Implementation Roadmap
+## 17. Implementation Roadmap
 
-### 16.1 Phase 1 — Foundation (v0.2.0)
+### 17.1 Phase 1 — Foundation (v0.2.0)
 1. Module reorganization (flat structure, one concept per file)
 2. Feature-gate `test_support` behind `test-support`
 3. Move `TestClock` out of `traits/clock.rs`
@@ -5760,28 +5936,28 @@ For each feature and each adapter, there are exactly three possibilities:
 7. Add `Interceptor` trait and pipeline
 8. Clean up `serde` dependency (make optional)
 
-### 16.2 Phase 2 — Lifecycle & Config (v0.2.1)
+### 17.2 Phase 2 — Lifecycle & Config (v0.2.1)
 1. Lifecycle hooks on `Actor` trait (`on_start`, `on_stop`, `on_error`)
 2. Add `MailboxConfig` and `OverflowStrategy`
 3. Add `SpawnConfig` for per-actor configuration
 4. Add `spawn_with_config()` to `ActorRuntime`
 5. Update adapter crates
 
-### 16.3 Phase 3 — Supervision (v0.3.0)
+### 17.3 Phase 3 — Supervision (v0.3.0)
 1. Add `SupervisionStrategy` trait
 2. Add `ChildTerminated` event
 3. Add `watch()` / `unwatch()` to `ActorRuntime`
 4. Built-in strategies: `OneForOne`, `OneForAll`, `RestForOne`
 5. Add `ErrorAction::Escalate` flow
 
-### 16.4 Phase 4 — Ask Pattern & Streaming (v0.3.1)
+### 17.4 Phase 4 — Ask Pattern & Streaming (v0.3.1)
 1. Add `AskRef<M, R>` trait
 2. Add `StreamRef<M, R>` trait, `StreamSender<R>`, `BoxStream<R>`
 3. Implement for adapters (channel-based shim)
 4. Add timeout support for ask
 5. Add `futures-core` and `tokio-stream` dependencies
 
-### 16.5 Phase 5 — Mock Cluster Crate (v0.4.0)
+### 17.5 Phase 5 — Mock Cluster Crate (v0.4.0)
 1. Create `dactor-mock` workspace crate
 2. `MockCluster` builder with multi-node setup
 3. `MockRuntime` implementing `ActorRuntime` per node
@@ -5795,7 +5971,7 @@ For each feature and each adapter, there are exactly three possibilities:
 
 ---
 
-### 16.6 Dependency Cleanup
+### 17.6 Dependency Cleanup
 
 #### v0.1 dactor/Cargo.toml deps:
 ```toml
@@ -5825,7 +6001,7 @@ test-support = ["tokio/test-util"]
 
 ---
 
-### 16.7 Breaking Changes & Migration
+### 17.7 Breaking Changes & Migration
 
 | v0.1 | v0.2 | Migration |
 |------|------|-----------|
@@ -5846,9 +6022,9 @@ test-support = ["tokio/test-util"]
 
 ---
 
-## 17. Module Layout
+## 18. Module Layout
 
-### 17.1 Before (v0.1)
+### 18.1 Before (v0.1)
 
 ```
 dactor/src/
@@ -5866,7 +6042,7 @@ dactor/src/
     └── test_clock.rs
 ```
 
-### 17.2 After (v0.2)
+### 18.2 After (v0.2)
 
 ```
 dactor/src/
@@ -5896,7 +6072,7 @@ dactor/src/
 
 ---
 
-## 18. Open Questions
+## 19. Open Questions
 
 1. **Should `Envelope<M>` be the only way to send messages?** → **Resolved: No.** `tell(msg)` is the only send method. Outbound interceptors handle header injection automatically. `Envelope<M>` remains as an internal transport type between interceptors and the runtime — not exposed to callers.
 
