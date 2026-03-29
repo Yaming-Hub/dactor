@@ -1397,6 +1397,125 @@ All four are methods on `ActorRef<A>`, providing a unified API.
 and `tokio-stream` (for `ReceiverStream`) as dependencies, both lightweight
 and standard in the async Rust ecosystem.
 
+#### 4.11.1 Stream & Feed Batching
+
+**Problem:** In both `stream()` and `feed()`, each item is an independent
+message through the channel (and over the wire for remote actors). For
+high-throughput streams with small items (e.g., sensor readings, log lines,
+pixel rows), per-item overhead dominates: serialization framing, channel
+wake-ups, network round-trips. Batching amortizes this overhead.
+
+**Design:** The runtime provides optional **transparent batching** controlled
+by a `BatchConfig`. Batching is applied at the transport layer — the
+application-level API remains item-by-item (`send(item)` / `recv()`), so
+actor code doesn't change.
+
+```rust
+/// Controls automatic batching for stream and feed channels.
+/// Batching is transparent — the sender/receiver API remains per-item.
+#[derive(Debug, Clone)]
+pub struct BatchConfig {
+    /// Maximum number of items to batch together.
+    /// When this many items are buffered, the batch is flushed immediately.
+    pub max_items: usize,
+
+    /// Maximum time to wait for more items before flushing.
+    /// If fewer than `max_items` are buffered but this duration elapses
+    /// since the first item in the batch, the batch is flushed.
+    pub max_delay: Duration,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_items: 64,
+            max_delay: Duration::from_millis(5),
+        }
+    }
+}
+```
+
+**API integration:**
+
+```rust
+impl<A: Actor> ActorRef<A> {
+    /// Send a request and receive a stream of responses, with batching.
+    pub fn stream_batched<M>(
+        &self,
+        msg: M,
+        buffer: usize,
+        batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<BoxStream<M::Reply>, RuntimeError>
+    where
+        A: Handler<M>,
+        M: Message;
+
+    /// Feed an async stream into the actor, with batching.
+    pub async fn feed_batched<M>(
+        &self,
+        msg: M,
+        input: BoxStream<M::Item>,
+        buffer: usize,
+        batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<M::Reply, RuntimeError>
+    where
+        A: FeedHandler<M>,
+        M: FeedMessage;
+}
+```
+
+**How batching works (local actors):**
+
+For local actors, batching has minimal benefit since channel operations are
+cheap. The runtime may skip batching entirely for local sends (adapter
+decides).
+
+**How batching works (remote actors):**
+
+```mermaid
+sequenceDiagram
+    participant S as Sender
+    participant BW as Batch Writer
+    participant W as Wire (network)
+    participant BR as Batch Reader
+    participant R as Receiver
+
+    S->>BW: item_1
+    S->>BW: item_2
+    S->>BW: item_3
+    Note over BW: max_items=3 reached
+    BW->>W: [item_1, item_2, item_3] (one frame)
+    W->>BR: [item_1, item_2, item_3]
+    BR->>R: item_1
+    BR->>R: item_2
+    BR->>R: item_3
+
+    S->>BW: item_4
+    Note over BW: max_delay=5ms elapsed
+    BW->>W: [item_4] (flush on timeout)
+    W->>BR: [item_4]
+    BR->>R: item_4
+```
+
+The batch writer accumulates items and flushes when either `max_items` is
+reached or `max_delay` elapses — whichever comes first. On the receiving
+end, the batch reader unpacks items and delivers them individually to the
+`StreamReceiver` or `StreamSender`. The application code sees single items
+as usual.
+
+**Trade-offs:**
+
+| Setting | Throughput | Latency |
+|---|---|---|
+| `max_items=1, max_delay=0` | No batching (baseline) | Lowest per-item latency |
+| `max_items=64, max_delay=5ms` | Good (default) | ≤5ms added latency |
+| `max_items=256, max_delay=50ms` | Best for bulk transfer | Higher latency acceptable |
+
+> **Note:** `stream()` and `feed()` without `_batched` suffix continue to
+> work with no batching (per-item delivery). Batching is opt-in.
+
 ### 4.12 Feed (Client-Streaming / Stream-to-Actor)
 
 **Rationale:** The `stream()` pattern (§4.11) covers *server-streaming* — one
