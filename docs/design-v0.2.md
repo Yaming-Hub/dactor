@@ -3657,6 +3657,10 @@ pub(crate) struct WireEnvelope {
     pub target: ActorId,
     /// The Rust type name of the message (for handler dispatch on remote).
     pub message_type: String,
+    /// Optional message schema version. When present, the receiver can
+    /// use a `MessageVersionHandler` to migrate or reject messages from
+    /// older/newer senders. When absent, no version checking is performed.
+    pub version: Option<u32>,
     /// Send mode — how the remote should handle this.
     pub send_mode: SendMode,
     /// Serialized headers (from `Headers::to_wire()`).
@@ -3666,6 +3670,134 @@ pub(crate) struct WireEnvelope {
     /// For ask: a request_id so the reply can be routed back.
     pub request_id: Option<u64>,
 }
+```
+
+**Message versioning:**
+
+The `version` field enables schema evolution for remote messages. Messages
+can declare their version, and the receiver can register a
+`MessageVersionHandler` to handle version mismatches — migrating old formats,
+rejecting incompatible versions, or logging warnings.
+
+```rust
+/// Declare the wire version on a message type.
+/// If not implemented, `version` is `None` in the envelope (no versioning).
+pub trait Versioned {
+    /// The current schema version of this message type.
+    fn version() -> u32;
+}
+
+// Example:
+impl Versioned for TransferFunds {
+    fn version() -> u32 { 2 }  // v2 added `memo` field
+}
+```
+
+```rust
+/// Handles version mismatches on the receiver side.
+/// Registered per message type name.
+pub trait MessageVersionHandler: Send + Sync + 'static {
+    /// Called when the receiver gets a message with a different version
+    /// than expected. Can migrate the bytes, reject, or pass through.
+    ///
+    /// - `message_type`: the Rust type name
+    /// - `received_version`: version from the sender's envelope
+    /// - `expected_version`: version from the local `Versioned` impl
+    /// - `body`: the serialized message bytes
+    ///
+    /// Returns migrated bytes or an error.
+    fn handle_mismatch(
+        &self,
+        message_type: &str,
+        received_version: u32,
+        expected_version: u32,
+        body: &[u8],
+    ) -> Result<Vec<u8>, ActorError>;
+}
+```
+
+**Built-in handlers:**
+
+```rust
+/// Reject any version mismatch — strict compatibility.
+pub struct RejectVersionMismatch;
+
+impl MessageVersionHandler for RejectVersionMismatch {
+    fn handle_mismatch(
+        &self, message_type: &str, received: u32, expected: u32, _body: &[u8],
+    ) -> Result<Vec<u8>, ActorError> {
+        Err(ActorError::new(
+            ErrorCode::FailedPrecondition,
+            format!("{message_type}: expected version {expected}, got {received}"),
+        ))
+    }
+}
+
+/// Accept any version — rely on serde's `#[serde(default)]` for
+/// forward/backward compatibility. Log a warning on mismatch.
+pub struct AcceptWithWarning;
+```
+
+**Custom migration example:**
+
+```rust
+struct TransferFundsMigrator;
+
+impl MessageVersionHandler for TransferFundsMigrator {
+    fn handle_mismatch(
+        &self, _msg_type: &str, received: u32, expected: u32, body: &[u8],
+    ) -> Result<Vec<u8>, ActorError> {
+        match (received, expected) {
+            (1, 2) => {
+                // v1 → v2: deserialize v1, add default `memo` field, re-serialize as v2
+                let mut v1: TransferFundsV1 = bincode::deserialize(body)?;
+                let v2 = TransferFundsV2 {
+                    from: v1.from, to: v1.to, amount: v1.amount,
+                    memo: String::new(),  // default for new field
+                };
+                Ok(bincode::serialize(&v2)?)
+            }
+            _ => Err(ActorError::new(
+                ErrorCode::FailedPrecondition,
+                format!("cannot migrate from v{received} to v{expected}"),
+            )),
+        }
+    }
+}
+```
+
+**Registration:**
+
+```rust
+// Register per message type
+runtime.register_version_handler(
+    "myapp::TransferFunds",
+    Box::new(TransferFundsMigrator),
+);
+
+// Or use a global policy
+runtime.set_default_version_handler(Box::new(AcceptWithWarning));
+```
+
+**Receiver-side flow with versioning:**
+
+```mermaid
+sequenceDiagram
+    participant W as Wire
+    participant R as Runtime (receiver)
+    participant VH as MessageVersionHandler
+    participant A as Actor Handler
+
+    W->>R: WireEnvelope { version: 1, body: [...] }
+    R->>R: local version = TransferFunds::version() = 2
+    R->>R: version mismatch: 1 ≠ 2
+
+    R->>VH: handle_mismatch("TransferFunds", 1, 2, body)
+    VH->>VH: migrate v1 bytes → v2 bytes
+    VH-->>R: Ok(migrated_bytes)
+
+    R->>R: deserialize migrated_bytes → TransferFunds v2
+    R->>A: handle(msg, ctx)
 ```
 
 ```mermaid
