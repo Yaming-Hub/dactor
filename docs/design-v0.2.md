@@ -4508,26 +4508,31 @@ async fn main() {
 
 **What happens under the hood for a remote `ask()`:**
 
-```
-Caller Node                                              Remote Node
-┌─────────────┐                                    ┌──────────────────┐
-│ ask(Transfer │                                    │   BankAccount    │
-│   Funds)     │                                    │   actor handler  │
-└──────┬──────┘                                    └────────┬─────────┘
-       │  1. serialize(TransferFunds)                       │
-       │  2. send bytes + reply channel ID                  │
-       │─────────────────────────────────────────────────►  │
-       │                                                    │  3. deserialize(TransferFunds)
-       │                                                    │  4. run interceptor chain
-       │                                                    │  5. handler(&mut self, msg)
-       │                                                    │  6. returns Result<Receipt, ActorError>
-       │  8. deserialize reply                              │
-       │  ◄─────────────────────────────────────────────────│  7. serialize reply
-       │  9. return to caller                               │
-       ▼                                                    │
-  Ok(receipt) or                                            │
-  Ok(ActorError) or                                         │
-  Err(RuntimeError)                                         │
+```mermaid
+sequenceDiagram
+    participant C as Caller (Node 1)
+    participant R as Runtime (Node 1)
+    participant N as Network
+    participant R2 as Runtime (Node 2)
+    participant II as Inbound Interceptors
+    participant H as BankAccount Handler
+
+    C->>R: ask(TransferFunds)
+    R->>R: 1. serialize(TransferFunds)
+    R->>R: 2. build WireEnvelope + request_id
+    R->>N: 3. send bytes
+
+    N->>R2: 4. receive bytes
+    R2->>R2: 5. deserialize WireEnvelope
+    R2->>II: 6. run inbound interceptor chain
+    II->>H: 7. handle(&mut self, msg)
+    H-->>R2: 8. Result‹Receipt, ActorError›
+    R2->>R2: 9. serialize reply
+    R2->>N: 10. send reply bytes
+
+    N->>R: 11. receive reply bytes
+    R->>R: 12. deserialize reply
+    R-->>C: Ok(receipt) or Err(ActorError) or Err(RuntimeError)
 ```
 
 **Three layers of errors the caller may see:**
