@@ -3704,30 +3704,51 @@ graph TB
 
 ### 10.2 System Actors
 
-System actors are regular actors (implement `Actor` + `Handler<M>`) that the
-runtime spawns automatically during node startup. They handle runtime-level
-operations as normal messages, using the adapter's existing cross-node
-messaging — **no separate network transport needed**.
+System actors are **native provider actors** — they are built directly on
+top of the provider crate (ractor, kameo, coerce), not on dactor's
+abstraction layer. They use the provider's native node identity and
+messaging, which means:
 
-| System Actor | Responsibility | Messages it handles |
+- They **don't depend on `NodeId(u64)`** — they use the provider's native
+  identity (ractor node name, kameo PeerId, coerce node tag)
+- They **don't go through dactor's interceptor pipeline** — they use the
+  provider's raw `tell()`/`ask()` directly
+- They are **spawned by the adapter** during startup, not by the dactor runtime
+
+This design ensures dactor never touches the network — all transport is
+the provider's responsibility, even for runtime operations.
+
+| System Actor | Responsibility | Built on |
 |---|---|---|
-| `SpawnManager` | Processes remote spawn requests | `SpawnRequest` → `ActorId` |
-| `CancelManager` | Processes remote cancellation requests | `CancelRequest` → `()` |
-| `WatchManager` | Manages watch/unwatch subscriptions, delivers `ChildTerminated` | `WatchRequest`, `UnwatchRequest`, `ChildTerminated` |
+| `SpawnManager` | Processes remote spawn requests | Provider's native actor API |
+| `CancelManager` | Processes remote cancellation | Provider's native actor API |
+| `WatchManager` | Watch/unwatch, delivers `ChildTerminated` | Provider's native actor API |
 
-**Why system actors, not a separate transport:**
+**How system actors relate to dactor:**
 
-- **Reuses existing infrastructure** — the adapter already handles cross-node
-  actor messaging. No new network code in dactor.
-- **Location-transparent** — system actors have `ActorRef`s like any other
-  actor. Sending a `SpawnRequest` to a remote `SpawnManager` works exactly
-  like any remote `tell()`/`ask()`.
-- **Interceptors work** — system messages flow through the same interceptor
-  pipeline, so they get tracing, metrics, and logging for free.
-- **Priority** — system actor messages can use `Priority::CRITICAL` via
-  outbound interceptors (on adapters that support outbound priority, §8.3).
-- **Testable** — `dactor-mock` can observe, delay, and fault-inject system
-  actor messages.
+```mermaid
+graph TB
+    subgraph "Application Layer (dactor abstraction)"
+        AA[Application Actors]
+        AA -->|"dactor tell/ask<br/>(interceptors, headers, priority)"| DA[dactor Runtime]
+    end
+    subgraph "System Layer (native provider)"
+        SM[SpawnManager]
+        CM[CancelManager]
+        WM[WatchManager]
+    end
+    subgraph "Provider (ractor / kameo / coerce)"
+        P[Provider Runtime + Transport]
+    end
+
+    DA -->|"delegates to"| P
+    SM & CM & WM -->|"native provider messaging"| P
+    DA -->|"invokes system actors<br/>via adapter"| SM & CM & WM
+```
+
+The dactor runtime invokes system actors through the adapter — it never
+sends messages directly. The adapter knows how to reach the system actors
+on remote nodes using the provider's native identity and transport.
 
 ### 10.3 Internal Registries
 
@@ -3759,14 +3780,16 @@ sequenceDiagram
     App->>R: .build()
 
     R->>A: initialize adapter
-    R->>SA: spawn SpawnManager
-    R->>SA: spawn CancelManager
-    R->>SA: spawn WatchManager
+    A->>SA: spawn SpawnManager (native provider actor)
+    A->>SA: spawn CancelManager (native provider actor)
+    A->>SA: spawn WatchManager (native provider actor)
 
     R->>CD: start discovery
-    CD-->>R: node_joined(NodeId(2))
-    R->>R: exchange system actor refs with Node 2
-    R->>R: store in NodeDirectory
+    CD-->>R: node_joined(addr)
+    R->>A: adapter.connect(addr)
+    Note over A: provider handles native node join<br/>+ NodeId negotiation
+    A-->>R: connected, NodeId(2) assigned
+    R->>R: store NodeId(2) mapping in NodeDirectory
 
     R-->>App: Runtime ready
     App->>R: runtime.spawn("my-actor", args, deps)
@@ -4822,178 +4845,95 @@ sequenceDiagram
 
 ### 12.2 Node Join/Leave Protocol
 
-When `ClusterDiscovery` detects a new node, the dactor runtime must:
-1. **Tell the adapter to establish a transport connection** — the adapter
-   owns the network, so dactor must ask it to connect
-2. **Bootstrap handshake** — exchange `NodeId`s and system actor refs
-3. After handshake, **all subsequent runtime operations** use system actors
-   via normal dactor messaging
+When `ClusterDiscovery` detects a new node, the flow is:
 
-**The chicken-and-egg problem:**
+1. Discovery reports a new node address to the dactor runtime
+2. Runtime tells the adapter to connect
+3. **Adapter tells the provider** — the provider handles all networking
+   (TCP connect, libp2p dial, gRPC handshake) using its native protocol
+4. Provider's native node join completes — system actors on both nodes
+   can now communicate using the provider's native messaging
+5. **NodeId negotiation** — each node announces its self-assigned
+   `NodeId` via system actors (which are native provider actors)
+6. Adapter reports the negotiated `NodeId` back to the dactor runtime
+7. Runtime stores the `NodeId` mapping in the `NodeDirectory`
 
-System actors (SpawnManager, CancelManager, WatchManager) communicate via
-dactor's `tell()`/`ask()`, which requires `ActorRef`s to the remote node's
-system actors. But we get those `ActorRef`s from the handshake. So the
-handshake itself **cannot use system actors** — it must use the adapter's
-raw transport directly.
-
-This creates two communication layers:
+**Key principle:** dactor never touches the network. The provider handles
+all transport. System actors are native provider actors that communicate
+using the provider's own messaging — they don't go through dactor's
+abstraction layer.
 
 ```mermaid
-graph TB
-    subgraph "1. Bootstrap Layer (handshake only)"
-        BL["AdapterCluster::connect() + handshake()"]
-        BL2["Uses adapter's raw transport directly"]
-        BL3["Exchanges NodeId + system actor ActorRefs"]
-    end
-    subgraph "2. Actor Layer (everything after handshake)"
-        AL["System actors: SpawnManager, CancelManager, WatchManager"]
-        AL2["Uses normal dactor tell() / ask()"]
-        AL3["Application actors also use this layer"]
-    end
-    BL -->|"handshake completes<br/>refs exchanged"| AL
+sequenceDiagram
+    participant CD as ClusterDiscovery
+    participant R as dactor Runtime
+    participant A as Adapter
+    participant P as Provider
+    participant SA as System Actors (native)
+
+    CD-->>R: node_joined(addr)
+    R->>A: adapter.connect(addr)
+    A->>P: provider.native_connect(addr)
+    Note over P: provider handles TCP/libp2p/gRPC
+
+    P-->>A: connection established
+    Note over SA: system actors on both nodes can<br/>now communicate via provider messaging
+
+    SA->>SA: NodeId negotiation
+    A-->>R: connected, peer NodeId(2) confirmed
+
+    R->>R: NodeDirectory stores NodeId(2)
+    R->>R: emit ClusterEvent::NodeJoined(NodeId(2))
 ```
 
-| Layer | Used for | How | Built on |
-|---|---|---|---|
-| **Bootstrap** | Handshake only (NodeId + system actor ref exchange) | `AdapterCluster::handshake()` — adapter sends raw bytes | Provider's native transport directly |
-| **Actor** | All runtime operations after handshake | System actors via `tell()` / `ask()` | dactor's normal actor messaging |
-
-**Step 1: Adapter connection + handshake — the `AdapterCluster` trait:**
-
-The adapter implements the bootstrap layer. The handshake is part of
-`connect()` — the adapter uses its provider's native transport to exchange
-dactor-level metadata:
+**The `AdapterCluster` trait:**
 
 ```rust
-/// Trait that adapters implement to manage transport-level connections
-/// and the bootstrap handshake.
 #[async_trait]
 pub trait AdapterCluster: Send + Sync + 'static {
-    /// Establish transport connection AND perform handshake.
-    ///
-    /// The adapter must:
-    /// 1. Connect using the provider's native mechanism
-    /// 2. Send our `HandshakeData` to the peer (via raw transport)
-    /// 3. Receive the peer's `HandshakeData`
-    /// 4. Return the peer's data so the runtime can populate NodeDirectory
-    ///
-    /// This is the ONLY operation that uses raw transport directly.
-    /// After this, all communication goes through system actors.
-    async fn connect(
-        &self,
-        local: HandshakeData,
-        peer_addr: NodeAddr,
-    ) -> Result<HandshakeData, ActorError>;
+    /// Tell the provider to connect to a new peer node.
+    /// The provider handles all networking natively.
+    /// Returns the negotiated NodeId of the peer.
+    async fn connect(&self, addr: NodeAddr) -> Result<NodeId, ActorError>;
 
-    /// Disconnect from a peer node (graceful leave or failure).
+    /// Tell the provider to disconnect from a peer node.
     async fn disconnect(&self, node_id: NodeId) -> Result<(), ActorError>;
 
     /// Register callback for provider-native health failure detection.
     fn on_node_unreachable(&self, callback: Box<dyn Fn(NodeId) + Send + Sync>);
 }
-
-/// Data exchanged during the bootstrap handshake.
-/// Sent via the adapter's raw transport (not via system actors).
-#[derive(Serialize, Deserialize)]
-pub struct HandshakeData {
-    /// This node's self-assigned NodeId.
-    pub node_id: NodeId,
-    /// Serialized ActorRefs for this node's system actors.
-    /// The peer deserializes these to get remote refs for
-    /// SpawnManager, CancelManager, WatchManager.
-    pub system_actor_refs: SystemActorRefs,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SystemActorRefs {
-    pub spawn_manager: SerializedActorRef,
-    pub cancel_manager: SerializedActorRef,
-    pub watch_manager: SerializedActorRef,
-}
 ```
 
-**Are system actors built on the provider directly?**
+**What each provider does inside `connect()`:**
 
-Yes — system actors are **regular actors spawned via the adapter's
-`ActorRuntime`**, just like application actors. They use the same
-`Actor` + `Handler<M>` traits and the same `tell()`/`ask()` messaging.
-The only special thing about them is that:
-1. The runtime spawns them automatically at startup
-2. Their `ActorRef`s are exchanged during the bootstrap handshake
-3. After handshake, they're accessible via the `NodeDirectory`
-
-```
-System actors ARE regular dactor actors:
-  SpawnManager: impl Actor + Handler<SpawnRequest>
-  CancelManager: impl Actor + Handler<CancelRequest>
-  WatchManager: impl Actor + Handler<WatchRequest>
-
-They run on the SAME adapter runtime as application actors.
-They use the SAME tell()/ask() as application actors.
-The ONLY difference: they're auto-spawned and their refs are
-exchanged during the bootstrap handshake.
-```
-
-**How each provider implements the handshake:**
-
-| Provider | What `connect()` does | Handshake transport |
+| Provider | Native join process | NodeId negotiation |
 |---|---|---|
-| **ractor** | `client_connect(addr)` → `NodeSession` established. Sends `HandshakeData` as a ractor system message on the session. | ractor's TCP session protocol |
-| **kameo** | `swarm.dial(multiaddr)` → libp2p connection. Sends `HandshakeData` via a custom libp2p protocol handler. | libp2p custom protocol |
-| **coerce** | Connects to `RemoteActorSystem`. Sends `HandshakeData` via coerce's protobuf RPC. | coerce gRPC/protobuf |
-
-**Step 2: After handshake — all via system actors:**
-
-```mermaid
-sequenceDiagram
-    participant CD as ClusterDiscovery
-    participant R1 as Runtime (Node 1)
-    participant A as Adapter (Node 1)
-    participant R2 as Runtime (Node 2)
-
-    CD-->>R1: node_joined(addr)
-
-    R1->>A: adapter.connect(our_handshake, addr)
-    Note over A: 1. provider native connect<br/>2. send our HandshakeData<br/>3. receive peer's HandshakeData
-    A-->>R1: peer's HandshakeData { node_id: 2, system_refs: {...} }
-
-    R1->>R1: store in NodeDirectory:<br/>NodeId(2) → peer's system actor refs
-
-    Note over R1,R2: Bootstrap complete. All subsequent<br/>operations use system actors via tell()/ask()
-
-    R1->>R2: SpawnManager.ask(SpawnRequest{...})
-    R1->>R2: CancelManager.tell(CancelRequest{...})
-```
-
-    Note over R1: NodeDirectory stores Node 2's system actor refs
-    Note over R2: NodeDirectory stores Node 1's system actor refs
-
-    Note over R1,R2: Nodes fully connected
-```
+| **ractor** | `client_connect(addr)` creates `NodeSession` (TCP + auth) | System actor exchanges `NodeId` via ractor messaging |
+| **kameo** | `swarm.dial(multiaddr)` establishes libp2p connection | System actor exchanges `NodeId` via kameo messaging |
+| **coerce** | `RemoteActorSystem` cluster worker connects via protobuf | System actor exchanges `NodeId` via coerce messaging |
 
 **Node leave flow:**
 
 ```mermaid
 sequenceDiagram
     participant CD as ClusterDiscovery
-    participant R1 as dactor Runtime (Node 1)
-    participant A1 as Adapter (Node 1)
-    participant WM as WatchManager (Node 1)
+    participant R as dactor Runtime
+    participant A as Adapter
+    participant P as Provider
     participant App as Application Actors
 
-    CD-->>R1: node_left(NodeId(2), Failed)
+    alt Discovery detects leave
+        CD-->>R: node_left(addr)
+        R->>A: adapter.disconnect(NodeId(2))
+        A->>P: provider.native_disconnect()
+    else Provider detects failure
+        P-->>A: node unreachable (native event)
+        A-->>R: on_node_unreachable(NodeId(2))
+    end
 
-    R1->>A1: adapter.disconnect(NodeId(2))
-    Note over A1: closes transport, cleans up sessions
-
-    R1->>R1: remove Node 2 from NodeDirectory
-    R1->>WM: notify watchers of actors on Node 2
-    WM->>App: ChildTerminated { reason: "node left" }
-    R1->>App: ClusterEvent::NodeLeft(NodeId(2))
+    R->>R: remove NodeId(2) from NodeDirectory
+    R->>App: ClusterEvent::NodeLeft(NodeId(2))
 ```
-
----
 
 ### 12.3 Node Health Monitoring
 
