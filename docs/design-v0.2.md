@@ -1985,7 +1985,7 @@ match actor.ask(Transfer { amount: 1000 }).await {
 
 /// Metadata about the message and its target, provided to interceptors
 /// alongside the mutable headers. All fields are read-only.
-pub struct InterceptContext<'a> {
+pub struct InboundContext<'a> {
     /// The unique ID of the target actor.
     pub actor_id: ActorId,
     /// The name the actor was spawned with.
@@ -2054,7 +2054,7 @@ pub trait InboundInterceptor: Send + Sync + 'static {
     /// downcast to the concrete type for content-based decisions.
     fn on_receive(
         &self,
-        ctx: &InterceptContext<'_>,
+        ctx: &InboundContext<'_>,
         headers: &mut Headers,
         message: &dyn Any,
     ) -> Disposition {
@@ -2067,7 +2067,7 @@ pub trait InboundInterceptor: Send + Sync + 'static {
     /// message, regardless of send mode.
     fn on_complete(
         &self,
-        ctx: &InterceptContext<'_>,
+        ctx: &InboundContext<'_>,
         headers: &Headers,
         outcome: &Outcome,
     ) {
@@ -2079,7 +2079,7 @@ pub trait InboundInterceptor: Send + Sync + 'static {
     /// The item is provided as `&dyn Any` for optional downcasting.
     fn on_stream_item(
         &self,
-        ctx: &InterceptContext<'_>,
+        ctx: &InboundContext<'_>,
         headers: &Headers,
         seq: u64,
         item: &dyn Any,
@@ -2133,7 +2133,7 @@ struct LoggingInterceptor;
 impl InboundInterceptor for LoggingInterceptor {
     fn name(&self) -> &'static str { "logging" }
     fn on_receive(
-        &self, ctx: &InterceptContext<'_>, headers: &mut Headers, _message: &dyn Any,
+        &self, ctx: &InboundContext<'_>, headers: &mut Headers, _message: &dyn Any,
     ) -> Disposition {
         let cid = headers.get::<CorrelationId>().map(|c| c.0.as_str()).unwrap_or("-");
         tracing::info!(
@@ -2166,7 +2166,7 @@ impl InboundInterceptor for TransferAuditInterceptor {
 
     fn on_receive(
         &self,
-        ctx: &InterceptContext<'_>,
+        ctx: &InboundContext<'_>,
         _headers: &mut Headers,
         message: &dyn Any,
     ) -> Disposition {
@@ -2187,7 +2187,7 @@ impl InboundInterceptor for TransferAuditInterceptor {
 
     fn on_complete(
         &self,
-        ctx: &InterceptContext<'_>,
+        ctx: &InboundContext<'_>,
         _headers: &Headers,
         outcome: &Outcome,
     ) {
@@ -2270,7 +2270,7 @@ impl InboundInterceptor for RateLimiter {
     fn name(&self) -> &'static str { "rate-limiter" }
 
     fn on_receive(
-        &self, ctx: &InterceptContext<'_>, _headers: &mut Headers, _msg: &dyn Any,
+        &self, ctx: &InboundContext<'_>, _headers: &mut Headers, _msg: &dyn Any,
     ) -> Disposition {
         let count = self.counts
             .entry(ctx.actor_id.clone())
@@ -2324,7 +2324,7 @@ impl InboundInterceptor for ToggleableInterceptor {
     fn name(&self) -> &'static str { self.inner.name() }
 
     fn on_receive(
-        &self, ctx: &InterceptContext<'_>, headers: &mut Headers, msg: &dyn Any,
+        &self, ctx: &InboundContext<'_>, headers: &mut Headers, msg: &dyn Any,
     ) -> Disposition {
         if self.enabled.load(Ordering::Relaxed) {
             self.inner.on_receive(ctx, headers, msg)
@@ -5380,7 +5380,7 @@ error-prone and repetitive.
 
 **Design:** dactor provides observability primarily through the **interceptor
 pipeline** (§5.2). Because interceptors see every message with full context
-(`InterceptContext`), they are the natural place to collect metrics. dactor
+(`InboundContext`), they are the natural place to collect metrics. dactor
 also provides a built-in `MetricsInterceptor` and a `RuntimeMetrics` query
 API for common operational needs.
 
@@ -5405,16 +5405,16 @@ impl MetricsInterceptor {
 
 impl InboundInterceptor for MetricsInterceptor {
     fn name(&self) -> &'static str { "metrics" }
-    fn on_receive(&self, ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+    fn on_receive(&self, ctx: &InboundContext<'_>, headers: &mut Headers) -> Disposition {
         self.inner.record_receive(ctx);
         Disposition::Continue
     }
 
-    fn on_complete(&self, ctx: &InterceptContext<'_>, _headers: &Headers, outcome: &Outcome) {
+    fn on_complete(&self, ctx: &InboundContext<'_>, _headers: &Headers, outcome: &Outcome) {
         self.inner.record_complete(ctx, outcome);
     }
 
-    fn on_stream_item(&self, ctx: &InterceptContext<'_>, _headers: &Headers, seq: u64) {
+    fn on_stream_item(&self, ctx: &InboundContext<'_>, _headers: &Headers, seq: u64) {
         self.inner.record_stream_item(ctx, seq);
     }
 }
@@ -5508,7 +5508,7 @@ struct MessageSizeInterceptor {
 
 impl InboundInterceptor for MessageSizeInterceptor {
     fn name(&self) -> &'static str { "message-size" }
-    fn on_receive(&self, ctx: &InterceptContext<'_>, _headers: &mut Headers) -> Disposition {
+    fn on_receive(&self, ctx: &InboundContext<'_>, _headers: &mut Headers) -> Disposition {
         // std::mem::size_of gives the stack size of the message type.
         // For heap-allocated content, use a custom SizeOf header set by the sender.
         let mut sizes = self.sizes.lock().unwrap();
@@ -5537,13 +5537,13 @@ struct SlowHandlerInterceptor {
 
 impl InboundInterceptor for SlowHandlerInterceptor {
     fn name(&self) -> &'static str { "slow-handler" }
-    fn on_receive(&self, _ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+    fn on_receive(&self, _ctx: &InboundContext<'_>, headers: &mut Headers) -> Disposition {
         // Stash the start time in a header for on_complete to read.
         headers.insert(HandlerStartTime(Instant::now()));
         Disposition::Continue
     }
 
-    fn on_complete(&self, ctx: &InterceptContext<'_>, headers: &Headers, outcome: &Outcome) {
+    fn on_complete(&self, ctx: &InboundContext<'_>, headers: &Headers, outcome: &Outcome) {
         if let Some(start) = headers.get::<HandlerStartTime>() {
             let elapsed = start.0.elapsed();
             if elapsed > self.threshold {
@@ -5573,7 +5573,7 @@ struct CircuitBreakerInterceptor {
 impl InboundInterceptor for CircuitBreakerInterceptor {
     fn name(&self) -> &'static str { "circuit-breaker" }
 
-    fn on_receive(&self, ctx: &InterceptContext<'_>, _headers: &mut Headers) -> Disposition {
+    fn on_receive(&self, ctx: &InboundContext<'_>, _headers: &mut Headers) -> Disposition {
         let count = self.error_counts
             .entry(ctx.actor_id)
             .or_insert(AtomicU64::new(0));
@@ -5586,7 +5586,7 @@ impl InboundInterceptor for CircuitBreakerInterceptor {
         Disposition::Continue
     }
 
-    fn on_complete(&self, ctx: &InterceptContext<'_>, _headers: &Headers, outcome: &Outcome) {
+    fn on_complete(&self, ctx: &InboundContext<'_>, _headers: &Headers, outcome: &Outcome) {
         match outcome {
             Outcome::Success => {
                 // Reset on success
@@ -5615,7 +5615,7 @@ struct OtelInterceptor;
 
 impl InboundInterceptor for OtelInterceptor {
     fn name(&self) -> &'static str { "opentelemetry" }
-    fn on_receive(&self, ctx: &InterceptContext<'_>, headers: &mut Headers) -> Disposition {
+    fn on_receive(&self, ctx: &InboundContext<'_>, headers: &mut Headers) -> Disposition {
         // Extract trace context from headers (injected by sender)
         let parent = headers.get::<TraceContext>();
 
@@ -5633,7 +5633,7 @@ impl InboundInterceptor for OtelInterceptor {
         Disposition::Continue
     }
 
-    fn on_complete(&self, _ctx: &InterceptContext<'_>, headers: &Headers, outcome: &Outcome) {
+    fn on_complete(&self, _ctx: &InboundContext<'_>, headers: &Headers, outcome: &Outcome) {
         if let Some(span_ctx) = headers.get::<SpanContext>() {
             match outcome {
                 Outcome::Success => span_ctx.0.set_status(StatusCode::Ok),
