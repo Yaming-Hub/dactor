@@ -391,6 +391,138 @@ observability (§12→§11).
 
 ---
 
+## Phase 15: Interceptor Refinements (2026-03-29)
+
+### 15.1 Interceptor lifecycle and statefulness
+**Request:** Can interceptors be stateful? What's their lifecycle?
+
+**Decision:** Yes — interceptors are long-lived, shared, stateful. Use
+`AtomicU64`, `DashMap`, `Arc` for thread-safe state. No lifecycle hooks —
+init in constructor, cleanup via `Drop`. Global: can't remove. Per-actor:
+dropped with actor. Dynamic: use `AtomicBool` wrapper.
+
+### 15.2 Outbound interceptor reply/stream interception
+**Request:** Should OutboundInterceptor also intercept replies and stream items?
+
+**Decision:** Yes — added `on_reply(outcome)` and `on_stream_item(item)` to
+`OutboundInterceptor`. Now symmetric with `InboundInterceptor`. Like HTTP
+client middleware seeing both request and response.
+
+### 15.3 MessageId and RuntimeHeaders
+**Request:** Should runtime stamp a UUID per message? Should ask headers flow
+back with reply?
+
+**Decision:** `RuntimeHeaders { message_id: MessageId, timestamp }` — auto-
+generated, read-only to interceptors. Same `MessageId` flows through
+on_send → on_receive → on_complete → on_reply. Request headers travel
+back with reply for both ask and stream.
+
+### 15.4 Request/reply correlation pattern
+**Request:** How to correlate ask message with its reply in interceptors?
+
+**Decision:** `on_receive` sees message, `on_complete` sees reply — separate
+callbacks. Bridge via headers: stash data in `on_receive`, read back in
+`on_complete`. `MessageId` in `RuntimeHeaders` provides automatic correlation.
+
+### 15.5 Rename InterceptContext → InboundContext
+**Action:** Renamed for symmetry with `OutboundContext`.
+
+---
+
+## Phase 16: Document Restructure (2026-03-29)
+
+### 16.1 Merge §6 into §4, §8 into §5
+**Request:** Tell/ask/stream are core actor operations (belong in §4).
+Envelope/interceptor/mailbox are messaging topics (belong together in §5).
+
+**Action:** §4 "Actor & Runtime" now has 4.1-4.13 (traits + communication
+patterns + actor pool). §5 "Messaging & Mailbox" has 5.1-5.8.
+
+### 16.2 RuntimeCapabilities → RuntimeCapability enum
+**Request:** Use enum + `is_supported()` instead of struct with bool fields.
+
+**Decision:** `#[non_exhaustive] enum RuntimeCapability { Ask, Stream, Watch, ... }`
+with `fn is_supported(&self, cap: RuntimeCapability) -> bool`.
+
+### 16.3 Outbound throttling as separate crate
+**Request:** Should throttling be built-in or optional?
+
+**Decision:** `dactor-throttle` — separate crate. `ActorRateLimiter` (per-actor
+sliding window) and `PeerPressureThrottle` (RTT-based dynamic). Core provides
+the hook (outbound interceptor + Reject), extension provides the policy.
+
+---
+
+## Phase 17: NodeId & Cluster (2026-03-29)
+
+### 17.1 NodeId(u64) → NodeId(String)
+**Request:** How is NodeId assigned? How to make it recognized by provider?
+
+**Decision:** Changed from `NodeId(u64)` to `NodeId(String)` wrapping the
+provider's native identity directly. `NodeIdConverter` trait for adapters.
+No negotiation needed — provider guarantees unique, consistent identity.
+
+### 17.2 Cluster-wide NodeId consistency
+**Request:** Will NodeId be the same across all machines?
+
+**Decision:** Yes — `NodeId` wraps the provider's native identity (which is
+already consistent cluster-wide). No separate negotiation protocol needed.
+
+### 17.3 System actors are native provider actors
+**Request:** Do system actors use dactor's abstraction or the provider directly?
+
+**Decision:** System actors are **native provider actors** — built directly on
+ractor/kameo/coerce. They don't depend on dactor's `NodeId`, don't go through
+interceptors, and are spawned by the adapter. dactor never touches the network.
+
+### 17.4 Health monitoring delegated to provider
+**Request:** Why duplicate heartbeats if provider already has them?
+
+**Decision:** dactor does NOT implement heartbeats. Provider detects failures →
+adapter reports via `on_node_unreachable()`. Removed `HealthMonitor` system actor.
+
+### 17.5 AdapterCluster for node join/leave
+**Request:** How does each provider handle dynamic node join/leave?
+
+**Decision:** `AdapterCluster` trait with `connect(addr) -> NodeId`,
+`disconnect(node_id)`, `on_node_unreachable()`. Provider handles all networking.
+
+---
+
+## Phase 18: Reviews & Final Polish (2026-03-29)
+
+### 18.1 Review rounds 2-4
+**Action:** 4 review rounds with Claude Haiku, GPT-5.1, GPT-5.4-mini, Claude
+Sonnet. Progressively fixed stale references, missing type definitions,
+signature inconsistencies, duplicate content, and broken mermaid diagrams.
+
+### 18.2 Final cleanup
+**Action:** All ASCII diagrams converted to mermaid. All section references
+verified. All old type names removed. Document is 17 sections + Appendix,
+~6000 lines, implementation-ready.
+
+---
+
+## Design Principles Established (Final)
+
+1. **Superset rule:** Include capabilities supported by ≥2 of 6 frameworks
+2. **Three adapter strategies:** Library Native / Adapter Implemented / Not Supported
+3. **Fail-fast:** Unsupported calls return `Err`, not panic — app decides severity
+4. **Kameo/Coerce API:** `ActorRef<A>` typed to actor, `Handler<M>` per message
+5. **Args/Deps/State separation:** Args cross wire, Deps resolved locally, State rebuilt
+6. **Delegate networking:** dactor never touches the network — all transport is provider's job
+7. **System actors are native:** Built on provider directly, not dactor abstraction
+8. **Cooperative cancellation:** `CancellationToken` via `ctx.cancelled()` at `.await` points
+9. **No opinionated context:** Headers are generic; concrete types from external crates
+10. **Sequential execution:** Fundamental actor model guarantee — `&mut self` without locks
+11. **MessageComparer:** Single trait for priority ordering + fairness
+12. **Delegate health:** Provider detects failures, adapter reports via callback
+13. **Pluggable serialization:** `MessageSerializer` trait, default bincode
+14. **NodeId wraps provider identity:** `NodeId(String)`, no negotiation
+15. **RuntimeHeaders read-only:** `MessageId` + `timestamp` auto-stamped, immutable to interceptors
+
+---
+
 ## Design Principles Established
 
 1. **Superset rule:** Include capabilities supported by ≥2 of 6 frameworks

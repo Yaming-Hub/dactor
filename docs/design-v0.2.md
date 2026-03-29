@@ -1322,23 +1322,26 @@ impl<A: Actor> ActorRef<A> {
 
 **How it works (adapter implementation pattern):**
 
-```
-Caller                       Adapter Layer                     Actor
-  │                               │                              │
-  │  stream(request, buf=16)      │                              │
-  │──────────────────────────────►│                              │
-  │                               │  create mpsc(16)             │
-  │                               │  tx = StreamSender(sender)   │
-  │                               │  rx = ReceiverStream(recv)   │
-  │                               │                              │
-  │                               │  deliver (request, tx)       │
-  │                               │─────────────────────────────►│
-  │◄─ return BoxStream(rx)        │                              │
-  │                               │                              │
-  │  .next().await ◄──────────────│◄── tx.send(item_1) ─────────│
-  │  .next().await ◄──────────────│◄── tx.send(item_2) ─────────│
-  │  .next().await ◄──────────────│◄── tx.send(item_3) ─────────│
-  │  None (stream ends) ◄────────│◄── drop(tx) ─────────────────│
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant A as Adapter Layer
+    participant H as Actor Handler
+
+    C->>A: stream(request, buf=16)
+    A->>A: create mpsc(16)
+    A->>A: tx = StreamSender, rx = ReceiverStream
+    A->>H: deliver (request, tx)
+    A-->>C: return BoxStream(rx)
+
+    H->>A: tx.send(item_1)
+    A-->>C: .next().await → item_1
+    H->>A: tx.send(item_2)
+    A-->>C: .next().await → item_2
+    H->>A: tx.send(item_3)
+    A-->>C: .next().await → item_3
+    H->>H: drop(tx)
+    A-->>C: .next().await → None (stream ends)
 ```
 
 **Backpressure:** The bounded channel naturally provides backpressure. If the
@@ -7280,20 +7283,17 @@ let count: u64 = actor.send(Get).await?;                        // ask (type-saf
 the type level (`ActorRef<M>` vs `ActorRef<A>`). However, a **layered
 architecture** can support all patterns:
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Layer 2: Actor Definition Patterns (optional, additive)     │
-│  ┌────────────────┐  ┌─────────────────┐  ┌──────────────┐  │
-│  │  Closure-based │  │  Trait-based     │  │  Enum-based  │  │
-│  │  (current v0.1)│  │  (kameo/coerce)  │  │  (ractor)    │  │
-│  │  simplest      │  │  type-safe reply │  │  one handle  │  │
-│  └───────┬────────┘  └────────┬────────┘  └──────┬───────┘  │
-│          │     compiles down to via macro/trait   │          │
-├──────────┴────────────────────┴──────────────────┴──────────┤
-│  Layer 1: Core Runtime Traits (always present)               │
-│  ActorRuntime, ActorRef<M>, tell(), ask(), Envelope,         │
-│  Interceptor, ClusterEvents, TimerHandle, ...                │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph "Layer 2: Actor Definition Patterns (optional)"
+        CL["Closure-based<br/>(simplest)"]
+        TB["Trait-based<br/>(kameo/coerce)<br/>type-safe reply"]
+        EB["Enum-based<br/>(ractor)<br/>one handle"]
+    end
+    subgraph "Layer 1: Core Runtime Traits (always present)"
+        CR["ActorRuntime, ActorRef, tell, ask,<br/>Envelope, ClusterEvents, TimerHandle"]
+    end
+    CL & TB & EB -->|"compiles down to"| CR
 ```
 
 **Layer 1 (core):** This analysis originally proposed `ActorRef<M>` (message-typed)
