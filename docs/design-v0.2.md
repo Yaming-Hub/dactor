@@ -769,10 +769,17 @@ impl fmt::Display for ActorId {
 }
 ```
 
-**How `NodeId` is assigned:**
+**How `NodeId` is assigned — cluster-wide consistency:**
 
-`NodeId` is a dactor-level abstraction. Each provider has its own native
-node identity format — dactor maps between them:
+`NodeId` must be the **same value on every machine** in the cluster for a
+given physical node. If Node A sees a peer as `NodeId(2)` but Node B sees
+the same peer as `NodeId(3)`, then `ActorId { node: NodeId(2), local: 42 }`
+serialized from Node A would be unresolvable on Node B.
+
+**Design:** Each node chooses its own `NodeId` at startup (from configuration
+or auto-generated) and announces it during the handshake. All peers record
+the announced value — so the `NodeId` is **self-assigned and propagated**,
+not locally assigned by each observer.
 
 | Provider | Native identity | Format | Mapping |
 |---|---|---|---|
@@ -784,30 +791,42 @@ node identity format — dactor maps between them:
 
 ```mermaid
 sequenceDiagram
-    participant CD as ClusterDiscovery
-    participant R as dactor Runtime
-    participant A as Adapter
+    participant N1 as Node 1 (starting)
+    participant N2 as Node 2 (existing)
 
-    Note over R: Local node starts
-    R->>R: assign self NodeId(1)<br/>(from config or auto-generated)
-    R->>A: register_local_node(NodeId(1))
-    A->>A: map NodeId(1) ↔ native identity<br/>(e.g., "node1@host")
+    Note over N1: Startup: read NodeId from config<br/>or generate (e.g., hash of hostname + pid)
+    Note over N1: self.node_id = NodeId(1)
 
-    CD-->>R: node_joined(addr)
-    R->>R: assign NodeId(2) for new peer
-    R->>A: adapter.connect(NodeId(2), addr)
-    A->>A: establish connection → learn native identity
-    A->>A: map NodeId(2) ↔ peer's native identity
+    N1->>N2: Handshake { my_node_id: NodeId(1), native_id: "node1@host" }
+    N2->>N2: record: NodeId(1) ↔ "node1@host"
+    N2->>N1: Handshake { my_node_id: NodeId(2), native_id: "node2@host" }
+    N1->>N1: record: NodeId(2) ↔ "node2@host"
+
+    Note over N1,N2: Both nodes now agree:<br/>Node 1 = NodeId(1), Node 2 = NodeId(2)
 ```
 
 **Who assigns which:**
 
-| Value | Assigned by | When |
+| Value | Assigned by | When | Consistent? |
+|---|---|---|---|
+| Local `NodeId` | **The node itself** (from config or auto-gen) | At startup | ✅ Self-assigned, announced to all peers |
+| Peer's `NodeId` | **The peer** (received during handshake) | During `connect()` | ✅ Same value everywhere |
+| Native identity | Provider | At adapter init | Adapter-local |
+| Mapping NodeId ↔ native | Adapter | During handshake | Adapter-local |
+
+**How to ensure uniqueness:** The `NodeId` value must be unique across the
+cluster. Recommended approaches:
+
+| Approach | How | When |
 |---|---|---|
-| Local `NodeId` | Application config or runtime auto-gen | At startup |
-| Peer `NodeId` | dactor runtime | When `ClusterDiscovery` reports `node_joined` |
-| Native identity (ractor name, PeerId) | Provider | At adapter initialization |
-| Mapping between NodeId ↔ native | Adapter | During `connect()` handshake |
+| **Config-assigned** | Operator sets `node_id = 1` in config file | Static clusters |
+| **Hash-based** | `hash(hostname + port + pid)` → truncate to u64 | Dynamic clusters |
+| **UUID-based** | Generate UUID v7, use lower 64 bits | Ephemeral nodes |
+| **K8s ordinal** | StatefulSet pod ordinal (pod-0 → 0, pod-1 → 1) | Kubernetes |
+
+The `ClusterDiscovery` trait can provide a suggested `NodeId` in the
+`node_joined` event if the infrastructure layer assigns node identities
+(e.g., K8s ordinals).
 
 **The adapter's `NodeIdMapper`:**
 
@@ -818,12 +837,6 @@ pub(crate) struct NodeIdMapper {
     to_native: HashMap<NodeId, NativeNodeId>,
     from_native: HashMap<NativeNodeId, NodeId>,
 }
-
-/// Provider-specific node identity — each adapter defines its own.
-/// Examples:
-///   ractor: type NativeNodeId = String;      // "node1@host"
-///   kameo:  type NativeNodeId = PeerId;       // libp2p peer ID
-///   coerce: type NativeNodeId = String;       // "node-east-1"
 ```
 
 When the adapter needs to send a message to `NodeId(2)`, it looks up the
