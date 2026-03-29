@@ -3570,6 +3570,522 @@ If an actor calls `watch()` but does **not** implement `Handler<ChildTerminated>
 the notification is silently dropped (same as an unhandled message). This
 avoids forcing every actor to handle termination events.
 
+### 6.3 Actor State Persistence
+
+**Problem:** When an actor restarts (after crash, node migration, or deployment),
+its in-memory state is lost. Applications need a way to persist and recover
+actor state across restarts without hand-rolling storage logic in every actor.
+
+**Research:** Provider support varies dramatically:
+
+| Framework | Persistence Support | Model |
+|---|---|---|
+| **Akka** | ✅ Built-in (`EventSourcedBehavior`, `DurableStateBehavior`) | Event sourcing + snapshots, pluggable journal/snapshot stores |
+| **Coerce** | ✅ Built-in (`PersistentActor`, `Recover<M>`, `RecoverSnapshot<S>`) | Event sourcing + manual snapshots, journal with sequence IDs |
+| **Ractor** | ❌ None | Application manages via `pre_start` / `post_stop` hooks |
+| **Kameo** | ❌ None | Application manages via `on_start` / `on_stop` hooks |
+
+**Design decision:** dactor provides a **dual-mode persistence abstraction** inspired
+by Akka's two patterns, adapted for Rust:
+
+1. **Event-sourced persistence** — State rebuilt by replaying persisted events
+2. **Durable state persistence** — Full state snapshot stored directly
+
+Both modes share the same storage backend traits and lifecycle integration.
+
+#### 6.3.1 Persistence ID
+
+Every persistent actor has a globally unique identity for storage:
+
+```rust
+/// Uniquely identifies a persistent actor's journal/snapshot in storage.
+/// Format convention: "type:id" (e.g., "BankAccount:acct-123").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PersistenceId(pub String);
+
+impl PersistenceId {
+    pub fn new(entity_type: &str, entity_id: &str) -> Self {
+        Self(format!("{entity_type}:{entity_id}"))
+    }
+}
+```
+
+The `PersistenceId` is **separate from `ActorId`** — it identifies the persistent
+entity across incarnations, while `ActorId` identifies the running actor instance.
+Multiple actor restarts share the same `PersistenceId`.
+
+#### 6.3.2 Persistent Actor Trait
+
+```rust
+/// Marker trait for actors with persistent state.
+/// Actors implement either `EventSourced` or `DurableState` (not both).
+#[async_trait]
+pub trait PersistentActor: Actor {
+    /// The persistence identity for this actor's journal/snapshot store.
+    fn persistence_id(&self) -> PersistenceId;
+
+    /// Called before recovery begins. Use for pre-recovery setup.
+    async fn pre_recovery(&mut self, _ctx: &mut ActorContext) {}
+
+    /// Called after recovery completes. Actor is ready to process messages.
+    async fn post_recovery(&mut self, _ctx: &mut ActorContext) {}
+
+    /// Policy when recovery fails (e.g., corrupt journal).
+    fn recovery_failure_policy(&self) -> RecoveryFailurePolicy {
+        RecoveryFailurePolicy::Stop
+    }
+
+    /// Policy when a persist operation fails.
+    fn persist_failure_policy(&self) -> PersistFailurePolicy {
+        PersistFailurePolicy::Stop
+    }
+}
+```
+
+#### 6.3.3 Event-Sourced Persistence
+
+State is rebuilt by replaying a sequence of domain events:
+
+```mermaid
+graph LR
+    C[Command] -->|validate| H[Handler]
+    H -->|"persist(event)"| J[(Journal)]
+    J -->|"apply(event)"| S[State Updated]
+    S -->|ack| H
+```
+
+**Recovery flow:**
+
+```mermaid
+graph LR
+    ST((Start)) -->|load| SN{Snapshot?}
+    SN -->|yes| AP1[Apply snapshot]
+    SN -->|no| AP2[Use initial state]
+    AP1 --> RE[Replay events after snapshot]
+    AP2 --> RE
+    RE -->|"apply(event) × N"| RD[State recovered]
+    RD -->|post_recovery| RUN((Running))
+```
+
+```rust
+/// Event-sourced persistence: state = f(initial_state, events[0..n])
+#[async_trait]
+pub trait EventSourced: PersistentActor {
+    /// The domain event type that modifies actor state.
+    type Event: Send + Sync + Serialize + DeserializeOwned + 'static;
+
+    /// Apply a single event to the actor's state. Must be deterministic
+    /// and side-effect free — called during both normal operation and recovery.
+    fn apply(&mut self, event: &Self::Event);
+
+    /// Persist an event to the journal, then apply it to state.
+    /// Returns `Err` if persistence fails (subject to `persist_failure_policy`).
+    async fn persist(
+        &mut self,
+        event: Self::Event,
+        ctx: &mut ActorContext,
+    ) -> Result<(), PersistError>;
+
+    /// Persist multiple events atomically, then apply all in order.
+    async fn persist_batch(
+        &mut self,
+        events: Vec<Self::Event>,
+        ctx: &mut ActorContext,
+    ) -> Result<(), PersistError>;
+
+    /// Take a snapshot of the current state. Snapshots are optional
+    /// optimization — they reduce recovery time by skipping old events.
+    async fn snapshot(&self, ctx: &mut ActorContext) -> Result<(), PersistError>
+    where
+        Self: Serialize;
+
+    /// Configuration for automatic snapshotting. `None` = manual only.
+    fn snapshot_config(&self) -> Option<SnapshotConfig> {
+        None
+    }
+
+    /// The last applied sequence number (managed by the runtime).
+    fn last_sequence_id(&self, ctx: &ActorContext) -> SequenceId;
+}
+
+/// Monotonically increasing event sequence number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SequenceId(pub i64);
+```
+
+**Usage in a handler:**
+
+```rust
+struct BankAccount {
+    balance: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+enum AccountEvent {
+    Deposited(i64),
+    Withdrawn(i64),
+}
+
+impl EventSourced for BankAccount {
+    type Event = AccountEvent;
+
+    fn apply(&mut self, event: &AccountEvent) {
+        match event {
+            AccountEvent::Deposited(amount) => self.balance += amount,
+            AccountEvent::Withdrawn(amount) => self.balance -= amount,
+        }
+    }
+}
+
+#[async_trait]
+impl Handler<Deposit> for BankAccount {
+    async fn handle(&mut self, msg: Deposit, ctx: &mut ActorContext) -> Result<(), ActorError> {
+        // Validate command
+        if msg.amount <= 0 {
+            return Err(ActorError::new(ErrorCode::InvalidArgument, "negative deposit"));
+        }
+        // Persist event (applies automatically after journal write)
+        self.persist(AccountEvent::Deposited(msg.amount), ctx).await?;
+        Ok(())
+    }
+}
+```
+
+#### 6.3.4 Durable State Persistence
+
+State is stored and loaded directly — no event replay:
+
+```mermaid
+graph LR
+    C[Command] -->|validate| H[Handler]
+    H -->|modify state| S[State Updated]
+    S -->|"save_state()"| ST[(State Store)]
+    ST -->|ack| H
+```
+
+**Recovery flow:**
+
+```mermaid
+graph LR
+    ST((Start)) -->|"load_state()"| LD{Found?}
+    LD -->|yes| RS[Restore state]
+    LD -->|no| DF[Use initial state]
+    RS -->|post_recovery| RUN((Running))
+    DF -->|post_recovery| RUN
+```
+
+```rust
+/// Durable state persistence: full state stored directly.
+/// Simpler than event sourcing but no audit trail or replay.
+#[async_trait]
+pub trait DurableState: PersistentActor + Serialize + DeserializeOwned {
+    /// Save the current state to the state store.
+    async fn save_state(&self, ctx: &mut ActorContext) -> Result<(), PersistError>;
+
+    /// Configuration for automatic state saving. `None` = manual only.
+    fn save_config(&self) -> Option<SaveConfig> {
+        None
+    }
+}
+```
+
+**Usage:**
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct SessionCache {
+    sessions: HashMap<String, SessionData>,
+}
+
+impl DurableState for SessionCache {}
+
+#[async_trait]
+impl Handler<UpdateSession> for SessionCache {
+    async fn handle(&mut self, msg: UpdateSession, ctx: &mut ActorContext) -> Result<(), ActorError> {
+        self.sessions.insert(msg.session_id, msg.data);
+        // Save full state (no events, just current snapshot)
+        self.save_state(ctx).await?;
+        Ok(())
+    }
+}
+```
+
+#### 6.3.5 Snapshot Configuration
+
+```rust
+/// Controls when automatic snapshots are taken (event-sourced actors).
+pub struct SnapshotConfig {
+    /// Take snapshot every N events.
+    pub every_n_events: Option<u64>,
+    /// Take snapshot if interval elapsed since last snapshot.
+    pub interval: Option<Duration>,
+    /// Retention: keep at most N snapshots. Older ones are deleted.
+    pub retention_count: Option<u32>,
+    /// Delete journal events older than the oldest retained snapshot.
+    pub delete_events_on_snapshot: bool,
+}
+
+/// Controls when automatic state saves occur (durable state actors).
+pub struct SaveConfig {
+    /// Save after every N messages handled.
+    pub every_n_messages: Option<u64>,
+    /// Save if interval elapsed since last save.
+    pub interval: Option<Duration>,
+}
+```
+
+#### 6.3.6 Storage Backend
+
+```rust
+/// Pluggable journal storage for event-sourced actors.
+#[async_trait]
+pub trait JournalStorage: Send + Sync + 'static {
+    /// Append an event to the journal.
+    async fn write_event(
+        &self,
+        persistence_id: &PersistenceId,
+        sequence_id: SequenceId,
+        event_type: &str,
+        payload: &[u8],
+    ) -> Result<(), StorageError>;
+
+    /// Append a batch of events atomically.
+    async fn write_event_batch(
+        &self,
+        persistence_id: &PersistenceId,
+        entries: &[(SequenceId, &str, &[u8])],
+    ) -> Result<(), StorageError>;
+
+    /// Read events from a given sequence number onwards.
+    async fn read_events(
+        &self,
+        persistence_id: &PersistenceId,
+        from_sequence: SequenceId,
+    ) -> Result<Vec<JournalEntry>, StorageError>;
+
+    /// Read the highest sequence number for a persistence ID.
+    async fn read_highest_sequence(
+        &self,
+        persistence_id: &PersistenceId,
+    ) -> Result<Option<SequenceId>, StorageError>;
+
+    /// Delete events up to (inclusive) a sequence number.
+    async fn delete_events_to(
+        &self,
+        persistence_id: &PersistenceId,
+        to_sequence: SequenceId,
+    ) -> Result<(), StorageError>;
+}
+
+/// Pluggable snapshot storage.
+#[async_trait]
+pub trait SnapshotStorage: Send + Sync + 'static {
+    /// Save a snapshot.
+    async fn save_snapshot(
+        &self,
+        persistence_id: &PersistenceId,
+        sequence_id: SequenceId,
+        payload: &[u8],
+    ) -> Result<(), StorageError>;
+
+    /// Load the most recent snapshot.
+    async fn load_latest_snapshot(
+        &self,
+        persistence_id: &PersistenceId,
+    ) -> Result<Option<SnapshotEntry>, StorageError>;
+
+    /// Delete snapshots older than a sequence number.
+    async fn delete_snapshots_before(
+        &self,
+        persistence_id: &PersistenceId,
+        sequence_id: SequenceId,
+    ) -> Result<(), StorageError>;
+}
+
+/// Pluggable state store for durable state actors.
+#[async_trait]
+pub trait StateStorage: Send + Sync + 'static {
+    /// Save the current state (overwrites previous).
+    async fn save_state(
+        &self,
+        persistence_id: &PersistenceId,
+        payload: &[u8],
+    ) -> Result<(), StorageError>;
+
+    /// Load the most recently saved state.
+    async fn load_state(
+        &self,
+        persistence_id: &PersistenceId,
+    ) -> Result<Option<Vec<u8>>, StorageError>;
+
+    /// Delete stored state.
+    async fn delete_state(
+        &self,
+        persistence_id: &PersistenceId,
+    ) -> Result<(), StorageError>;
+}
+
+/// A single journal entry.
+pub struct JournalEntry {
+    pub sequence_id: SequenceId,
+    pub event_type: String,
+    pub payload: Vec<u8>,
+}
+
+/// A single snapshot entry.
+pub struct SnapshotEntry {
+    pub sequence_id: SequenceId,
+    pub payload: Vec<u8>,
+}
+
+/// Combined storage provider registered with the runtime.
+pub trait StorageProvider: Send + Sync + 'static {
+    fn journal_storage(&self) -> Option<Arc<dyn JournalStorage>>;
+    fn snapshot_storage(&self) -> Option<Arc<dyn SnapshotStorage>>;
+    fn state_storage(&self) -> Option<Arc<dyn StateStorage>>;
+}
+```
+
+**Built-in implementations:**
+
+| Storage | Crate | Use Case |
+|---|---|---|
+| `InMemoryStorage` | `dactor` | Testing, development |
+| `SqliteStorage` | `dactor-sqlite` (future) | Single-node production |
+| `PostgresStorage` | `dactor-postgres` (future) | Multi-node production |
+
+#### 6.3.7 Lifecycle Integration
+
+Persistence is integrated into the actor lifecycle (updating the §6 diagram):
+
+```mermaid
+graph TD
+    S((Start)) -->|"runtime.spawn()"| SP[Spawned]
+    SP -->|"on_start()"| PR{Persistent?}
+    PR -->|no| R[Running]
+    PR -->|yes| REC[Recovery]
+    REC -->|"pre_recovery()"| LD[Load snapshot + replay events]
+    LD -->|"post_recovery()"| R
+    LD -->|"recovery failed"| RF{Policy?}
+    RF -->|Stop| ST[Stopped]
+    RF -->|Retry| REC
+    R -->|"handle messages"| R
+    R -->|"persist() / save_state()"| R
+    R -->|"handler error / panic"| E{on_error}
+    E -->|Resume| R
+    E -->|Restart| SP
+    E -->|Stop| ST
+    E -->|Escalate| P[Parent Supervisor]
+    R -->|"shutdown / supervision"| ST
+    ST -->|"on_stop()"| F((End))
+```
+
+**Key behaviors:**
+
+- **Spawn with recovery:** When a `PersistentActor` starts, the runtime
+  automatically runs recovery before delivering any messages. The actor
+  does not see commands until recovery completes.
+- **Restart recovery:** On `ErrorAction::Restart`, the actor goes through
+  the full spawn → recovery cycle again. The journal/state store survives
+  the restart (same `PersistenceId`).
+- **Async spawn:** `runtime.spawn()` returns `ActorRef<A>` immediately.
+  Messages sent before recovery completes are buffered in the mailbox.
+  The actor processes them only after `post_recovery()`.
+- **No messages during recovery:** The runtime guarantees sequential execution —
+  recovery runs to completion before the first `handle()` call.
+
+#### 6.3.8 Recovery Failure Policies
+
+```rust
+/// What to do when recovery fails (corrupt journal, storage unavailable).
+pub enum RecoveryFailurePolicy {
+    /// Stop the actor. Supervisor may restart it.
+    Stop,
+    /// Retry recovery with exponential backoff.
+    Retry {
+        max_attempts: Option<u32>,
+        initial_delay: Duration,
+    },
+    /// Skip recovery and start with initial state (data loss risk).
+    SkipAndStart,
+}
+
+/// What to do when a persist/save operation fails.
+pub enum PersistFailurePolicy {
+    /// Stop the actor. Unacknowledged message may be retried by caller.
+    Stop,
+    /// Return error to the handler. Handler decides what to do.
+    ReturnError,
+    /// Retry the persist operation.
+    Retry {
+        max_attempts: Option<u32>,
+        initial_delay: Duration,
+    },
+}
+
+/// Errors from persistence operations.
+#[derive(Debug)]
+pub enum PersistError {
+    /// Storage backend unavailable.
+    StorageUnavailable(String),
+    /// Serialization/deserialization failed.
+    SerializationFailed(String),
+    /// Journal entry corrupted or unreadable.
+    CorruptEntry { sequence_id: SequenceId, detail: String },
+    /// No storage provider configured for this runtime.
+    NotConfigured,
+}
+```
+
+#### 6.3.9 Runtime Configuration
+
+```rust
+// Register storage provider with the runtime
+let storage = InMemoryStorage::new();
+let runtime = RuntimeBuilder::new()
+    .with_storage_provider(storage)
+    .build()
+    .await?;
+
+// Spawn a persistent actor — recovery happens automatically
+let account = BankAccount { balance: 0 };
+let account_ref = runtime.spawn("account-123", account).await?;
+// Messages are buffered until recovery completes, then delivered in order.
+account_ref.tell(Deposit { amount: 100 }).await?;
+```
+
+#### 6.3.10 Provider Adapter Mapping
+
+| dactor Feature | coerce | ractor | kameo |
+|---|---|---|---|
+| `EventSourced` trait | ✅ Maps to `PersistentActor` + `Recover<M>` | ⚙️ Adapter (hooks + external storage) | ⚙️ Adapter (hooks + external storage) |
+| `DurableState` trait | ⚙️ Adapter (use snapshot store only) | ⚙️ Adapter (hooks + external storage) | ⚙️ Adapter (hooks + external storage) |
+| `JournalStorage` | ✅ Maps to `JournalStorage` | ⚙️ Adapter provides | ⚙️ Adapter provides |
+| `SnapshotStorage` | ✅ Maps to snapshot in `JournalStorage` | ⚙️ Adapter provides | ⚙️ Adapter provides |
+| `StateStorage` | ⚙️ Adapter (snapshot store) | ⚙️ Adapter provides | ⚙️ Adapter provides |
+| Recovery on start | ✅ Native (`started()` runs recovery) | ⚙️ Adapter (in `pre_start`) | ⚙️ Adapter (in `on_start`) |
+| `RecoveryFailurePolicy` | ✅ Maps to `recovery_failure_policy()` | ⚙️ Adapter logic | ⚙️ Adapter logic |
+| `SnapshotConfig` | ⚙️ Adapter (coerce has manual-only) | ⚙️ Adapter logic | ⚙️ Adapter logic |
+
+> **Note:** For ractor and kameo, the adapter implements the full persistence
+> lifecycle: it wraps the actor, intercepts `on_start` to run recovery, wraps
+> `handle` to auto-persist events, and intercepts `on_stop` for cleanup.
+> The adapter owns the `JournalStorage`/`StateStorage` instance — the provider
+> runtime is unaware of persistence.
+
+#### 6.3.11 Event Sourcing vs Durable State — When to Use Which
+
+| Consideration | EventSourced | DurableState |
+|---|---|---|
+| **Recovery speed** | Slower (replay events; snapshots help) | Fast (load state directly) |
+| **Storage size** | O(n) events | O(1) state |
+| **Audit trail** | ✅ Complete history of all changes | ❌ Only current state |
+| **Replay / time travel** | ✅ Can reconstruct any past state | ❌ Not possible |
+| **Projections / CQRS** | ✅ Multiple read models from event stream | ❌ Not applicable |
+| **Complexity** | Higher (event design, apply must be deterministic) | Lower (just serialize state) |
+| **Schema evolution** | Harder (old events must remain readable) | Easier (migrate current state) |
+| **Best for** | Domain models, financial systems, audit-required | Caches, config, simple state machines |
+
 ---
 
 ## 7. Error Model
