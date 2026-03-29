@@ -150,23 +150,32 @@ pub enum RuntimeError {
 }
 ```
 
-### 2.4 RuntimeCapabilities Introspection
+### 2.4 Capability Introspection
 
-Callers can pre-flight requirements at startup via `ActorRuntime::capabilities()`:
+Callers can pre-flight requirements at startup via `ActorRuntime::is_supported()`:
 
 ```rust
-/// Describes which optional capabilities a runtime adapter supports.
-/// Returned by `ActorRuntime::capabilities()`.
-#[derive(Debug, Clone)]
-pub struct RuntimeCapabilities {
-    pub ask: bool,
-    pub stream: bool,
-    pub watch: bool,
-    pub bounded_mailbox: bool,
-    pub priority_mailbox: bool,
-    pub inbound_interceptors: bool,
-    pub outbound_interceptors: bool,
-    pub remote_spawn: bool,
+/// Individual capabilities that an adapter may or may not support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RuntimeCapability {
+    Ask,
+    Stream,
+    Watch,
+    BoundedMailbox,
+    PriorityMailbox,
+    InboundInterceptors,
+    OutboundInterceptors,
+    RemoteSpawn,
+}
+```
+
+```rust
+pub trait ActorRuntime: Send + Sync + 'static {
+    /// Check whether a specific capability is supported by this adapter.
+    fn is_supported(&self, capability: RuntimeCapability) -> bool;
+
+    // ... other methods ...
 }
 ```
 
@@ -180,18 +189,15 @@ adapter cannot fulfill the application's requirements.
 **Recommended startup pattern:**
 
 ```rust
-fn validate_runtime(runtime: &impl ActorRuntime) -> Result<(), String> {
-    let caps = runtime.capabilities();
+use dactor::RuntimeCapability::*;
 
-    // Application requires these capabilities — fail fast if missing
-    if !caps.ask {
-        return Err("this application requires ask() support".into());
-    }
-    if !caps.inbound_interceptors {
-        return Err("this application requires interceptor support".into());
-    }
-    if !caps.watch {
-        return Err("this application requires watch/supervision support".into());
+fn validate_runtime(runtime: &impl ActorRuntime) -> Result<(), String> {
+    let required = [Ask, InboundInterceptors, Watch];
+
+    for cap in &required {
+        if !runtime.is_supported(*cap) {
+            return Err(format!("this application requires {:?} support", cap));
+        }
     }
 
     Ok(())
@@ -213,10 +219,10 @@ fn main() {
 
 | Call | Adapter doesn't support it | Result |
 |---|---|---|
-| `actor.ask(msg, None)` | `caps.ask == false` | `Err(RuntimeError::NotSupported { operation: "ask", ... })` |
-| `runtime.add_inbound_interceptor(...)` | `caps.inbound_interceptors == false` | `Err(RuntimeError::NotSupported { operation: "add_inbound_interceptor", ... })` |
-| `spawn_with_config(... config.mailbox = Bounded ...)` | `caps.bounded_mailbox == false` | `Err(RuntimeError::NotSupported { operation: "spawn_with_config", ... })` |
-| `runtime.watch(watcher, target)` | `caps.watch == false` | `Err(RuntimeError::NotSupported { operation: "watch", ... })` |
+| `actor.ask(msg, None)` | `!is_supported(Ask)` | `Err(RuntimeError::NotSupported { operation: "ask", ... })` |
+| `runtime.add_inbound_interceptor(...)` | `!is_supported(InboundInterceptors)` | `Err(RuntimeError::NotSupported { operation: "add_inbound_interceptor", ... })` |
+| `spawn_with_config(... Bounded ...)` | `!is_supported(BoundedMailbox)` | `Err(RuntimeError::NotSupported { operation: "spawn_with_config", ... })` |
+| `runtime.watch(watcher, target)` | `!is_supported(Watch)` | `Err(RuntimeError::NotSupported { operation: "watch", ... })` |
 
 All `NotSupported` errors include the `operation` name and `adapter` name
 (see §2.3) so the developer immediately knows which capability is missing
@@ -308,7 +314,7 @@ classDiagram
         +send_after(target, delay, msg)
         +send_interval(target, interval, msg)
         +watch(watcher, target)
-        +capabilities() RuntimeCapabilities
+        +is_supported(RuntimeCapability) bool
     }
     Actor <|-- Handler: requires
     Handler ..> Message: handles
@@ -851,23 +857,10 @@ pub trait ActorRuntime: Send + Sync + 'static {
     fn set_dead_letter_handler(&self, handler: Box<dyn DeadLetterHandler>);
 
     // ── Capability Introspection ────────────────────────
-    fn capabilities(&self) -> RuntimeCapabilities;
+    fn is_supported(&self, capability: RuntimeCapability) -> bool;
 
     // ── Metrics ─────────────────────────────────────────
     fn runtime_metrics(&self) -> RuntimeMetrics;
-}
-
-/// Describes which optional capabilities a runtime adapter supports.
-#[derive(Debug, Clone)]
-pub struct RuntimeCapabilities {
-    pub ask: bool,
-    pub stream: bool,
-    pub watch: bool,
-    pub bounded_mailbox: bool,
-    pub priority_mailbox: bool,
-    pub inbound_interceptors: bool,
-    pub outbound_interceptors: bool,
-    pub remote_spawn: bool,
 }
 
 /// Subscription to cluster membership events.
@@ -2415,7 +2408,7 @@ the framework degrades as follows:
 
 | Feature | Adapter supports | Adapter doesn't support |
 |---|---|---|
-| `watch()` / `unwatch()` | Delivers `ChildTerminated` to watcher | Returns `Err(NotSupported)` — app should check `caps.watch` at startup |
+| `watch()` / `unwatch()` | Delivers `ChildTerminated` to watcher | Returns `Err(NotSupported)` — app should check `runtime.is_supported(RuntimeCapability::Watch)` at startup |
 | `ErrorAction::Restart` | Runtime re-creates actor via `Actor::create(args, deps)` → `on_start()` | Actor is **stopped** instead — `Restart` degrades to `Stop`. A warning is logged: `"adapter does not support restart, stopping actor"` |
 | `ErrorAction::Escalate` | Runtime forwards failure to parent supervisor | Actor is **stopped** instead — `Escalate` degrades to `Stop`. Warning logged. |
 | `SupervisionStrategy` | Applied when child fails | Ignored — strategies have no effect without `watch` support |
@@ -2425,7 +2418,7 @@ the framework degrades as follows:
 
 ```rust
 let caps = runtime.capabilities();
-if !caps.watch {
+if !runtime.is_supported(RuntimeCapability::Watch) {
     tracing::warn!("adapter does not support supervision — actors will stop on error, not restart");
     // Application can decide: continue without supervision, or fail fast
 }
@@ -5825,13 +5818,13 @@ pub async fn run_all<R: ActorRuntime>(runtime: &R) {
     test_dead_letter_handler(runtime).await;
     test_message_ordering(runtime).await;
     // Capability-gated tests:
-    if runtime.capabilities().watch {
+    if runtime.is_supported(RuntimeCapability::Watch) {
         test_watch_notification(runtime).await;
     }
-    if runtime.capabilities().bounded_mailbox {
+    if runtime.is_supported(RuntimeCapability::BoundedMailbox) {
         test_bounded_mailbox_overflow(runtime).await;
     }
-    if runtime.capabilities().priority_mailbox {
+    if runtime.is_supported(RuntimeCapability::PriorityMailbox) {
         test_priority_ordering(runtime).await;
     }
 }
