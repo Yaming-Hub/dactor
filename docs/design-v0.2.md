@@ -4825,65 +4825,146 @@ sequenceDiagram
 When `ClusterDiscovery` detects a new node, the dactor runtime must:
 1. **Tell the adapter to establish a transport connection** — the adapter
    owns the network, so dactor must ask it to connect
-2. **Exchange system actor references** — so both nodes can send runtime
-   messages to each other
+2. **Bootstrap handshake** — exchange `NodeId`s and system actor refs
+3. After handshake, **all subsequent runtime operations** use system actors
+   via normal dactor messaging
 
-**Step 1: Adapter connection — the `AdapterCluster` trait:**
+**The chicken-and-egg problem:**
 
-Each provider has its own mechanism for connecting to peer nodes. The adapter
-must implement a trait that dactor calls when discovery reports a new node:
+System actors (SpawnManager, CancelManager, WatchManager) communicate via
+dactor's `tell()`/`ask()`, which requires `ActorRef`s to the remote node's
+system actors. But we get those `ActorRef`s from the handshake. So the
+handshake itself **cannot use system actors** — it must use the adapter's
+raw transport directly.
+
+This creates two communication layers:
+
+```mermaid
+graph TB
+    subgraph "1. Bootstrap Layer (handshake only)"
+        BL["AdapterCluster::connect() + handshake()"]
+        BL2["Uses adapter's raw transport directly"]
+        BL3["Exchanges NodeId + system actor ActorRefs"]
+    end
+    subgraph "2. Actor Layer (everything after handshake)"
+        AL["System actors: SpawnManager, CancelManager, WatchManager"]
+        AL2["Uses normal dactor tell() / ask()"]
+        AL3["Application actors also use this layer"]
+    end
+    BL -->|"handshake completes<br/>refs exchanged"| AL
+```
+
+| Layer | Used for | How | Built on |
+|---|---|---|---|
+| **Bootstrap** | Handshake only (NodeId + system actor ref exchange) | `AdapterCluster::handshake()` — adapter sends raw bytes | Provider's native transport directly |
+| **Actor** | All runtime operations after handshake | System actors via `tell()` / `ask()` | dactor's normal actor messaging |
+
+**Step 1: Adapter connection + handshake — the `AdapterCluster` trait:**
+
+The adapter implements the bootstrap layer. The handshake is part of
+`connect()` — the adapter uses its provider's native transport to exchange
+dactor-level metadata:
 
 ```rust
-/// Trait that adapters implement to manage transport-level connections.
-/// Called by the dactor runtime when ClusterDiscovery reports node changes.
+/// Trait that adapters implement to manage transport-level connections
+/// and the bootstrap handshake.
 #[async_trait]
 pub trait AdapterCluster: Send + Sync + 'static {
-    /// Establish a transport connection to a new peer node.
-    /// The adapter uses its library's native connection mechanism.
-    async fn connect(&self, node_id: NodeId, addr: NodeAddr) -> Result<(), ActorError>;
+    /// Establish transport connection AND perform handshake.
+    ///
+    /// The adapter must:
+    /// 1. Connect using the provider's native mechanism
+    /// 2. Send our `HandshakeData` to the peer (via raw transport)
+    /// 3. Receive the peer's `HandshakeData`
+    /// 4. Return the peer's data so the runtime can populate NodeDirectory
+    ///
+    /// This is the ONLY operation that uses raw transport directly.
+    /// After this, all communication goes through system actors.
+    async fn connect(
+        &self,
+        local: HandshakeData,
+        peer_addr: NodeAddr,
+    ) -> Result<HandshakeData, ActorError>;
 
     /// Disconnect from a peer node (graceful leave or failure).
     async fn disconnect(&self, node_id: NodeId) -> Result<(), ActorError>;
+
+    /// Register callback for provider-native health failure detection.
+    fn on_node_unreachable(&self, callback: Box<dyn Fn(NodeId) + Send + Sync>);
+}
+
+/// Data exchanged during the bootstrap handshake.
+/// Sent via the adapter's raw transport (not via system actors).
+#[derive(Serialize, Deserialize)]
+pub struct HandshakeData {
+    /// This node's self-assigned NodeId.
+    pub node_id: NodeId,
+    /// Serialized ActorRefs for this node's system actors.
+    /// The peer deserializes these to get remote refs for
+    /// SpawnManager, CancelManager, WatchManager.
+    pub system_actor_refs: SystemActorRefs,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SystemActorRefs {
+    pub spawn_manager: SerializedActorRef,
+    pub cancel_manager: SerializedActorRef,
+    pub watch_manager: SerializedActorRef,
 }
 ```
 
-**How each provider connects:**
+**Are system actors built on the provider directly?**
 
-| Provider | What `connect()` does | Connection mechanism |
+Yes — system actors are **regular actors spawned via the adapter's
+`ActorRuntime`**, just like application actors. They use the same
+`Actor` + `Handler<M>` traits and the same `tell()`/`ask()` messaging.
+The only special thing about them is that:
+1. The runtime spawns them automatically at startup
+2. Their `ActorRef`s are exchanged during the bootstrap handshake
+3. After handshake, they're accessible via the `NodeDirectory`
+
+```
+System actors ARE regular dactor actors:
+  SpawnManager: impl Actor + Handler<SpawnRequest>
+  CancelManager: impl Actor + Handler<CancelRequest>
+  WatchManager: impl Actor + Handler<WatchRequest>
+
+They run on the SAME adapter runtime as application actors.
+They use the SAME tell()/ask() as application actors.
+The ONLY difference: they're auto-spawned and their refs are
+exchanged during the bootstrap handshake.
+```
+
+**How each provider implements the handshake:**
+
+| Provider | What `connect()` does | Handshake transport |
 |---|---|---|
-| **ractor** | Calls `ractor_cluster::client_connect(addr)` | Creates a `NodeSession` actor — TCP connection with authentication, PG sync |
-| **kameo** | Dials peer via libp2p swarm | `swarm.dial(multiaddr)` — P2P connection via Kademlia DHT |
-| **coerce** | Adds peer to `RemoteActorSystem` | `cluster_worker.listen_addr()` — protobuf-based transport, K8s peer list |
+| **ractor** | `client_connect(addr)` → `NodeSession` established. Sends `HandshakeData` as a ractor system message on the session. | ractor's TCP session protocol |
+| **kameo** | `swarm.dial(multiaddr)` → libp2p connection. Sends `HandshakeData` via a custom libp2p protocol handler. | libp2p custom protocol |
+| **coerce** | Connects to `RemoteActorSystem`. Sends `HandshakeData` via coerce's protobuf RPC. | coerce gRPC/protobuf |
 
-**How each provider handles disconnect:**
-
-| Provider | What `disconnect()` does | Detection |
-|---|---|---|
-| **ractor** | Drops `NodeSession` — TCP close, actor deregistration, PG cleanup | Session drop / TCP close → automatic `nodedown` |
-| **kameo** | Peer removed from swarm | DHT records expire, connection drop detected by libp2p |
-| **coerce** | Node removed from `RemoteActorSystem` | System topic publishes node-left event, health check failure |
-
-**Step 2: Handshake — exchange system actor refs:**
-
-After the adapter establishes the transport connection, dactor performs a
-handshake to exchange system actor references:
+**Step 2: After handshake — all via system actors:**
 
 ```mermaid
 sequenceDiagram
     participant CD as ClusterDiscovery
-    participant R1 as dactor Runtime (Node 1)
-    participant A1 as Adapter (Node 1)
-    participant A2 as Adapter (Node 2)
-    participant R2 as dactor Runtime (Node 2)
+    participant R1 as Runtime (Node 1)
+    participant A as Adapter (Node 1)
+    participant R2 as Runtime (Node 2)
 
-    CD-->>R1: node_joined(NodeId(2), addr)
+    CD-->>R1: node_joined(addr)
 
-    R1->>A1: adapter.connect(NodeId(2), addr)
-    A1->>A2: establish transport (TCP / libp2p / gRPC)
-    A2-->>A1: connection established
+    R1->>A: adapter.connect(our_handshake, addr)
+    Note over A: 1. provider native connect<br/>2. send our HandshakeData<br/>3. receive peer's HandshakeData
+    A-->>R1: peer's HandshakeData { node_id: 2, system_refs: {...} }
 
-    R1->>R2: Handshake { system_actors: { spawn, cancel, watch, health } }
-    R2-->>R1: Handshake { system_actors: { spawn, cancel, watch, health } }
+    R1->>R1: store in NodeDirectory:<br/>NodeId(2) → peer's system actor refs
+
+    Note over R1,R2: Bootstrap complete. All subsequent<br/>operations use system actors via tell()/ask()
+
+    R1->>R2: SpawnManager.ask(SpawnRequest{...})
+    R1->>R2: CancelManager.tell(CancelRequest{...})
+```
 
     Note over R1: NodeDirectory stores Node 2's system actor refs
     Note over R2: NodeDirectory stores Node 1's system actor refs
