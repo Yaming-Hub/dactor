@@ -1212,7 +1212,7 @@ pub fn cancel_after(duration: Duration) -> CancellationToken {
 }
 ```
 
-**What happens on cancellation:** See §4.12 for the complete cancellation
+**What happens on cancellation:** See §4.13 for the complete cancellation
 design (applies identically to ask and stream).
 
 ### 4.11 Streaming (Request-Stream)
@@ -1381,20 +1381,276 @@ async fn handle_get_logs(request: GetLogs, tx: StreamSender<LogEntry>) {
 }
 ```
 
-**Relationship to Tell and Ask:** The three patterns form a spectrum:
-- `tell()` — request → no reply (fire-and-forget)
-- `ask()` — request → single reply
-- `stream()` — request → multiple replies
+**Relationship to Tell and Ask:** The four communication patterns form a
+complete matrix (mirroring gRPC's four RPC types):
 
-All three are methods on `ActorRef<A>`, providing a unified API.
+| Pattern | Input | Output | gRPC Equivalent |
+|---|---|---|---|
+| `tell()` | single message | no reply | — |
+| `ask()` | single message | single reply | Unary |
+| `stream()` | single message | stream of replies | Server streaming |
+| `feed()` | stream of items | optional single reply | Client streaming |
+
+All four are methods on `ActorRef<A>`, providing a unified API.
 
 **Dependencies:** The core crate adds `futures-core` (for the `Stream` trait)
 and `tokio-stream` (for `ReceiverStream`) as dependencies, both lightweight
 and standard in the async Rust ecosystem.
 
-### 4.12 Cancellation
+### 4.12 Feed (Client-Streaming / Stream-to-Actor)
 
-Cancellation applies to both `ask()` and `stream()` — the design is
+**Rationale:** The `stream()` pattern (§4.11) covers *server-streaming* — one
+request yields many response items. The inverse pattern is equally important:
+the caller has an async stream of items to feed into an actor, which digests
+them and optionally returns a final result. Use cases include:
+
+- **Bulk data ingestion** — streaming CSV rows, log entries, or sensor readings
+- **Aggregation** — sum/count/average over a stream of values
+- **Upload pipelines** — chunked file upload with a final checksum
+- **ETL processing** — transform and load a stream of records
+- **Training data** — feeding batches to an ML model actor
+
+This is analogous to gRPC client streaming, where the client sends a stream
+and the server responds once after consuming it.
+
+**Core types:**
+
+```rust
+/// Handle given to the actor to receive items from the incoming stream.
+/// The actor pulls items from this receiver in its handler.
+///
+/// Backed by a bounded `mpsc` channel for backpressure — if the actor
+/// is slow to consume, the caller's stream is naturally throttled.
+pub struct StreamReceiver<T: Send + 'static> {
+    inner: tokio::sync::mpsc::Receiver<T>,
+}
+
+impl<T: Send + 'static> StreamReceiver<T> {
+    /// Receive the next item from the stream.
+    /// Returns `None` when the stream is exhausted (caller finished or dropped).
+    pub async fn recv(&mut self) -> Option<T> {
+        self.inner.recv().await
+    }
+
+    /// Try to receive without blocking. Returns `None` if empty or closed.
+    pub fn try_recv(&mut self) -> Option<T> {
+        self.inner.try_recv().ok()
+    }
+
+    /// Convert into an async `Stream` for use with `StreamExt` combinators.
+    pub fn into_stream(self) -> BoxStream<T> {
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(self.inner))
+    }
+}
+```
+
+**Message trait for feed handlers:**
+
+```rust
+/// Marker trait for messages that represent a stream-to-actor feed.
+/// `Item` is the type of each streamed element.
+/// `Reply` is the optional final response after the stream is consumed.
+pub trait FeedMessage: Message {
+    type Item: Send + 'static;
+}
+```
+
+**Feed handler trait:**
+
+```rust
+/// Implemented by actors that can receive a stream of items.
+/// The handler receives the initial request plus a `StreamReceiver`
+/// to pull items from. It returns a final reply after processing.
+#[async_trait]
+pub trait FeedHandler<M: FeedMessage>: Actor {
+    async fn handle_feed(
+        &mut self,
+        msg: M,
+        receiver: StreamReceiver<M::Item>,
+        ctx: &mut ActorContext,
+    ) -> Result<M::Reply, ActorError>;
+}
+```
+
+**Extension method on `ActorRef`:**
+
+```rust
+impl<A: Actor> ActorRef<A> {
+    /// Feed an async stream of items into the actor and await a final reply.
+    ///
+    /// `input` is an async stream the caller provides. The runtime drains
+    /// items from it and delivers them to the actor's `FeedHandler`.
+    ///
+    /// `msg` is an initial request/config sent alongside the stream
+    /// (e.g., filename, options, schema).
+    ///
+    /// `buffer` controls the internal channel capacity (backpressure).
+    ///
+    /// `cancel` optionally cancels the feed. When cancelled, the receiver
+    /// yields `None` and the actor can finalize early.
+    ///
+    /// Returns the actor's final reply after the stream is fully consumed
+    /// (or cancelled).
+    pub async fn feed<M>(
+        &self,
+        msg: M,
+        input: BoxStream<M::Item>,
+        buffer: usize,
+        cancel: Option<CancellationToken>,
+    ) -> Result<M::Reply, RuntimeError>
+    where
+        A: FeedHandler<M>,
+        M: FeedMessage;
+}
+```
+
+**How it works (adapter implementation pattern):**
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant A as Adapter Layer
+    participant H as Actor FeedHandler
+
+    C->>A: feed(config, input_stream, buf=16)
+    A->>A: create mpsc(16)
+    A->>A: tx = Sender, rx = StreamReceiver
+    A->>A: spawn drain task: input_stream → tx
+    A->>H: deliver (config, rx)
+
+    Note over C,A: drain task pulls from caller's stream
+    A->>H: rx.recv() → item_1
+    A->>H: rx.recv() → item_2
+    A->>H: rx.recv() → item_3
+    A->>H: rx.recv() → None (stream exhausted)
+
+    H-->>A: return final_result
+    A-->>C: Ok(final_result)
+```
+
+**Backpressure:** The bounded channel between the drain task and the actor
+provides natural backpressure. If the actor is slow to consume items, the
+drain task suspends on `tx.send().await`, which in turn stops pulling from
+the caller's input stream. No unbounded buffering occurs.
+
+**Cancellation:** When the cancellation token fires:
+1. The drain task stops pulling from the input stream and drops `tx`
+2. The actor's `receiver.recv()` returns `None`, signaling end-of-stream
+3. The actor can finalize (compute aggregate, flush buffer, etc.)
+4. The final reply is returned to the caller
+
+**Example — Aggregation actor:**
+
+```rust
+// Message: start a sum aggregation over streamed i64 values
+struct SumRequest {
+    label: String,
+}
+
+impl Message for SumRequest {
+    type Reply = i64;  // final sum
+}
+
+impl FeedMessage for SumRequest {
+    type Item = i64;  // each streamed value
+}
+
+#[async_trait]
+impl FeedHandler<SumRequest> for Aggregator {
+    async fn handle_feed(
+        &mut self,
+        msg: SumRequest,
+        mut receiver: StreamReceiver<i64>,
+        _ctx: &mut ActorContext,
+    ) -> Result<i64, ActorError> {
+        let mut sum: i64 = 0;
+        while let Some(value) = receiver.recv().await {
+            sum += value;
+        }
+        tracing::info!(label = %msg.label, sum, "aggregation complete");
+        Ok(sum)
+    }
+}
+```
+
+**Caller side:**
+
+```rust
+use tokio_stream::StreamExt;
+
+async fn compute_sum(aggregator: &ActorRef<Aggregator>) -> i64 {
+    // Create an async stream of values
+    let values = tokio_stream::iter(vec![10, 20, 30, 40, 50]);
+    let input: BoxStream<i64> = Box::pin(values);
+
+    let total = aggregator
+        .feed(SumRequest { label: "batch-1".into() }, input, 16, None)
+        .await
+        .unwrap();
+
+    println!("Total: {total}");  // Total: 150
+    total
+}
+```
+
+**Example — Chunked file upload:**
+
+```rust
+struct UploadFile {
+    filename: String,
+    content_type: String,
+}
+
+impl Message for UploadFile {
+    type Reply = UploadResult;
+}
+
+impl FeedMessage for UploadFile {
+    type Item = Bytes;  // file chunks
+}
+
+#[async_trait]
+impl FeedHandler<UploadFile> for StorageActor {
+    async fn handle_feed(
+        &mut self,
+        msg: UploadFile,
+        mut receiver: StreamReceiver<Bytes>,
+        ctx: &mut ActorContext,
+    ) -> Result<UploadResult, ActorError> {
+        let mut file = File::create(&msg.filename).await?;
+        let mut total_bytes = 0u64;
+
+        while let Some(chunk) = receiver.recv().await {
+            file.write_all(&chunk).await?;
+            total_bytes += chunk.len() as u64;
+        }
+
+        file.flush().await?;
+        Ok(UploadResult { bytes_written: total_bytes })
+    }
+}
+```
+
+**Remote support:** For remote actors, the adapter serializes each stream
+item and sends it over the wire using the same `MessageSerializer`. The
+drain task runs on the caller's node; items flow to the remote actor via
+the provider's transport. The `FeedMessage` initial request travels as a
+`WireEnvelope`, and stream items follow as a sequence of serialized payloads
+on the same logical channel.
+
+**Interceptor visibility:** Both `InboundInterceptor` and `OutboundInterceptor`
+see the initial `FeedMessage` as a regular message. Individual stream items
+are **not** intercepted (same as `stream()` — see §5.2, §5.3). The final
+reply is visible to `OutboundInterceptor::on_reply`.
+
+> **Note:** Bidirectional streaming (stream in + stream out) can be composed
+> from `feed()` + actor-internal `stream()`, or by having the `FeedHandler`
+> return a `BoxStream` as its reply type. This is left as an application-level
+> composition rather than a first-class primitive, to keep the core API simple.
+
+### 4.13 Cancellation
+
+Cancellation applies to `ask()`, `stream()`, and `feed()` — the design is
 identical. `tell()` is fire-and-forget and does not support cancellation.
 
 **The problem:** Actors process messages sequentially on a single task
@@ -1624,7 +1880,7 @@ pub fn cancel_after(duration: Duration) -> CancellationToken {
 
 ---
 
-### 4.13 Actor Pool / Worker Factory
+### 4.14 Actor Pool / Worker Factory
 
 **Rationale:** A single actor processes messages sequentially — this is safe
 but limits throughput. When work is stateless or partitionable, a **pool of
