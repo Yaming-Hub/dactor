@@ -270,7 +270,7 @@ call site — the choice is the application's, not the framework's.
 5. **Message envelopes** with headers exist in Erlang and Akka (2 frameworks) — qualifies for inclusion under the superset rule.
 6. **Interceptors/middleware** exist in Akka, Actix, and Coerce (3 frameworks) — qualifies for inclusion.
 7. **Test support behind feature flags** is standard practice in Rust crates.
-8. **Superset rule applied:** every capability above is supported by ≥ 2 frameworks (see §0). Adapters return `NotSupported` for features they can't provide.
+8. **Superset rule applied:** every capability above is supported by ≥ 2 frameworks (see §2). Adapters return `NotSupported` for features they can't provide.
 9. **Streaming responses** exist in Erlang (multi-part `gen_server` replies) and Akka (Akka Streams `Source`) — qualifies under the superset rule. Combined with the ubiquity of gRPC server-streaming and Rust's async `Stream` trait, this is a high-value addition.
 
 ---
@@ -1252,7 +1252,7 @@ pub fn cancel_after(duration: Duration) -> CancellationToken {
 }
 ```
 
-**What happens on cancellation:** See §6.4 for the complete cancellation
+**What happens on cancellation:** See §4.12 for the complete cancellation
 design (applies identically to ask and stream).
 
 ### 4.11 Streaming (Request-Stream)
@@ -4016,7 +4016,7 @@ on remote nodes using the provider's native identity and transport.
 
 | Registry | Purpose | Populated by |
 |---|---|---|
-| `TypeRegistry` | Maps type name → `ActorFactory` for remote spawn (§10.5) | `runtime.register_remote_actor::<A>()` at startup |
+| `TypeRegistry` | Maps type name → `ActorFactory` for remote spawn (§9.2) | `runtime.register_remote_actor::<A>()` at startup |
 | `HeaderRegistry` | Maps header name → deserializer for `Headers::from_wire()` (§5.1) | `registry.register::<H>()` at startup |
 | `ErrorCodecRegistry` | Maps error type name → `ErrorCodec` for encode/decode (§9.1) | `runtime.register_error_codec()` at startup |
 | `NodeDirectory` | Maps `NodeId` → peer system actor `ActorRef`s | Auto-populated on cluster join (§11.1) |
@@ -4759,7 +4759,7 @@ impl<A: Actor> Deserialize for ActorRef<A> {
 Messages used for remote calls must implement `Serialize + Deserialize` so
 they can cross node boundaries. The caller uses the same `tell()` / `ask()`
 API — the adapter handles serialization transparently. Errors from the
-remote actor arrive as structured `ActorError` (see §3.14).
+remote actor arrive as structured `ActorError` (see §7.1).
 
 ```rust
 use dactor::prelude::*;
@@ -5356,7 +5356,7 @@ let connected_count = state.peers.iter()
     .count();
 ```
 
-**Integration with observability (§13):**
+**Integration with observability (§11):**
 
 The `MetricsInterceptor` can expose cluster metrics automatically:
 
@@ -5379,7 +5379,7 @@ long handlers take. Building this into every actor's handler code is
 error-prone and repetitive.
 
 **Design:** dactor provides observability primarily through the **interceptor
-pipeline** (§3.2). Because interceptors see every message with full context
+pipeline** (§5.2). Because interceptors see every message with full context
 (`InterceptContext`), they are the natural place to collect metrics. dactor
 also provides a built-in `MetricsInterceptor` and a `RuntimeMetrics` query
 API for common operational needs.
@@ -5764,7 +5764,7 @@ let healthy = rm.system_actors_healthy
 | Uptime | Runtime (start timestamp) | ❌ No |
 | Per-actor message count, latency, errors | `MetricsInterceptor` (§13.2) | ✅ Yes |
 | Per-message-type throughput | `MetricsInterceptor` (§13.2) | ✅ Yes |
-| Custom metrics (message size, etc.) | Custom interceptors (§13.4) | ✅ Yes |
+| Custom metrics (message size, etc.) | Custom interceptors (§11.4) | ✅ Yes |
 
 Runtime metrics are **always available** — they don't depend on interceptors.
 Interceptor-based metrics (§13.2) add message-level detail on top.
@@ -6446,7 +6446,7 @@ TestCluster::builder()
 
 ### 13.1 Proc-Macro for Reduced Boilerplate (`dactor-macros`)
 
-The trait-based API (§10.6) is explicit and type-safe but requires repetitive
+The trait-based API (§4) is explicit and type-safe but requires repetitive
 boilerplate — each message needs a struct, a `Message` impl, and a `Handler`
 impl. A proc-macro crate (`dactor-macros`) can eliminate most of this while
 generating the exact same traits underneath.
@@ -6955,7 +6955,7 @@ dactor/src/
 
 2. **Should interceptors be per-runtime or per-actor?** → **Proposed: both.** Global interceptors via `runtime.add_inbound_interceptor()`, per-actor via `SpawnConfig`.
 
-3. **Should lifecycle hooks be a separate trait or methods on Actor?** → **Resolved: methods on `Actor` trait.** Since we adopted the Kameo/Coerce pattern (§10.6) where the actor struct implements `Actor`, lifecycle hooks belong directly on that trait with default no-op implementations. No separate `ActorLifecycle` trait needed.
+3. **Should lifecycle hooks be a separate trait or methods on Actor?** → **Resolved: methods on `Actor` trait.** Since we adopted the Kameo/Coerce pattern (§4) where the actor struct implements `Actor`, lifecycle hooks belong directly on that trait with default no-op implementations. No separate `ActorLifecycle` trait needed.
 
 4. **Should dactor provide a `Registry` (named actor lookup)?** → **Deferred to v0.4.** 5 of 6 frameworks support it (qualifies under superset rule), but adapters already have their own registry mechanisms. Design to be informed by adapter experience.
 
