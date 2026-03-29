@@ -4726,94 +4726,7 @@ sequenceDiagram
     Note over A: actors handle node departure
 ```
 
-### 12.2 Node Health Monitoring
-
-**Problem:** Once nodes are discovered, the cluster needs to detect when a
-node becomes unhealthy (network partition, process crash, resource exhaustion).
-
-**Key insight:** Most providers **already implement health monitoring**:
-
-| Provider | Built-in health mechanism |
-|---|---|
-| **ractor** | `ractor_cluster` — periodic ping/pong between peer nodes, detects unresponsive peers |
-| **kameo** | libp2p connection monitoring — P2P-level keepalive, connection drop detection |
-| **coerce** | Built-in health checks, system topics for node status, liveness probes |
-
-**dactor should NOT duplicate this.** If dactor runs its own heartbeat layer
-on top of the provider's heartbeat, two problems arise:
-
-1. **Conflicting health views** — dactor thinks a node is alive but the
-   provider thinks it's dead (or vice versa). Which one wins? The provider
-   owns the transport connection, so its view is authoritative.
-2. **Wasted resources** — two heartbeat mechanisms ping the same nodes,
-   doubling network and CPU overhead for no benefit.
-
-**dactor design:** Delegate health monitoring to the provider via the
-`AdapterCluster` trait. The adapter reports health events to dactor, which
-translates them into `ClusterEvent::NodeLeft`:
-
-```rust
-/// Extension to AdapterCluster for health event reporting.
-/// The adapter's provider-native health monitoring detects failures
-/// and reports them to dactor via this callback.
-pub trait AdapterCluster: Send + Sync + 'static {
-    /// Establish transport connection (see §12.3).
-    async fn connect(&self, node_id: NodeId, addr: NodeAddr) -> Result<(), ActorError>;
-
-    /// Disconnect from peer (see §12.3).
-    async fn disconnect(&self, node_id: NodeId) -> Result<(), ActorError>;
-
-    /// Register a callback that the adapter invokes when its native
-    /// health monitoring detects a node failure.
-    fn on_node_unreachable(&self, callback: Box<dyn Fn(NodeId) + Send + Sync>);
-}
-```
-
-**Flow:**
-
-```mermaid
-sequenceDiagram
-    participant P as Provider Health (ractor/kameo/coerce)
-    participant A as Adapter
-    participant R as dactor Runtime
-    participant App as Application Actors
-
-    P->>P: heartbeat ping/pong fails for Node 2
-    P->>A: node 2 unreachable (provider-native event)
-    A->>R: on_node_unreachable callback → NodeId(2)
-    R->>R: remove Node 2 from NodeDirectory
-    R->>App: ClusterEvent::NodeLeft(NodeId(2))
-    R->>App: ChildTerminated for watched actors on Node 2
-```
-
-**Two sources of "node left" events — unified handling:**
-
-| Source | Detects | Authoritative for |
-|---|---|---|
-| `ClusterDiscovery` (infrastructure) | Pod termination, scale-down, graceful shutdown | Planned changes (K8s knows the pod is gone) |
-| `AdapterCluster::on_node_unreachable` (provider) | Network partition, process crash, OOM kill | Transport-level failures (provider owns the connection) |
-
-Both feed into the same `ClusterEvent::NodeLeft`. The runtime deduplicates
-— if both sources report the same node leaving, only one event is emitted
-to application actors.
-
-**What if the provider doesn't have health monitoring?**
-
-For providers without built-in health checks, the adapter can implement a
-simple heartbeat as an adapter-level shim (not in dactor core). This is the
-adapter's responsibility — dactor doesn't prescribe how health is detected,
-only that the adapter reports failures via `on_node_unreachable`.
-
-| Adapter | Health source |
-|---|---|
-| dactor-ractor | ✅ Provider: `ractor_cluster` ping/pong → `on_node_unreachable` |
-| dactor-kameo | ✅ Provider: libp2p connection monitoring → `on_node_unreachable` |
-| dactor-coerce | ✅ Provider: built-in health checks → `on_node_unreachable` |
-| dactor-mock | ⚙️ Simulated: `MockCluster::crash_node()` triggers `on_node_unreachable` |
-
----
-
-### 12.3 Node Join/Leave Protocol
+### 12.2 Node Join/Leave Protocol
 
 When `ClusterDiscovery` detects a new node, the dactor runtime must:
 1. **Tell the adapter to establish a transport connection** — the adapter
@@ -4906,6 +4819,93 @@ sequenceDiagram
     WM->>App: ChildTerminated { reason: "node left" }
     R1->>App: ClusterEvent::NodeLeft(NodeId(2))
 ```
+
+---
+
+### 12.3 Node Health Monitoring
+
+**Problem:** Once nodes are discovered, the cluster needs to detect when a
+node becomes unhealthy (network partition, process crash, resource exhaustion).
+
+**Key insight:** Most providers **already implement health monitoring**:
+
+| Provider | Built-in health mechanism |
+|---|---|
+| **ractor** | `ractor_cluster` — periodic ping/pong between peer nodes, detects unresponsive peers |
+| **kameo** | libp2p connection monitoring — P2P-level keepalive, connection drop detection |
+| **coerce** | Built-in health checks, system topics for node status, liveness probes |
+
+**dactor should NOT duplicate this.** If dactor runs its own heartbeat layer
+on top of the provider's heartbeat, two problems arise:
+
+1. **Conflicting health views** — dactor thinks a node is alive but the
+   provider thinks it's dead (or vice versa). Which one wins? The provider
+   owns the transport connection, so its view is authoritative.
+2. **Wasted resources** — two heartbeat mechanisms ping the same nodes,
+   doubling network and CPU overhead for no benefit.
+
+**dactor design:** Delegate health monitoring to the provider via the
+`AdapterCluster` trait. The adapter reports health events to dactor, which
+translates them into `ClusterEvent::NodeLeft`:
+
+```rust
+/// Extension to AdapterCluster for health event reporting.
+/// The adapter's provider-native health monitoring detects failures
+/// and reports them to dactor via this callback.
+pub trait AdapterCluster: Send + Sync + 'static {
+    /// Establish transport connection (see §12.3).
+    async fn connect(&self, node_id: NodeId, addr: NodeAddr) -> Result<(), ActorError>;
+
+    /// Disconnect from peer (see §12.3).
+    async fn disconnect(&self, node_id: NodeId) -> Result<(), ActorError>;
+
+    /// Register a callback that the adapter invokes when its native
+    /// health monitoring detects a node failure.
+    fn on_node_unreachable(&self, callback: Box<dyn Fn(NodeId) + Send + Sync>);
+}
+```
+
+**Flow:**
+
+```mermaid
+sequenceDiagram
+    participant P as Provider Health (ractor/kameo/coerce)
+    participant A as Adapter
+    participant R as dactor Runtime
+    participant App as Application Actors
+
+    P->>P: heartbeat ping/pong fails for Node 2
+    P->>A: node 2 unreachable (provider-native event)
+    A->>R: on_node_unreachable callback → NodeId(2)
+    R->>R: remove Node 2 from NodeDirectory
+    R->>App: ClusterEvent::NodeLeft(NodeId(2))
+    R->>App: ChildTerminated for watched actors on Node 2
+```
+
+**Two sources of "node left" events — unified handling:**
+
+| Source | Detects | Authoritative for |
+|---|---|---|
+| `ClusterDiscovery` (infrastructure) | Pod termination, scale-down, graceful shutdown | Planned changes (K8s knows the pod is gone) |
+| `AdapterCluster::on_node_unreachable` (provider) | Network partition, process crash, OOM kill | Transport-level failures (provider owns the connection) |
+
+Both feed into the same `ClusterEvent::NodeLeft`. The runtime deduplicates
+— if both sources report the same node leaving, only one event is emitted
+to application actors.
+
+**What if the provider doesn't have health monitoring?**
+
+For providers without built-in health checks, the adapter can implement a
+simple heartbeat as an adapter-level shim (not in dactor core). This is the
+adapter's responsibility — dactor doesn't prescribe how health is detected,
+only that the adapter reports failures via `on_node_unreachable`.
+
+| Adapter | Health source |
+|---|---|
+| dactor-ractor | ✅ Provider: `ractor_cluster` ping/pong → `on_node_unreachable` |
+| dactor-kameo | ✅ Provider: libp2p connection monitoring → `on_node_unreachable` |
+| dactor-coerce | ✅ Provider: built-in health checks → `on_node_unreachable` |
+| dactor-mock | ⚙️ Simulated: `MockCluster::crash_node()` triggers `on_node_unreachable` |
 
 ---
 
