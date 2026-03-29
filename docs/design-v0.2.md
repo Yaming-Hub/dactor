@@ -5300,6 +5300,105 @@ let top_5_failing = metrics_store.most_failed_actors(5);
 Interceptors execute in registration order. The pipeline is:
 `OTel → Metrics → SlowHandler → CircuitBreaker → Actor Handler → CircuitBreaker.on_complete → SlowHandler.on_complete → Metrics.on_complete → OTel.on_complete`
 
+### 13.6 Runtime Observability
+
+Message-level metrics (§13.1–13.5) cover what actors **do**. Runtime
+observability covers what the system **is** — how many actors exist, how
+deep their mailboxes are, how the cluster looks, and whether the runtime
+itself is healthy.
+
+**`RuntimeMetrics` — queryable from the runtime:**
+
+```rust
+impl ActorRuntime {
+    /// Get a snapshot of runtime-level metrics.
+    fn runtime_metrics(&self) -> RuntimeMetrics;
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeMetrics {
+    // ── Actor inventory ──────────────────────────────
+    /// Total number of actors currently alive on this node.
+    pub actor_count: usize,
+    /// Actors grouped by type name and count.
+    pub actors_by_type: Vec<ActorTypeCount>,
+
+    // ── Mailbox health ───────────────────────────────
+    /// Actors with the deepest mailbox queues (potential bottlenecks).
+    pub deepest_mailboxes: Vec<MailboxSnapshot>,
+    /// Total messages queued across all actor mailboxes on this node.
+    pub total_queued_messages: usize,
+
+    // ── Cluster ──────────────────────────────────────
+    /// Current cluster state (same as §12.4).
+    pub cluster: ClusterState,
+
+    // ── System actors ────────────────────────────────
+    /// Whether system actors (SpawnManager, CancelManager, WatchManager)
+    /// are alive and responsive.
+    pub system_actors_healthy: bool,
+
+    // ── Runtime uptime ───────────────────────────────
+    /// How long this runtime has been running.
+    pub uptime: Duration,
+}
+
+pub struct ActorTypeCount {
+    pub type_name: String,
+    pub count: usize,
+}
+
+pub struct MailboxSnapshot {
+    pub actor_id: ActorId,
+    pub actor_name: String,
+    pub queued: usize,
+    pub mailbox_type: String,  // "Unbounded" / "Bounded(1000)" / "Priority"
+}
+```
+
+**Usage:**
+
+```rust
+let rm = runtime.runtime_metrics();
+
+// Dashboard: how many actors are running?
+println!("Actors alive: {}", rm.actor_count);
+for t in &rm.actors_by_type {
+    println!("  {}: {}", t.type_name, t.count);
+}
+
+// Alert: any mailboxes dangerously deep?
+for mb in &rm.deepest_mailboxes {
+    if mb.queued > 10_000 {
+        tracing::warn!(
+            actor = mb.actor_name,
+            queued = mb.queued,
+            "mailbox backlog critical"
+        );
+    }
+}
+
+// Health check endpoint (e.g., for K8s liveness probe)
+let healthy = rm.system_actors_healthy
+    && rm.cluster.peers.iter().all(|p| p.status != PeerStatus::Unreachable);
+```
+
+**What each layer provides:**
+
+| Metric | Source | Requires interceptor? |
+|---|---|---|
+| Actor count, actors by type | Runtime (actor registry) | ❌ No |
+| Mailbox depth | Runtime (mailbox introspection) | ❌ No |
+| Cluster state, peer count | Runtime (NodeDirectory) | ❌ No |
+| System actor health | Runtime (ping system actors) | ❌ No |
+| Uptime | Runtime (start timestamp) | ❌ No |
+| Per-actor message count, latency, errors | `MetricsInterceptor` (§13.2) | ✅ Yes |
+| Per-message-type throughput | `MetricsInterceptor` (§13.2) | ✅ Yes |
+| Custom metrics (message size, etc.) | Custom interceptors (§13.4) | ✅ Yes |
+
+Runtime metrics are **always available** — they don't depend on interceptors.
+Interceptor-based metrics (§13.2) add message-level detail on top.
+
 ---
 
 ## 14. Testing
@@ -5442,29 +5541,33 @@ pub trait MessageCodec: Send + Sync + 'static {
 
 **How cross-node messaging works:**
 
-```
-Node A (sender)                  MockNetwork                   Node B (receiver)
-  │                                 │                              │
-  │  actor_on_b.tell(msg)           │                              │
-  │────────────────────────────────►│                              │
-  │                                 │  1. codec.encode(msg)        │
-  │                                 │  2. check link config:       │
-  │                                 │     - connected?             │
-  │                                 │     - error_mode?            │
-  │                                 │     - drop_rate roll?        │
-  │                                 │     - corrupt_rate roll?     │
-  │                                 │     - duplicate_rate roll?   │
-  │                                 │  3. if corrupt: flip bits    │
-  │                                 │  4. sleep(latency ± jitter)  │
-  │                                 │  5. if reorder: enqueue      │
-  │                                 │  6. codec.decode(bytes)      │
-  │                                 │     → may fail if corrupted  │
-  │                                 │  7. deliver to Node B        │
-  │                                 │─────────────────────────────►│
-  │                                 │                              │  handler(msg)
-  │                                 │  8. if duplicate: re-deliver │
-  │                                 │─────────────────────────────►│
-  │                                 │                              │  handler(msg) again
+```mermaid
+sequenceDiagram
+    participant A as Node A (sender)
+    participant MN as MockNetwork
+    participant B as Node B (receiver)
+
+    A->>MN: actor_on_b.tell(msg)
+    MN->>MN: 1. codec.encode(msg)
+    MN->>MN: 2. check link config
+    
+    alt link disconnected or error_mode
+        MN-->>A: Err or silent drop
+    else link connected
+        MN->>MN: 3. roll drop_rate → drop?
+        MN->>MN: 4. roll corrupt_rate → flip bits?
+        MN->>MN: 5. sleep(latency ± jitter)
+        MN->>MN: 6. roll reorder → enqueue?
+        MN->>MN: 7. codec.decode(bytes)
+        Note over MN: may fail if corrupted
+        MN->>B: 8. deliver message
+        B->>B: handler(msg)
+        
+        opt duplicate_rate triggered
+            MN->>B: 9. re-deliver same message
+            B->>B: handler(msg) again
+        end
+    end
 ```
 
 **Key point: forced serialization.** Even though sender and receiver are in the
