@@ -734,6 +734,10 @@ system, IDs must be **globally unique** across all nodes without requiring
 a central coordinator.
 
 ```rust
+/// Unique identifier for a node in the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NodeId(pub u64);
+
 /// Globally unique identifier for an actor across all nodes in a cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActorId {
@@ -865,6 +869,31 @@ pub struct RuntimeCapabilities {
     pub outbound_interceptors: bool,
     pub remote_spawn: bool,
 }
+
+/// Subscription to cluster membership events.
+pub trait ClusterEvents: Send + Sync + 'static {
+    /// Subscribe to cluster membership changes.
+    fn subscribe(
+        &self,
+        on_event: Box<dyn Fn(ClusterEvent) + Send + Sync>,
+    ) -> Result<SubscriptionId, ClusterError>;
+
+    /// Remove a previously registered subscription.
+    fn unsubscribe(&self, id: SubscriptionId) -> Result<(), ClusterError>;
+}
+
+/// Events emitted by the cluster membership system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusterEvent {
+    NodeJoined(NodeId),
+    NodeLeft(NodeId),
+}
+
+/// A handle to a scheduled timer that can be cancelled.
+pub trait TimerHandle: Send + 'static {
+    /// Cancel the timer. Idempotent.
+    fn cancel(self);
+}
 ```
 
 ### 4.6 ActorContext
@@ -934,7 +963,7 @@ use dactor::prelude::*;
 struct Counter { count: u64 }
 
 impl Actor for Counter {
-    fn on_start(&mut self) {
+    async fn on_start(&mut self, _ctx: &mut ActorContext) {
         println!("Counter started at {}", self.count);
     }
 }
@@ -1144,9 +1173,11 @@ pub struct HeaderRegistry {
 
 impl HeaderRegistry {
     /// Register a header type so it can be deserialized from wire format.
-    pub fn register<H: HeaderValue>(&mut self) {
+    pub fn register<H: HeaderValue + Default>(&mut self) {
+        let sample = H::default();
+        let name = sample.header_name().to_string();
         self.deserializers.insert(
-            H::header_name_static(),
+            name,
             Box::new(|bytes| Ok(Box::new(H::from_bytes(bytes)?))),
         );
     }
@@ -1553,7 +1584,7 @@ runtime.add_inbound_interceptor(Box::new(TransferAuditInterceptor));
 
 // Or per-actor at spawn time via SpawnConfig:
 let config = SpawnConfig {
-    interceptors: vec![Box::new(TransferAuditInterceptor)],
+    inbound_interceptors: vec![Box::new(TransferAuditInterceptor)],
     ..Default::default()
 };
 runtime.spawn_with_config("bank", args, deps, config)?;
@@ -2517,7 +2548,7 @@ pub enum MailboxConfig {
     },
     /// Priority mailbox — messages are delivered in priority order rather
     /// than FIFO. Priority is determined by the `Priority` header in the
-    /// message envelope, or by a user-supplied `PriorityFunction`.
+    /// message envelope, ordered by the `MessageComparer` trait (§8.1).
     ///
     /// Supported natively by: Akka (`PriorityMailbox`), Kameo (custom mailbox).
     /// Adapter-implemented for: ractor (priority queue wrapper).
@@ -3275,16 +3306,14 @@ struct FieldError {
 
 struct ValidationErrorCodec;
 
-impl ErrorCodec for ValidationErrorCodec {
-    type Error = ValidationErrors;
-
+impl ErrorCodec<ValidationErrors> for ValidationErrorCodec {
     fn type_name(&self) -> &'static str { "myapp.ValidationErrors" }
 
-    fn encode(&self, error: ValidationErrors) -> ActorError {
+    fn encode(&self, error: &ValidationErrors) -> ActorError {
         ActorError::new(ErrorCode::InvalidArgument, "validation failed")
             .with_payload(
                 self.type_name(),
-                bincode::serialize(&error).unwrap(),
+                bincode::serialize(error).unwrap(),
             )
     }
 
@@ -3299,8 +3328,8 @@ impl ErrorCodec for ValidationErrorCodec {
 **Registration:**
 
 ```rust
-// Register on both handler side and caller side
-runtime.register_error_codec(Box::new(ValidationErrorCodec));
+// Wrap with erased() for object-safe registry storage
+runtime.register_error_codec(erased(ValidationErrorCodec));
 ```
 
 **Handler side — returning custom errors:**
@@ -3399,7 +3428,7 @@ impl ActorError {
 sequenceDiagram
     participant C as Caller
 
-    rect rgb(230, 245, 230)
+    Note over C: Local ask — same process
         Note over C: Local ask — same process
         participant A1 as Actor
         C->>A1: ask(msg)
@@ -3530,16 +3559,9 @@ pub enum RuntimeError {
 **Relationship to `Outcome::HandlerError`:**
 
 The `Outcome::HandlerError` passed to interceptors' `on_complete` now carries
-the full `ActorError` rather than a plain string:
-
-```rust
-pub enum Outcome {
-    Success,
-    HandlerError { error: ActorError },
-    StreamCompleted { items_emitted: u64 },
-    StreamCancelled { items_emitted: u64 },
-}
-```
+the full `ActorError` rather than a plain string. See §5.2 for the
+authoritative `Outcome` enum definition (with `TellSuccess`, `AskSuccess`,
+etc.).
 
 ### 9.2 Error Mapping per Adapter
 
@@ -3599,7 +3621,7 @@ graph TB
 
     A1 & A2 --> OI --> AR
     AR --> II --> A1 & A2
-    SM & CM & WM & HM --> AR
+    SM & CM & WM --> AR
 ```
 
 ### 10.2 System Actors
