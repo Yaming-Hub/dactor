@@ -14,7 +14,7 @@ use futures::FutureExt;
 use tokio::sync::mpsc;
 
 use crate::actor::{Actor, ActorContext, ActorError, AskReply, Handler, TypedActorRef};
-use crate::errors::ActorSendError;
+use crate::errors::{ActorSendError, RuntimeError};
 use crate::interceptor::{
     Disposition, InboundContext, InboundInterceptor, Outcome, SendMode,
 };
@@ -41,6 +41,10 @@ trait Dispatch<A: Actor>: Send {
 
     /// The message type name.
     fn message_type_name(&self) -> &'static str;
+
+    /// Reject this dispatch — for ask, sends the proper error to the caller.
+    /// For tell, silently drops (fire-and-forget has no error path).
+    fn reject(self: Box<Self>, disposition: Disposition, interceptor_name: &str);
 }
 
 /// Result of dispatching a message, including the type-erased reply for ask.
@@ -90,12 +94,16 @@ where
     fn message_type_name(&self) -> &'static str {
         std::any::type_name::<M>()
     }
+
+    fn reject(self: Box<Self>, _disposition: Disposition, _interceptor_name: &str) {
+        // tell: silently drop (fire-and-forget has no error path)
+    }
 }
 
 /// Ask envelope: carries the message and a oneshot sender for the reply.
 struct AskDispatch<M: Message> {
     msg: M,
-    reply_tx: tokio::sync::oneshot::Sender<M::Reply>,
+    reply_tx: tokio::sync::oneshot::Sender<Result<M::Reply, RuntimeError>>,
 }
 
 #[async_trait]
@@ -112,7 +120,7 @@ where
             reply: Some(reply_any),
             reply_sender: Some(Box::new(move |boxed_reply| {
                 if let Ok(reply) = boxed_reply.downcast::<M::Reply>() {
-                    if reply_tx.send(*reply).is_err() {
+                    if reply_tx.send(Ok(*reply)).is_err() {
                         tracing::debug!("ask reply dropped — caller may have timed out or been cancelled");
                     }
                 }
@@ -130,6 +138,22 @@ where
 
     fn message_type_name(&self) -> &'static str {
         std::any::type_name::<M>()
+    }
+
+    fn reject(self: Box<Self>, disposition: Disposition, interceptor_name: &str) {
+        let error = match disposition {
+            Disposition::Reject(reason) => RuntimeError::Rejected {
+                interceptor: interceptor_name.to_string(),
+                reason,
+            },
+            Disposition::Retry(retry_after) => RuntimeError::RetryAfter {
+                interceptor: interceptor_name.to_string(),
+                retry_after,
+            },
+            Disposition::Drop => RuntimeError::ActorNotFound("message dropped by interceptor".into()),
+            _ => return,
+        };
+        let _ = self.reply_tx.send(Err(error));
     }
 }
 
@@ -297,20 +321,25 @@ impl V2TestRuntime {
             actor.on_start(&mut ctx).await;
 
             while let Some(dispatch) = rx.recv().await {
+                // Capture metadata before dispatch consumes the message
+                let send_mode = dispatch.send_mode();
+                let message_type = dispatch.message_type_name();
+
                 // Run inbound interceptor pipeline
-                let (should_deliver, total_delay) = {
+                let runtime_headers = RuntimeHeaders::new();
+                let mut headers = Headers::new();
+                let mut total_delay = Duration::ZERO;
+                let mut rejection: Option<(String, Disposition)> = None; // (interceptor_name, disposition)
+
+                {
                     let ictx = InboundContext {
                         actor_id: ctx.actor_id.clone(),
                         actor_name: &ctx.actor_name,
-                        message_type: dispatch.message_type_name(),
-                        send_mode: dispatch.send_mode(),
+                        message_type,
+                        send_mode,
                         remote: false,
                         origin_node: None,
                     };
-                    let runtime_headers = RuntimeHeaders::new();
-                    let mut headers = Headers::new();
-                    let mut total_delay = Duration::ZERO;
-                    let mut should_deliver = true;
 
                     for interceptor in &interceptors {
                         match interceptor.on_receive(
@@ -323,20 +352,17 @@ impl V2TestRuntime {
                             Disposition::Delay(d) => {
                                 total_delay += d;
                             }
-                            Disposition::Drop | Disposition::Reject(_) | Disposition::Retry(_) => {
-                                should_deliver = false;
+                            disp @ (Disposition::Drop | Disposition::Reject(_) | Disposition::Retry(_)) => {
+                                rejection = Some((interceptor.name().to_string(), disp));
                                 break;
                             }
                         }
                     }
+                }
 
-                    (should_deliver, total_delay)
-                };
-
-                if !should_deliver {
-                    // For ask: dropping the dispatch drops the oneshot sender,
-                    // so AskReply resolves to Err(RuntimeError::ActorNotFound).
-                    drop(dispatch);
+                // If rejected/dropped/retry, propagate proper error to caller
+                if let Some((interceptor_name, disposition)) = rejection {
+                    dispatch.reject(disposition, &interceptor_name);
                     continue;
                 }
 
@@ -345,23 +371,20 @@ impl V2TestRuntime {
                 }
 
                 // Dispatch the message
-                let send_mode = dispatch.send_mode();
                 let result =
                     std::panic::AssertUnwindSafe(dispatch.dispatch(&mut actor, &mut ctx))
                         .catch_unwind()
                         .await;
 
-                // Call on_complete for each interceptor, then send reply
+                // Build context for on_complete (reuse headers from on_receive)
                 let ictx = InboundContext {
                     actor_id: ctx.actor_id.clone(),
                     actor_name: &ctx.actor_name,
-                    message_type: "", // message consumed by dispatch
+                    message_type,
                     send_mode,
                     remote: false,
                     origin_node: None,
                 };
-                let runtime_headers = RuntimeHeaders::new();
-                let headers = Headers::new();
 
                 match result {
                     Ok(dispatch_result) => {
@@ -889,6 +912,85 @@ mod tests {
 
         let result = counter.ask(GetCount).unwrap().await;
         assert!(result.is_err(), "rejected ask should return Err");
+        match result.unwrap_err() {
+            RuntimeError::Rejected { interceptor, reason } => {
+                assert_eq!(interceptor, "reject-all");
+                assert_eq!(reason, "forbidden");
+            }
+            other => panic!("expected Rejected, got: {:?}", other),
+        }
+    }
+
+    // ── Disposition::Retry tests ─────────────────────────────
+
+    struct RetryInterceptor;
+    impl InboundInterceptor for RetryInterceptor {
+        fn name(&self) -> &'static str { "retry-later" }
+        fn on_receive(
+            &self, _ctx: &InboundContext<'_>, _rh: &RuntimeHeaders,
+            _h: &mut Headers, _msg: &dyn Any,
+        ) -> Disposition {
+            Disposition::Retry(Duration::from_millis(500))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disposition_retry_ask_returns_retry_after() {
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 42 },
+            SpawnOptions {
+                interceptors: vec![Box::new(RetryInterceptor)],
+            },
+        );
+
+        let result = counter.ask(GetCount).unwrap().await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RuntimeError::RetryAfter { interceptor, retry_after } => {
+                assert_eq!(interceptor, "retry-later");
+                assert_eq!(retry_after, Duration::from_millis(500));
+            }
+            other => panic!("expected RetryAfter, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disposition_retry_tell_silently_drops() {
+        let handler_count = Arc::new(AtomicU64::new(0));
+        let count_clone = handler_count.clone();
+
+        struct TrackActor { count: Arc<AtomicU64> }
+        impl Actor for TrackActor {
+            type Args = Arc<AtomicU64>;
+            type Deps = ();
+            fn create(args: Arc<AtomicU64>, _: ()) -> Self { TrackActor { count: args } }
+        }
+
+        struct TrackMsg;
+        impl Message for TrackMsg { type Reply = (); }
+
+        #[async_trait]
+        impl Handler<TrackMsg> for TrackActor {
+            async fn handle(&mut self, _msg: TrackMsg, _ctx: &mut ActorContext) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let actor = runtime.spawn_with_options::<TrackActor>(
+            "tracker",
+            count_clone,
+            SpawnOptions {
+                interceptors: vec![Box::new(RetryInterceptor)],
+            },
+        );
+
+        actor.tell(TrackMsg).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(handler_count.load(Ordering::SeqCst), 0, "handler should not be called when Retry");
     }
 
     #[tokio::test]
