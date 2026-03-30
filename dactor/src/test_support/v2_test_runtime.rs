@@ -56,7 +56,9 @@ where
 {
     async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) {
         let reply = actor.handle(self.msg, ctx).await;
-        let _ = self.reply_tx.send(reply);
+        if self.reply_tx.send(reply).is_err() {
+            tracing::debug!("ask reply dropped — caller may have timed out or been cancelled");
+        }
     }
 }
 

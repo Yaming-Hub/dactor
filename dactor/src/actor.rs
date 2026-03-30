@@ -194,7 +194,7 @@ impl<R> Future for AskReply<R> {
         match Pin::new(&mut self.rx).poll(cx) {
             Poll::Ready(Ok(reply)) => Poll::Ready(Ok(reply)),
             Poll::Ready(Err(_)) => Poll::Ready(Err(RuntimeError::ActorNotFound(
-                "actor stopped before replying".into(),
+                "reply channel closed — actor may have stopped, panicked, or the request was cancelled".into(),
             ))),
             Poll::Pending => Poll::Pending,
         }
