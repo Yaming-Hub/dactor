@@ -58,14 +58,32 @@ pub enum Disposition {
 }
 
 /// Outcome reported to interceptors after handler completion.
-#[derive(Debug)]
-pub enum Outcome {
-    /// Tell completed successfully (no reply).
-    Success,
-    /// Ask completed and reply was sent.
-    Replied,
+/// The reply (for ask) is type-erased — interceptors can downcast via
+/// `reply.downcast_ref::<ConcreteReply>()` if they know the type.
+pub enum Outcome<'a> {
+    /// Tell: handler returned successfully. No reply value.
+    TellSuccess,
+    /// Ask: handler returned a reply successfully.
+    /// The reply is type-erased for interceptor inspection.
+    AskSuccess { reply: &'a dyn Any },
     /// Handler returned an error or panicked.
     HandlerError { error: ActorError },
+    /// Stream completed normally (future use).
+    StreamCompleted { items_emitted: u64 },
+    /// Stream was cancelled (future use).
+    StreamCancelled { items_emitted: u64 },
+}
+
+impl<'a> std::fmt::Debug for Outcome<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TellSuccess => write!(f, "TellSuccess"),
+            Self::AskSuccess { .. } => write!(f, "AskSuccess"),
+            Self::HandlerError { error } => write!(f, "HandlerError({:?})", error),
+            Self::StreamCompleted { items_emitted } => write!(f, "StreamCompleted({})", items_emitted),
+            Self::StreamCancelled { items_emitted } => write!(f, "StreamCancelled({})", items_emitted),
+        }
+    }
 }
 
 /// An interceptor that observes or modifies inbound messages.
@@ -88,12 +106,13 @@ pub trait InboundInterceptor: Send + Sync + 'static {
     }
 
     /// Called after the handler finishes. Called exactly once per delivered message.
+    /// For ask, the `Outcome::AskSuccess` variant carries the type-erased reply.
     fn on_complete(
         &self,
         ctx: &InboundContext<'_>,
         runtime_headers: &RuntimeHeaders,
         headers: &Headers,
-        outcome: &Outcome,
+        outcome: &Outcome<'_>,
     ) {
         let _ = (ctx, runtime_headers, headers, outcome);
     }
@@ -151,10 +170,13 @@ mod tests {
 
     #[test]
     fn test_outcome_variants() {
-        let _ = Outcome::Success;
-        let _ = Outcome::Replied;
+        let _ = Outcome::TellSuccess;
+        let val = 42u64;
+        let _ = Outcome::AskSuccess { reply: &val };
         let _ = Outcome::HandlerError {
             error: ActorError::new("test"),
         };
+        let _ = Outcome::StreamCompleted { items_emitted: 10 };
+        let _ = Outcome::StreamCancelled { items_emitted: 5 };
     }
 }

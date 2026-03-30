@@ -29,7 +29,9 @@ use crate::node::{ActorId, NodeId};
 /// `TypedDispatch<M>` that knows how to invoke `Handler<M>::handle`.
 #[async_trait]
 trait Dispatch<A: Actor>: Send {
-    async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext);
+    /// Dispatch the message to the actor's handler.
+    /// Returns the type-erased reply for ask (Some), or None for tell.
+    async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) -> DispatchResult;
 
     /// The message as `&dyn Any` for interceptor inspection.
     fn message_any(&self) -> &dyn Any;
@@ -39,6 +41,27 @@ trait Dispatch<A: Actor>: Send {
 
     /// The message type name.
     fn message_type_name(&self) -> &'static str;
+}
+
+/// Result of dispatching a message, including the type-erased reply for ask.
+struct DispatchResult {
+    /// The type-erased reply value (Some for ask, None for tell).
+    reply: Option<Box<dyn Any + Send>>,
+    /// Oneshot sender to deliver the reply to the caller (Some for ask).
+    reply_sender: Option<Box<dyn FnOnce(Box<dyn Any + Send>) + Send>>,
+}
+
+impl DispatchResult {
+    fn tell() -> Self {
+        Self { reply: None, reply_sender: None }
+    }
+
+    /// Send the reply to the caller (for ask). Must be called after interceptors inspect it.
+    fn send_reply(self) {
+        if let (Some(reply), Some(sender)) = (self.reply, self.reply_sender) {
+            sender(reply);
+        }
+    }
 }
 
 struct TypedDispatch<M: Message> {
@@ -51,8 +74,9 @@ where
     A: Handler<M>,
     M: Message<Reply = ()>,
 {
-    async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) {
+    async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) -> DispatchResult {
         actor.handle(self.msg, ctx).await;
+        DispatchResult::tell()
     }
 
     fn message_any(&self) -> &dyn Any {
@@ -80,10 +104,19 @@ where
     A: Handler<M>,
     M: Message,
 {
-    async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) {
+    async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) -> DispatchResult {
         let reply = actor.handle(self.msg, ctx).await;
-        if self.reply_tx.send(reply).is_err() {
-            tracing::debug!("ask reply dropped — caller may have timed out or been cancelled");
+        let reply_any: Box<dyn Any + Send> = Box::new(reply);
+        let reply_tx = self.reply_tx;
+        DispatchResult {
+            reply: Some(reply_any),
+            reply_sender: Some(Box::new(move |boxed_reply| {
+                if let Ok(reply) = boxed_reply.downcast::<M::Reply>() {
+                    if reply_tx.send(*reply).is_err() {
+                        tracing::debug!("ask reply dropped — caller may have timed out or been cancelled");
+                    }
+                }
+            })),
         }
     }
 
@@ -318,38 +351,42 @@ impl V2TestRuntime {
                         .catch_unwind()
                         .await;
 
-                // Call on_complete for each interceptor
-                if !interceptors.is_empty() {
-                    let ictx = InboundContext {
-                        actor_id: ctx.actor_id.clone(),
-                        actor_name: &ctx.actor_name,
-                        message_type: "", // message consumed by dispatch
-                        send_mode,
-                        remote: false,
-                        origin_node: None,
-                    };
-                    let runtime_headers = RuntimeHeaders::new();
-                    let headers = Headers::new();
+                // Call on_complete for each interceptor, then send reply
+                let ictx = InboundContext {
+                    actor_id: ctx.actor_id.clone(),
+                    actor_name: &ctx.actor_name,
+                    message_type: "", // message consumed by dispatch
+                    send_mode,
+                    remote: false,
+                    origin_node: None,
+                };
+                let runtime_headers = RuntimeHeaders::new();
+                let headers = Headers::new();
 
-                    let outcome = if result.is_ok() {
-                        match send_mode {
-                            SendMode::Ask => Outcome::Replied,
-                            _ => Outcome::Success,
-                        }
-                    } else {
-                        Outcome::HandlerError {
-                            error: ActorError::new("handler panicked"),
-                        }
-                    };
+                match result {
+                    Ok(dispatch_result) => {
+                        let outcome = match (&dispatch_result.reply, send_mode) {
+                            (Some(reply), SendMode::Ask) => Outcome::AskSuccess { reply: reply.as_ref() },
+                            _ => Outcome::TellSuccess,
+                        };
 
-                    for interceptor in &interceptors {
-                        interceptor.on_complete(&ictx, &runtime_headers, &headers, &outcome);
+                        for interceptor in &interceptors {
+                            interceptor.on_complete(&ictx, &runtime_headers, &headers, &outcome);
+                        }
+
+                        // Send reply to caller AFTER interceptors have seen it
+                        dispatch_result.send_reply();
                     }
-                }
-
-                if result.is_err() {
-                    tracing::error!("handler panicked in actor {}", ctx.actor_name);
-                    break;
+                    Err(_panic) => {
+                        let outcome = Outcome::HandlerError {
+                            error: ActorError::new("handler panicked"),
+                        };
+                        for interceptor in &interceptors {
+                            interceptor.on_complete(&ictx, &runtime_headers, &headers, &outcome);
+                        }
+                        tracing::error!("handler panicked in actor {}", ctx.actor_name);
+                        break;
+                    }
                 }
             }
 
@@ -704,7 +741,7 @@ mod tests {
             _ctx: &InboundContext<'_>,
             _rh: &RuntimeHeaders,
             _h: &Headers,
-            outcome: &Outcome,
+            outcome: &Outcome<'_>,
         ) {
             self.log
                 .lock()
@@ -731,7 +768,7 @@ mod tests {
         let entries = log.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries[0].starts_with("on_receive:"));
-        assert!(entries[1].starts_with("on_complete:Success"));
+        assert!(entries[1].starts_with("on_complete:TellSuccess"));
     }
 
     #[tokio::test]
@@ -752,7 +789,7 @@ mod tests {
         let entries = log.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries[0].starts_with("on_receive:"));
-        assert!(entries[1].starts_with("on_complete:Replied"));
+        assert!(entries[1].starts_with("on_complete:AskSuccess"));
     }
 
     struct DropInterceptor;
