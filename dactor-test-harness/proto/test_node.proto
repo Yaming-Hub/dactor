@@ -1,0 +1,74 @@
+syntax = "proto3";
+package dactor.test.v1;
+
+service TestNodeService {
+    // Ping — verify the node is alive and the control channel works
+    rpc Ping(PingRequest) returns (PingResponse);
+
+    // Node info
+    rpc GetNodeInfo(Empty) returns (NodeInfoResponse);
+
+    // Shutdown
+    rpc Shutdown(ShutdownRequest) returns (Empty);
+
+    // Fault injection
+    rpc InjectFault(FaultRequest) returns (Empty);
+    rpc ClearFaults(Empty) returns (Empty);
+
+    // Event subscription (server-streaming)
+    rpc SubscribeEvents(EventFilter) returns (stream NodeEvent);
+
+    // Custom application commands
+    rpc CustomCommand(CustomRequest) returns (CustomResponse);
+}
+
+message Empty {}
+
+message PingRequest {
+    string echo = 1;
+}
+
+message PingResponse {
+    string echo = 1;
+    string node_id = 2;
+    uint64 uptime_ms = 3;
+}
+
+message NodeInfoResponse {
+    string node_id = 1;
+    uint64 uptime_ms = 2;
+    string adapter = 3;
+    uint32 actor_count = 4;
+}
+
+message ShutdownRequest {
+    bool graceful = 1;
+    uint64 timeout_ms = 2;
+}
+
+message FaultRequest {
+    string fault_type = 1;
+    string target = 2;
+    uint64 duration_ms = 3;
+    uint32 count = 4;
+    string detail = 5;
+}
+
+message EventFilter {
+    repeated string event_types = 1;
+}
+
+message NodeEvent {
+    string event_type = 1;
+    string detail = 2;
+    uint64 timestamp_ms = 3;
+}
+
+message CustomRequest {
+    string command_type = 1;
+    bytes payload = 2;
+}
+
+message CustomResponse {
+    bytes payload = 1;
+}

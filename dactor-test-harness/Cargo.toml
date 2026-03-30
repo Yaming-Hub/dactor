@@ -1,0 +1,25 @@
+[package]
+name = "dactor-test-harness"
+version = "0.2.0"
+edition = "2021"
+description = "Multi-process integration test harness for dactor actor framework"
+license = "MIT"
+repository = "https://github.com/Yaming-Hub/dactor"
+
+[dependencies]
+dactor = { version = "0.2.0", path = "../dactor" }
+tonic = "0.13"
+prost = "0.13"
+tokio = { version = "1", features = ["process", "sync", "rt", "rt-multi-thread", "time", "net", "macros", "io-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+dashmap = "6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+tonic-build = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
