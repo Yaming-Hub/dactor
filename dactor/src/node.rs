@@ -24,7 +24,7 @@ impl From<String> for NodeId {
 }
 
 /// Globally unique identifier for an actor across all nodes in a cluster.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ActorId {
     /// The node that spawned this actor.

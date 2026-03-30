@@ -42,6 +42,7 @@ pub mod prelude {
 }
 
 // Backward-compatible re-exports at crate root
+pub use async_trait::async_trait;
 pub use actor::{ActorRef, ActorRuntime};
 pub use actor::{Actor, ActorContext, ActorError, SpawnConfig};
 pub use errors::{ActorSendError, ClusterError, GroupError};

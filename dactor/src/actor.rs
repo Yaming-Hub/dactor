@@ -1,6 +1,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use crate::cluster::ClusterEvents;
 use crate::errors::{ActorSendError, ErrorAction, GroupError};
 use crate::node::ActorId;
@@ -100,7 +102,8 @@ pub trait ActorRuntime: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 
 /// Stub error type for actor errors — will be expanded in a later PR.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ActorError {
     pub message: String,
 }
@@ -121,6 +124,7 @@ impl std::error::Error for ActorError {}
 
 /// Context passed to actor lifecycle hooks and handlers.
 /// Will be expanded in later PRs with headers, send_mode, etc.
+#[derive(Debug, Clone)]
 pub struct ActorContext {
     pub actor_id: ActorId,
     pub actor_name: String,
@@ -131,23 +135,24 @@ pub struct ActorContext {
 ///
 /// This is the v0.2 Actor API — distinct from the v0.1 `ActorRef<M>` / `ActorRuntime`
 /// traits which remain for backward compatibility.
+#[async_trait]
 pub trait Actor: Send + 'static {
     /// Serializable construction arguments.
-    /// Defaults to `Self` for simple actors.
     type Args: Send + 'static;
 
     /// Local dependencies — non-serializable, resolved at target node.
-    /// Defaults to `()` for actors with no local dependencies.
     type Deps: Send + 'static;
 
     /// Construct the actor from args and deps.
     fn create(args: Self::Args, deps: Self::Deps) -> Self where Self: Sized;
 
     /// Called after spawn, before any messages. Default: no-op.
-    fn on_start(&mut self, _ctx: &mut ActorContext) {}
+    /// Use for async initialization, resource acquisition, subscriptions.
+    async fn on_start(&mut self, _ctx: &mut ActorContext) {}
 
     /// Called when the actor is stopping. Default: no-op.
-    fn on_stop(&mut self) {}
+    /// Use for cleanup, resource release, flushing buffers.
+    async fn on_stop(&mut self) {}
 
     /// Called on handler error/panic. Returns what to do next.
     fn on_error(&mut self, _error: &ActorError) -> ErrorAction {
@@ -157,7 +162,7 @@ pub trait Actor: Send + 'static {
 
 /// Configuration for spawning an actor. All fields have defaults
 /// matching v0.1 behavior (unbounded mailbox, no interceptors, local spawn).
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SpawnConfig {
     // Will be expanded in later PRs with:
     // - mailbox: MailboxConfig
@@ -273,15 +278,15 @@ mod tests {
     }
 
     // Test: on_start / on_stop defaults are no-ops
-    #[test]
-    fn test_lifecycle_defaults_are_noop() {
+    #[tokio::test]
+    async fn test_lifecycle_defaults_are_noop() {
         let mut counter = Counter { count: 42 };
         let mut ctx = ActorContext {
             actor_id: ActorId { node: NodeId("n1".into()), local: 1 },
             actor_name: "counter".into(),
         };
-        counter.on_start(&mut ctx);
-        counter.on_stop();
+        counter.on_start(&mut ctx).await;
+        counter.on_stop().await;
         assert_eq!(counter.count, 42);
     }
 }
