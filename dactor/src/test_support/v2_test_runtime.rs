@@ -4,16 +4,21 @@
 //! Actors are spawned on the Tokio runtime and process messages sequentially
 //! via an unbounded channel.
 
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::FutureExt;
 use tokio::sync::mpsc;
 
-use crate::actor::{Actor, ActorContext, AskReply, Handler, TypedActorRef};
+use crate::actor::{Actor, ActorContext, ActorError, AskReply, Handler, TypedActorRef};
 use crate::errors::ActorSendError;
-use crate::message::Message;
+use crate::interceptor::{
+    Disposition, InboundContext, InboundInterceptor, Outcome, SendMode,
+};
+use crate::message::{Headers, Message, RuntimeHeaders};
 use crate::node::{ActorId, NodeId};
 
 // ---------------------------------------------------------------------------
@@ -25,6 +30,15 @@ use crate::node::{ActorId, NodeId};
 #[async_trait]
 trait Dispatch<A: Actor>: Send {
     async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext);
+
+    /// The message as `&dyn Any` for interceptor inspection.
+    fn message_any(&self) -> &dyn Any;
+
+    /// The send mode (Tell or Ask).
+    fn send_mode(&self) -> SendMode;
+
+    /// The message type name.
+    fn message_type_name(&self) -> &'static str;
 }
 
 struct TypedDispatch<M: Message> {
@@ -39,6 +53,18 @@ where
 {
     async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) {
         actor.handle(self.msg, ctx).await;
+    }
+
+    fn message_any(&self) -> &dyn Any {
+        &self.msg
+    }
+
+    fn send_mode(&self) -> SendMode {
+        SendMode::Tell
+    }
+
+    fn message_type_name(&self) -> &'static str {
+        std::any::type_name::<M>()
     }
 }
 
@@ -60,9 +86,38 @@ where
             tracing::debug!("ask reply dropped — caller may have timed out or been cancelled");
         }
     }
+
+    fn message_any(&self) -> &dyn Any {
+        &self.msg
+    }
+
+    fn send_mode(&self) -> SendMode {
+        SendMode::Ask
+    }
+
+    fn message_type_name(&self) -> &'static str {
+        std::any::type_name::<M>()
+    }
 }
 
 type BoxedDispatch<A> = Box<dyn Dispatch<A>>;
+
+// ---------------------------------------------------------------------------
+// SpawnOptions
+// ---------------------------------------------------------------------------
+
+/// Options for spawning an actor, including the inbound interceptor pipeline.
+pub struct SpawnOptions {
+    pub interceptors: Vec<Box<dyn InboundInterceptor>>,
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        Self {
+            interceptors: Vec::new(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // V2ActorRef
@@ -151,11 +206,37 @@ impl V2TestRuntime {
     where
         A: Actor<Deps = ()> + 'static,
     {
-        self.spawn_with_deps(name, args, ())
+        self.spawn_internal(name, args, (), Vec::new())
     }
 
     /// Spawn a v0.2 actor with explicit dependencies.
     pub fn spawn_with_deps<A>(&self, name: &str, args: A::Args, deps: A::Deps) -> V2ActorRef<A>
+    where
+        A: Actor + 'static,
+    {
+        self.spawn_internal(name, args, deps, Vec::new())
+    }
+
+    /// Spawn a v0.2 actor with spawn options (including interceptors).
+    pub fn spawn_with_options<A>(
+        &self,
+        name: &str,
+        args: A::Args,
+        options: SpawnOptions,
+    ) -> V2ActorRef<A>
+    where
+        A: Actor<Deps = ()> + 'static,
+    {
+        self.spawn_internal(name, args, (), options.interceptors)
+    }
+
+    fn spawn_internal<A>(
+        &self,
+        name: &str,
+        args: A::Args,
+        deps: A::Deps,
+        interceptors: Vec<Box<dyn InboundInterceptor>>,
+    ) -> V2ActorRef<A>
     where
         A: Actor + 'static,
     {
@@ -183,10 +264,89 @@ impl V2TestRuntime {
             actor.on_start(&mut ctx).await;
 
             while let Some(dispatch) = rx.recv().await {
-                // Catch panics in handlers to ensure on_stop is always called
-                let result = std::panic::AssertUnwindSafe(dispatch.dispatch(&mut actor, &mut ctx))
-                    .catch_unwind()
-                    .await;
+                // Run inbound interceptor pipeline
+                let (should_deliver, total_delay) = {
+                    let ictx = InboundContext {
+                        actor_id: ctx.actor_id.clone(),
+                        actor_name: &ctx.actor_name,
+                        message_type: dispatch.message_type_name(),
+                        send_mode: dispatch.send_mode(),
+                        remote: false,
+                        origin_node: None,
+                    };
+                    let runtime_headers = RuntimeHeaders::new();
+                    let mut headers = Headers::new();
+                    let mut total_delay = Duration::ZERO;
+                    let mut should_deliver = true;
+
+                    for interceptor in &interceptors {
+                        match interceptor.on_receive(
+                            &ictx,
+                            &runtime_headers,
+                            &mut headers,
+                            dispatch.message_any(),
+                        ) {
+                            Disposition::Continue => {}
+                            Disposition::Delay(d) => {
+                                total_delay += d;
+                            }
+                            Disposition::Drop | Disposition::Reject(_) => {
+                                should_deliver = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    (should_deliver, total_delay)
+                };
+
+                if !should_deliver {
+                    // For ask: dropping the dispatch drops the oneshot sender,
+                    // so AskReply resolves to Err(RuntimeError::ActorNotFound).
+                    drop(dispatch);
+                    continue;
+                }
+
+                if !total_delay.is_zero() {
+                    tokio::time::sleep(total_delay).await;
+                }
+
+                // Dispatch the message
+                let send_mode = dispatch.send_mode();
+                let result =
+                    std::panic::AssertUnwindSafe(dispatch.dispatch(&mut actor, &mut ctx))
+                        .catch_unwind()
+                        .await;
+
+                // Call on_complete for each interceptor
+                if !interceptors.is_empty() {
+                    let ictx = InboundContext {
+                        actor_id: ctx.actor_id.clone(),
+                        actor_name: &ctx.actor_name,
+                        message_type: "", // message consumed by dispatch
+                        send_mode,
+                        remote: false,
+                        origin_node: None,
+                    };
+                    let runtime_headers = RuntimeHeaders::new();
+                    let headers = Headers::new();
+
+                    let outcome = if result.is_ok() {
+                        match send_mode {
+                            SendMode::Ask => Outcome::Replied,
+                            _ => Outcome::Success,
+                        }
+                    } else {
+                        Outcome::HandlerError {
+                            error: ActorError::new("handler panicked"),
+                        }
+                    };
+
+                    for interceptor in &interceptors {
+                        interceptor.on_complete(&ictx, &runtime_headers, &headers, &outcome);
+                    }
+                }
+
                 if result.is_err() {
                     tracing::error!("handler panicked in actor {}", ctx.actor_name);
                     break;
@@ -510,5 +670,515 @@ mod tests {
 
         let c3 = counter.ask(GetCount).unwrap().await.unwrap();
         assert_eq!(c3, 0);
+    }
+
+    // -- Interceptor tests --------------------------------------------------
+
+    use std::sync::Mutex;
+
+    struct LogInterceptor {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl InboundInterceptor for LogInterceptor {
+        fn name(&self) -> &'static str {
+            "log"
+        }
+
+        fn on_receive(
+            &self,
+            ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _h: &mut Headers,
+            _msg: &dyn Any,
+        ) -> Disposition {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("on_receive:{}", ctx.message_type));
+            Disposition::Continue
+        }
+
+        fn on_complete(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _h: &Headers,
+            outcome: &Outcome,
+        ) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("on_complete:{:?}", outcome));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_interceptor_on_receive_and_on_complete_called() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 0 },
+            SpawnOptions {
+                interceptors: vec![Box::new(LogInterceptor { log: log.clone() })],
+            },
+        );
+
+        counter.tell(Increment(5)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].starts_with("on_receive:"));
+        assert!(entries[1].starts_with("on_complete:Success"));
+    }
+
+    #[tokio::test]
+    async fn test_interceptor_on_complete_replied_for_ask() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 42 },
+            SpawnOptions {
+                interceptors: vec![Box::new(LogInterceptor { log: log.clone() })],
+            },
+        );
+
+        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        assert_eq!(count, 42);
+
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].starts_with("on_receive:"));
+        assert!(entries[1].starts_with("on_complete:Replied"));
+    }
+
+    struct DropInterceptor;
+
+    impl InboundInterceptor for DropInterceptor {
+        fn name(&self) -> &'static str {
+            "drop-all"
+        }
+
+        fn on_receive(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _h: &mut Headers,
+            _msg: &dyn Any,
+        ) -> Disposition {
+            Disposition::Drop
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disposition_drop_prevents_handler() {
+        // Use a shared counter to verify the handler was never called
+        let handle_count = Arc::new(AtomicU64::new(0));
+        let handle_count_clone = handle_count.clone();
+
+        struct CountingActor {
+            handle_count: Arc<AtomicU64>,
+        }
+
+        impl Actor for CountingActor {
+            type Args = Arc<AtomicU64>;
+            type Deps = ();
+            fn create(args: Arc<AtomicU64>, _deps: ()) -> Self {
+                CountingActor { handle_count: args }
+            }
+        }
+
+        struct Ping;
+        impl Message for Ping {
+            type Reply = ();
+        }
+
+        #[async_trait]
+        impl Handler<Ping> for CountingActor {
+            async fn handle(&mut self, _msg: Ping, _ctx: &mut ActorContext) {
+                self.handle_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let actor = runtime.spawn_with_options::<CountingActor>(
+            "counting",
+            handle_count_clone,
+            SpawnOptions {
+                interceptors: vec![Box::new(DropInterceptor)],
+            },
+        );
+
+        actor.tell(Ping).unwrap();
+        actor.tell(Ping).unwrap();
+        actor.tell(Ping).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(handle_count.load(Ordering::SeqCst), 0, "handler should not have been called");
+        assert!(actor.is_alive(), "actor should still be alive after drops");
+    }
+
+    struct RejectInterceptor;
+
+    impl InboundInterceptor for RejectInterceptor {
+        fn name(&self) -> &'static str {
+            "reject-all"
+        }
+
+        fn on_receive(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _h: &mut Headers,
+            _msg: &dyn Any,
+        ) -> Disposition {
+            Disposition::Reject("forbidden".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disposition_reject_ask_returns_error() {
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 42 },
+            SpawnOptions {
+                interceptors: vec![Box::new(RejectInterceptor)],
+            },
+        );
+
+        let result = counter.ask(GetCount).unwrap().await;
+        assert!(result.is_err(), "rejected ask should return Err");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_interceptors_execute_in_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+
+        struct OrderedInterceptor {
+            id: u32,
+            log: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl InboundInterceptor for OrderedInterceptor {
+            fn name(&self) -> &'static str {
+                "ordered"
+            }
+
+            fn on_receive(
+                &self,
+                _ctx: &InboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("interceptor-{}", self.id));
+                Disposition::Continue
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 0 },
+            SpawnOptions {
+                interceptors: vec![
+                    Box::new(OrderedInterceptor {
+                        id: 1,
+                        log: log.clone(),
+                    }),
+                    Box::new(OrderedInterceptor {
+                        id: 2,
+                        log: log.clone(),
+                    }),
+                    Box::new(OrderedInterceptor {
+                        id: 3,
+                        log: log.clone(),
+                    }),
+                ],
+            },
+        );
+
+        counter.tell(Increment(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], "interceptor-1");
+        assert_eq!(entries[1], "interceptor-2");
+        assert_eq!(entries[2], "interceptor-3");
+    }
+
+    #[tokio::test]
+    async fn test_drop_interceptor_short_circuits_chain() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+
+        struct LabelInterceptor {
+            label: &'static str,
+            log: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl InboundInterceptor for LabelInterceptor {
+            fn name(&self) -> &'static str {
+                self.label
+            }
+
+            fn on_receive(
+                &self,
+                _ctx: &InboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                self.log.lock().unwrap().push(self.label.to_string());
+                Disposition::Continue
+            }
+        }
+
+        struct DropAtSecond;
+
+        impl InboundInterceptor for DropAtSecond {
+            fn name(&self) -> &'static str {
+                "drop-at-second"
+            }
+
+            fn on_receive(
+                &self,
+                _ctx: &InboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                Disposition::Drop
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 0 },
+            SpawnOptions {
+                interceptors: vec![
+                    Box::new(LabelInterceptor {
+                        label: "first",
+                        log: log.clone(),
+                    }),
+                    Box::new(DropAtSecond),
+                    Box::new(LabelInterceptor {
+                        label: "third",
+                        log: log.clone(),
+                    }),
+                ],
+            },
+        );
+
+        counter.tell(Increment(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let entries = log.lock().unwrap();
+        // Only the first interceptor should have been called (second drops, third skipped)
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], "first");
+    }
+
+    #[tokio::test]
+    async fn test_disposition_delay() {
+        struct DelayInterceptor;
+
+        impl InboundInterceptor for DelayInterceptor {
+            fn name(&self) -> &'static str {
+                "delay"
+            }
+
+            fn on_receive(
+                &self,
+                _ctx: &InboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                Disposition::Delay(Duration::from_millis(100))
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 0 },
+            SpawnOptions {
+                interceptors: vec![Box::new(DelayInterceptor)],
+            },
+        );
+
+        let start = tokio::time::Instant::now();
+        counter.tell(Increment(1)).unwrap();
+
+        // Ask blocks until tell+ask are both processed (sequentially, both delayed)
+        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(count, 1);
+        // Both the tell and the ask were delayed by 100ms each
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "expected cumulative delay, got {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cumulative_delays_from_multiple_interceptors() {
+        struct SmallDelay(u64);
+
+        impl InboundInterceptor for SmallDelay {
+            fn name(&self) -> &'static str {
+                "small-delay"
+            }
+
+            fn on_receive(
+                &self,
+                _ctx: &InboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                Disposition::Delay(Duration::from_millis(self.0))
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 0 },
+            SpawnOptions {
+                interceptors: vec![
+                    Box::new(SmallDelay(50)),
+                    Box::new(SmallDelay(50)),
+                ],
+            },
+        );
+
+        let start = tokio::time::Instant::now();
+        // Use ask to block until message is processed
+        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(count, 0);
+        // 50ms + 50ms = 100ms cumulative delay
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "expected ~100ms cumulative delay, got {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_interceptors_existing_behavior_unchanged() {
+        // Existing spawn() path should work identically
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+
+        counter.tell(Increment(10)).unwrap();
+        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        assert_eq!(count, 10);
+    }
+
+    #[tokio::test]
+    async fn test_interceptor_can_inspect_message_type() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+
+        struct TypeLogInterceptor {
+            log: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl InboundInterceptor for TypeLogInterceptor {
+            fn name(&self) -> &'static str {
+                "type-log"
+            }
+
+            fn on_receive(
+                &self,
+                ctx: &InboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:{:?}", ctx.message_type, ctx.send_mode));
+                Disposition::Continue
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 0 },
+            SpawnOptions {
+                interceptors: vec![Box::new(TypeLogInterceptor { log: log.clone() })],
+            },
+        );
+
+        counter.tell(Increment(1)).unwrap();
+        let _ = counter.ask(GetCount).unwrap().await.unwrap();
+
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        // First message is Tell, second is Ask
+        assert!(entries[0].contains("Tell"), "got: {}", entries[0]);
+        assert!(entries[1].contains("Ask"), "got: {}", entries[1]);
+    }
+
+    #[tokio::test]
+    async fn test_interceptor_can_downcast_message() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+
+        struct DowncastInterceptor {
+            captured: Arc<Mutex<Vec<u64>>>,
+        }
+
+        impl InboundInterceptor for DowncastInterceptor {
+            fn name(&self) -> &'static str {
+                "downcast"
+            }
+
+            fn on_receive(
+                &self,
+                _ctx: &InboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                msg: &dyn Any,
+            ) -> Disposition {
+                if let Some(inc) = msg.downcast_ref::<Increment>() {
+                    self.captured.lock().unwrap().push(inc.0);
+                }
+                Disposition::Continue
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 0 },
+            SpawnOptions {
+                interceptors: vec![Box::new(DowncastInterceptor {
+                    captured: captured.clone(),
+                })],
+            },
+        );
+
+        counter.tell(Increment(42)).unwrap();
+        counter.tell(Increment(7)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let values = captured.lock().unwrap();
+        assert_eq!(*values, vec![42, 7]);
     }
 }
