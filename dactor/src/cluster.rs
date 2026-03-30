@@ -3,6 +3,7 @@ use crate::node::NodeId;
 
 /// Events emitted by the cluster membership system.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ClusterEvent {
     NodeJoined(NodeId),
     NodeLeft(NodeId),
@@ -11,6 +12,7 @@ pub enum ClusterEvent {
 /// Opaque handle returned by [`ClusterEvents::subscribe`], used to cancel
 /// a subscription via [`ClusterEvents::unsubscribe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SubscriptionId(pub(crate) u64);
 
 impl SubscriptionId {

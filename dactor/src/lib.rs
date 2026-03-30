@@ -48,3 +48,7 @@ pub use cluster::{ClusterEvent, ClusterEvents, SubscriptionId};
 pub use timer::TimerHandle;
 pub use clock::{Clock, SystemClock};
 pub use node::NodeId;
+
+// Backward-compatible re-export of TestClock (feature-gated)
+#[cfg(feature = "test-support")]
+pub use test_support::test_clock::TestClock;
