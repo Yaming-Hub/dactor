@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use tokio::sync::mpsc;
 
 use crate::actor::{Actor, ActorContext, Handler, TypedActorRef};
@@ -146,11 +147,19 @@ impl V2TestRuntime {
             actor.on_start(&mut ctx).await;
 
             while let Some(dispatch) = rx.recv().await {
-                dispatch.dispatch(&mut actor, &mut ctx).await;
+                // Catch panics in handlers to ensure on_stop is always called
+                let result = std::panic::AssertUnwindSafe(dispatch.dispatch(&mut actor, &mut ctx))
+                    .catch_unwind()
+                    .await;
+                if result.is_err() {
+                    tracing::error!("handler panicked in actor {}", ctx.actor_name);
+                    break;
+                }
             }
 
-            actor.on_stop().await;
+            // Set alive=false BEFORE on_stop to avoid is_alive race condition
             alive_task.store(false, Ordering::SeqCst);
+            actor.on_stop().await;
         });
 
         V2ActorRef {
