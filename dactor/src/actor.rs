@@ -5,6 +5,7 @@ use async_trait::async_trait;
 
 use crate::cluster::ClusterEvents;
 use crate::errors::{ActorSendError, ErrorAction, GroupError};
+use crate::message::Message;
 use crate::node::ActorId;
 use crate::timer::TimerHandle;
 
@@ -160,6 +161,32 @@ pub trait Actor: Send + 'static {
     }
 }
 
+/// Implemented by an actor for each message type it can handle.
+/// One impl per (Actor, Message) pair. Sequential execution guaranteed.
+#[async_trait]
+pub trait Handler<M: Message>: Actor {
+    /// Handle the message and return a reply.
+    async fn handle(&mut self, msg: M, ctx: &mut ActorContext) -> M::Reply;
+}
+
+/// A reference to a running actor of type `A` (v0.2 API).
+///
+/// Unlike v0.1 `ActorRef<M>` which is typed to the message,
+/// `TypedActorRef<A>` is typed to the actor struct. This enables
+/// sending any message type `M` where `A: Handler<M>`.
+///
+/// Note: `tell()` and `ask()` will be added in later PRs.
+pub trait TypedActorRef<A: Actor>: Clone + Send + Sync + 'static {
+    /// The actor's unique identity.
+    fn id(&self) -> ActorId;
+
+    /// The actor's name (as given to spawn).
+    fn name(&self) -> &str;
+
+    /// Check if the actor is still alive.
+    fn is_alive(&self) -> bool;
+}
+
 /// Configuration for spawning an actor. All fields have defaults
 /// matching v0.1 behavior (unbounded mailbox, no interceptors, local spawn).
 #[derive(Debug, Clone, Default)]
@@ -174,6 +201,7 @@ pub struct SpawnConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Message;
     use crate::node::{NodeId, ActorId};
     use crate::errors::ErrorAction;
 
@@ -185,6 +213,46 @@ mod tests {
         type Deps = ();
 
         fn create(args: Self, _deps: ()) -> Self { args }
+    }
+
+    // ── Message definitions ───────────────────────────
+    struct Increment(u64);
+    impl Message for Increment {
+        type Reply = ();
+    }
+
+    struct GetCount;
+    impl Message for GetCount {
+        type Reply = u64;
+    }
+
+    struct Reset;
+    impl Message for Reset {
+        type Reply = u64;
+    }
+
+    // ── Handler implementations ───────────────────────
+    #[async_trait]
+    impl Handler<Increment> for Counter {
+        async fn handle(&mut self, msg: Increment, _ctx: &mut ActorContext) {
+            self.count += msg.0;
+        }
+    }
+
+    #[async_trait]
+    impl Handler<GetCount> for Counter {
+        async fn handle(&mut self, _msg: GetCount, _ctx: &mut ActorContext) -> u64 {
+            self.count
+        }
+    }
+
+    #[async_trait]
+    impl Handler<Reset> for Counter {
+        async fn handle(&mut self, _msg: Reset, _ctx: &mut ActorContext) -> u64 {
+            let old = self.count;
+            self.count = 0;
+            old
+        }
     }
 
     #[test]
@@ -288,5 +356,70 @@ mod tests {
         counter.on_start(&mut ctx).await;
         counter.on_stop().await;
         assert_eq!(counter.count, 42);
+    }
+
+    // ── Handler tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_handler_increment() {
+        let mut counter = Counter { count: 0 };
+        let mut ctx = ActorContext {
+            actor_id: ActorId { node: NodeId("n1".into()), local: 1 },
+            actor_name: "counter".into(),
+        };
+        counter.handle(Increment(5), &mut ctx).await;
+        assert_eq!(counter.count, 5);
+        counter.handle(Increment(3), &mut ctx).await;
+        assert_eq!(counter.count, 8);
+    }
+
+    #[tokio::test]
+    async fn test_handler_get_count() {
+        let mut counter = Counter { count: 42 };
+        let mut ctx = ActorContext {
+            actor_id: ActorId { node: NodeId("n1".into()), local: 1 },
+            actor_name: "counter".into(),
+        };
+        let count = counter.handle(GetCount, &mut ctx).await;
+        assert_eq!(count, 42);
+    }
+
+    #[tokio::test]
+    async fn test_handler_reset() {
+        let mut counter = Counter { count: 100 };
+        let mut ctx = ActorContext {
+            actor_id: ActorId { node: NodeId("n1".into()), local: 1 },
+            actor_name: "counter".into(),
+        };
+        let old = counter.handle(Reset, &mut ctx).await;
+        assert_eq!(old, 100);
+        assert_eq!(counter.count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_handlers_on_same_actor() {
+        let mut counter = Counter { count: 0 };
+        let mut ctx = ActorContext {
+            actor_id: ActorId { node: NodeId("n1".into()), local: 1 },
+            actor_name: "counter".into(),
+        };
+
+        counter.handle(Increment(10), &mut ctx).await;
+        counter.handle(Increment(20), &mut ctx).await;
+
+        let count = counter.handle(GetCount, &mut ctx).await;
+        assert_eq!(count, 30);
+
+        let old = counter.handle(Reset, &mut ctx).await;
+        assert_eq!(old, 30);
+        assert_eq!(counter.count, 0);
+    }
+
+    #[test]
+    fn test_handler_requires_actor_bound() {
+        fn assert_handler<A: Handler<M>, M: Message>() {}
+        assert_handler::<Counter, Increment>();
+        assert_handler::<Counter, GetCount>();
+        assert_handler::<Counter, Reset>();
     }
 }
