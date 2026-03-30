@@ -181,7 +181,7 @@ pub trait TypedActorRef<A: Actor>: Clone + Send + Sync + 'static {
     fn id(&self) -> ActorId;
 
     /// The actor's name (as given to spawn).
-    fn name(&self) -> &str;
+    fn name(&self) -> String;
 
     /// Check if the actor is still alive.
     fn is_alive(&self) -> bool;
