@@ -118,6 +118,55 @@ pub trait InboundInterceptor: Send + Sync + 'static {
     }
 }
 
+/// Metadata about the outbound message, provided to outbound interceptors.
+pub struct OutboundContext<'a> {
+    /// The target actor's ID.
+    pub target_id: ActorId,
+    /// The target actor's name.
+    pub target_name: &'a str,
+    /// The Rust type name of the message.
+    pub message_type: &'static str,
+    /// How the message is being sent.
+    pub send_mode: SendMode,
+    /// Whether the target is on a remote node.
+    pub remote: bool,
+}
+
+/// An outbound interceptor that runs on the SENDER side before the message
+/// is delivered to the target actor's mailbox.
+///
+/// Use cases: tracing context propagation, rate limiting, circuit breaking,
+/// header stamping, metrics, logging.
+pub trait OutboundInterceptor: Send + Sync + 'static {
+    /// Human-readable name.
+    fn name(&self) -> &'static str;
+
+    /// Called before the message is sent. Can modify headers, delay, reject,
+    /// or retry. The message body is provided as `&dyn Any` for inspection.
+    fn on_send(
+        &self,
+        ctx: &OutboundContext<'_>,
+        runtime_headers: &RuntimeHeaders,
+        headers: &mut Headers,
+        message: &dyn Any,
+    ) -> Disposition {
+        let _ = (ctx, runtime_headers, headers, message);
+        Disposition::Continue
+    }
+
+    /// Called when an ask() reply is received back on the sender side.
+    /// The reply is type-erased — downcast if you know the type.
+    fn on_reply(
+        &self,
+        ctx: &OutboundContext<'_>,
+        runtime_headers: &RuntimeHeaders,
+        headers: &Headers,
+        outcome: &Outcome<'_>,
+    ) {
+        let _ = (ctx, runtime_headers, headers, outcome);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

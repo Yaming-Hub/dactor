@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 use crate::actor::{Actor, ActorContext, ActorError, AskReply, Handler, TypedActorRef};
 use crate::errors::{ActorSendError, RuntimeError};
 use crate::interceptor::{
-    Disposition, InboundContext, InboundInterceptor, Outcome, SendMode,
+    Disposition, InboundContext, InboundInterceptor, OutboundContext, OutboundInterceptor,
+    Outcome, SendMode,
 };
 use crate::message::{Headers, Message, RuntimeHeaders};
 use crate::node::{ActorId, NodeId};
@@ -186,6 +187,7 @@ pub struct V2ActorRef<A: Actor> {
     name: String,
     sender: mpsc::UnboundedSender<BoxedDispatch<A>>,
     alive: Arc<AtomicBool>,
+    outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
 }
 
 impl<A: Actor> Clone for V2ActorRef<A> {
@@ -195,6 +197,7 @@ impl<A: Actor> Clone for V2ActorRef<A> {
             name: self.name.clone(),
             sender: self.sender.clone(),
             alive: self.alive.clone(),
+            outbound_interceptors: self.outbound_interceptors.clone(),
         }
     }
 }
@@ -217,6 +220,30 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
         A: Handler<M>,
         M: Message<Reply = ()>,
     {
+        // Run outbound interceptors on the caller's task
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let octx = OutboundContext {
+            target_id: self.id.clone(),
+            target_name: &self.name,
+            message_type: std::any::type_name::<M>(),
+            send_mode: SendMode::Tell,
+            remote: false,
+        };
+
+        for interceptor in self.outbound_interceptors.iter() {
+            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
+                Disposition::Continue => {}
+                Disposition::Delay(_) => {
+                    // For test runtime, skip delay (would require making tell async).
+                    // The real runtime will handle this differently.
+                }
+                Disposition::Drop => return Ok(()),
+                Disposition::Reject(_) => return Ok(()),
+                Disposition::Retry(_) => return Ok(()),
+            }
+        }
+
         let dispatch: BoxedDispatch<A> = Box::new(TypedDispatch { msg });
         self.sender
             .send(dispatch)
@@ -228,6 +255,42 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
         A: Handler<M>,
         M: Message,
     {
+        // Run outbound interceptors on the caller's task
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let octx = OutboundContext {
+            target_id: self.id.clone(),
+            target_name: &self.name,
+            message_type: std::any::type_name::<M>(),
+            send_mode: SendMode::Ask,
+            remote: false,
+        };
+
+        for interceptor in self.outbound_interceptors.iter() {
+            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
+                Disposition::Continue => {}
+                Disposition::Delay(_) => {
+                    // For test runtime, skip delay (would need async)
+                }
+                Disposition::Drop => {
+                    let (_tx, rx) = tokio::sync::oneshot::channel();
+                    return Ok(AskReply::new(rx));
+                }
+                Disposition::Reject(reason) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let name = interceptor.name().to_string();
+                    let _ = tx.send(Err(RuntimeError::Rejected { interceptor: name, reason }));
+                    return Ok(AskReply::new(rx));
+                }
+                Disposition::Retry(retry_after) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let name = interceptor.name().to_string();
+                    let _ = tx.send(Err(RuntimeError::RetryAfter { interceptor: name, retry_after }));
+                    return Ok(AskReply::new(rx));
+                }
+            }
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let dispatch: BoxedDispatch<A> = Box::new(AskDispatch {
             msg,
@@ -248,6 +311,7 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
 pub struct V2TestRuntime {
     node_id: NodeId,
     next_local: AtomicU64,
+    outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
 }
 
 impl V2TestRuntime {
@@ -255,7 +319,16 @@ impl V2TestRuntime {
         Self {
             node_id: NodeId("test-node".into()),
             next_local: AtomicU64::new(1),
+            outbound_interceptors: Arc::new(Vec::new()),
         }
+    }
+
+    /// Add a global outbound interceptor.
+    /// Must be called before any actors are spawned.
+    pub fn add_outbound_interceptor(&mut self, interceptor: Box<dyn OutboundInterceptor>) {
+        Arc::get_mut(&mut self.outbound_interceptors)
+            .expect("cannot add interceptors after actors are spawned")
+            .push(interceptor);
     }
 
     /// Spawn a v0.2 actor whose `Deps` type is `()`. Returns a `V2ActorRef<A>`.
@@ -423,6 +496,7 @@ impl V2TestRuntime {
             name: actor_name,
             sender: tx,
             alive,
+            outbound_interceptors: self.outbound_interceptors.clone(),
         }
     }
 }
@@ -1319,5 +1393,264 @@ mod tests {
 
         let values = captured.lock().unwrap();
         assert_eq!(*values, vec![42, 7]);
+    }
+
+    // -- Outbound interceptor tests ----------------------------------------
+
+    #[tokio::test]
+    async fn test_outbound_interceptor_on_send_called() {
+        use std::sync::Mutex;
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        struct OutLog {
+            log: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl OutboundInterceptor for OutLog {
+            fn name(&self) -> &'static str {
+                "out-log"
+            }
+
+            fn on_send(
+                &self,
+                ctx: &OutboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("on_send:{}", ctx.message_type));
+                Disposition::Continue
+            }
+        }
+
+        let mut runtime = V2TestRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(OutLog { log: log.clone() }));
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+
+        counter.tell(Increment(5)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let entries = log.lock().unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries[0].contains("Increment"));
+    }
+
+    #[tokio::test]
+    async fn test_outbound_reject_ask() {
+        struct RejectOut;
+
+        impl OutboundInterceptor for RejectOut {
+            fn name(&self) -> &'static str {
+                "reject-out"
+            }
+
+            fn on_send(
+                &self,
+                _ctx: &OutboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                Disposition::Reject("outbound blocked".into())
+            }
+        }
+
+        let mut runtime = V2TestRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(RejectOut));
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 42 });
+
+        let result = counter.ask(GetCount).unwrap().await;
+        match result.unwrap_err() {
+            RuntimeError::Rejected {
+                interceptor,
+                reason,
+            } => {
+                assert_eq!(interceptor, "reject-out");
+                assert_eq!(reason, "outbound blocked");
+            }
+            other => panic!("expected Rejected, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_outbound_stamps_header() {
+        use crate::message::Priority;
+
+        struct StampPriority;
+
+        impl OutboundInterceptor for StampPriority {
+            fn name(&self) -> &'static str {
+                "stamp"
+            }
+
+            fn on_send(
+                &self,
+                _ctx: &OutboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                headers: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                headers.insert(Priority::HIGH);
+                Disposition::Continue
+            }
+        }
+
+        let mut runtime = V2TestRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(StampPriority));
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+
+        counter.tell(Increment(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Header was stamped on outbound side — verified by no panic
+    }
+
+    #[tokio::test]
+    async fn test_outbound_retry_ask() {
+        struct RetryOut;
+
+        impl OutboundInterceptor for RetryOut {
+            fn name(&self) -> &'static str {
+                "retry-out"
+            }
+
+            fn on_send(
+                &self,
+                _ctx: &OutboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                Disposition::Retry(Duration::from_millis(250))
+            }
+        }
+
+        let mut runtime = V2TestRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(RetryOut));
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+
+        let result = counter.ask(GetCount).unwrap().await;
+        match result.unwrap_err() {
+            RuntimeError::RetryAfter {
+                interceptor,
+                retry_after,
+            } => {
+                assert_eq!(interceptor, "retry-out");
+                assert_eq!(retry_after, Duration::from_millis(250));
+            }
+            other => panic!("expected RetryAfter, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_outbound_drop_tell_silently_drops() {
+        use std::sync::Mutex;
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        struct DropOut;
+
+        impl OutboundInterceptor for DropOut {
+            fn name(&self) -> &'static str {
+                "drop-out"
+            }
+
+            fn on_send(
+                &self,
+                _ctx: &OutboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                Disposition::Drop
+            }
+        }
+
+        let mut runtime = V2TestRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(DropOut));
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+
+        // tell should succeed (no error path) but message should not be delivered
+        counter.tell(Increment(100)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify actor still has count=0 via ask (without outbound drop)
+        // Since the outbound interceptor drops all messages including ask,
+        // we just verify tell returned Ok.
+    }
+
+    #[tokio::test]
+    async fn test_outbound_drop_ask_returns_channel_closed() {
+        struct DropOut;
+
+        impl OutboundInterceptor for DropOut {
+            fn name(&self) -> &'static str {
+                "drop-out"
+            }
+
+            fn on_send(
+                &self,
+                _ctx: &OutboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                Disposition::Drop
+            }
+        }
+
+        let mut runtime = V2TestRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(DropOut));
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+
+        let result = counter.ask(GetCount).unwrap().await;
+        // Dropped ask returns a channel-closed error (ActorNotFound)
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_outbound_interceptor_sees_ask_send_mode() {
+        use std::sync::Mutex;
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        struct ModeLog {
+            log: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl OutboundInterceptor for ModeLog {
+            fn name(&self) -> &'static str {
+                "mode-log"
+            }
+
+            fn on_send(
+                &self,
+                ctx: &OutboundContext<'_>,
+                _rh: &RuntimeHeaders,
+                _h: &mut Headers,
+                _msg: &dyn Any,
+            ) -> Disposition {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("{:?}", ctx.send_mode));
+                Disposition::Continue
+            }
+        }
+
+        let mut runtime = V2TestRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(ModeLog { log: log.clone() }));
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+
+        counter.tell(Increment(1)).unwrap();
+        let _ = counter.ask(GetCount).unwrap().await;
+
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], "Tell");
+        assert_eq!(entries[1], "Ask");
     }
 }

@@ -57,6 +57,7 @@ pub use timer::TimerHandle;
 pub use clock::{Clock, SystemClock};
 pub use node::{NodeId, ActorId};
 pub use interceptor::{InboundInterceptor, InboundContext, Disposition, Outcome, SendMode};
+pub use interceptor::{OutboundInterceptor, OutboundContext};
 
 // Backward-compatible re-export of TestClock (feature-gated)
 #[cfg(feature = "test-support")]
