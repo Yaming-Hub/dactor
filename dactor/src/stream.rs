@@ -2,12 +2,17 @@ use std::pin::Pin;
 
 use futures::Stream;
 
-/// A pinned, boxed, Send-safe async stream of items.
+/// A pinned, boxed, `Send`-safe async stream of items.
+///
+/// Returned by [`TypedActorRef::stream`](crate::actor::TypedActorRef::stream)
+/// so callers can consume streamed replies with `StreamExt` combinators.
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
-/// A sender handle given to the actor's stream handler.
+/// A sender handle given to the actor's [`StreamHandler`](crate::actor::StreamHandler).
+///
 /// The actor pushes items into this sender; the caller receives them
-/// as an async stream on the other end.
+/// as a [`BoxStream`] on the other end. When the handler returns,
+/// the stream is automatically closed.
 pub struct StreamSender<T: Send + 'static> {
     inner: tokio::sync::mpsc::Sender<T>,
 }
@@ -27,7 +32,11 @@ impl<T: Send + 'static> StreamSender<T> {
             .map_err(|_| StreamSendError::ConsumerDropped)
     }
 
-    /// Try to send without blocking.
+    /// Try to send an item without blocking.
+    ///
+    /// Returns `Err(StreamSendError::Full)` if the channel buffer is at
+    /// capacity, or `Err(StreamSendError::ConsumerDropped)` if the
+    /// consumer has disconnected.
     pub fn try_send(&self, item: T) -> Result<(), StreamSendError> {
         self.inner.try_send(item).map_err(|e| match e {
             tokio::sync::mpsc::error::TrySendError::Full(_) => StreamSendError::Full,
@@ -35,13 +44,19 @@ impl<T: Send + 'static> StreamSender<T> {
         })
     }
 
-    /// Check if the consumer is still listening.
+    /// Check if the consumer has dropped the receiving stream.
+    ///
+    /// Useful for early exit in long-running stream handlers to avoid
+    /// producing items that nobody will consume.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
 }
 
-/// Errors from StreamSender operations.
+/// Errors from [`StreamSender`] send operations.
+///
+/// Indicates either backpressure (buffer full) or that the consumer
+/// has disconnected and will never read further items.
 #[derive(Debug)]
 pub enum StreamSendError {
     /// The consumer dropped the stream (no longer reading).
