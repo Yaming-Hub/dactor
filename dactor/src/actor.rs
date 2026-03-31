@@ -13,6 +13,7 @@ use crate::interceptor::SendMode;
 use crate::mailbox::MailboxConfig;
 use crate::message::{Headers, Message};
 use crate::node::ActorId;
+use crate::stream::{BoxStream, StreamSender};
 use crate::timer::TimerHandle;
 
 /// A handle to a running actor that can receive messages of type `M`.
@@ -185,6 +186,21 @@ pub trait Handler<M: Message>: Actor {
     async fn handle(&mut self, msg: M, ctx: &mut ActorContext) -> M::Reply;
 }
 
+/// Implemented by actors that handle streaming requests.
+/// The handler receives the request and a `StreamSender` to push items into.
+/// When this method returns, the stream closes on the caller side.
+#[async_trait]
+pub trait StreamHandler<M: Message>: Actor {
+    /// Handle a streaming request. Push items into `sender`.
+    /// When this method returns, the stream closes.
+    async fn handle_stream(
+        &mut self,
+        msg: M,
+        sender: StreamSender<M::Reply>,
+        ctx: &mut ActorContext,
+    );
+}
+
 /// A future that resolves to the reply from an `ask()` call.
 ///
 /// Wraps a `oneshot::Receiver` and implements `Future` so that callers can
@@ -246,6 +262,17 @@ pub trait TypedActorRef<A: Actor>: Clone + Send + Sync + 'static {
     fn ask<M>(&self, msg: M) -> Result<AskReply<M::Reply>, ActorSendError>
     where
         A: Handler<M>,
+        M: Message;
+
+    /// Request-stream: send a request and receive a stream of responses.
+    /// `buffer` controls the channel capacity (backpressure).
+    fn stream<M>(
+        &self,
+        msg: M,
+        buffer: usize,
+    ) -> Result<BoxStream<M::Reply>, ActorSendError>
+    where
+        A: StreamHandler<M>,
         M: Message;
 }
 
