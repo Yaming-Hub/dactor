@@ -4,10 +4,21 @@ pub enum MailboxConfig {
     /// Unbounded mailbox — no capacity limit (default).
     Unbounded,
     /// Bounded mailbox with a fixed capacity.
+    ///
+    /// **Note:** `capacity` must be > 0. A zero-capacity mailbox would
+    /// reject all messages immediately.
     Bounded {
         capacity: usize,
         overflow: OverflowStrategy,
     },
+}
+
+impl MailboxConfig {
+    /// Create a bounded mailbox config. Panics if capacity is 0.
+    pub fn bounded(capacity: usize, overflow: OverflowStrategy) -> Self {
+        assert!(capacity > 0, "bounded mailbox capacity must be > 0");
+        Self::Bounded { capacity, overflow }
+    }
 }
 
 impl Default for MailboxConfig {

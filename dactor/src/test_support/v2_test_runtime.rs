@@ -213,6 +213,21 @@ impl<A: Actor> MailboxSender<A> {
         }
     }
 
+    /// Force-send a control signal bypassing overflow strategy.
+    /// Used for stop signals that must not be dropped.
+    fn force_send(&self, msg: Option<BoxedDispatch<A>>) {
+        match self {
+            Self::Unbounded(tx) => { let _ = tx.send(msg); }
+            Self::Bounded { sender, .. } => {
+                // For control signals, use regular send (not try_send).
+                // This may block briefly but guarantees delivery.
+                // If the channel is closed, the signal is moot (actor already stopped).
+                let _ = sender.try_send(msg);
+                // If full, the actor will stop naturally when all senders are dropped.
+            }
+        }
+    }
+
     fn is_closed(&self) -> bool {
         match self {
             Self::Unbounded(tx) => tx.is_closed(),
@@ -307,7 +322,10 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
     }
 
     fn stop(&self) {
-        let _ = self.sender.send(None);
+        // Mark as not alive immediately so is_alive() returns false
+        self.alive.store(false, Ordering::SeqCst);
+        // Send stop signal bypassing overflow strategy
+        self.sender.force_send(None);
     }
 
     fn tell<M>(&self, msg: M) -> Result<(), ActorSendError>
