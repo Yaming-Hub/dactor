@@ -16,6 +16,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["time", "sync", "rt", "rt-multi-thread", "macros"] }
 tracing = "0.1"
 tokio-stream = "0.1"
+tokio-util = "0.7"
 uuid = { version = "1.23.0", features = ["v4"] }
 
 [dependencies.serde]

@@ -200,7 +200,7 @@ async fn main() {
     // Send a request-reply message — interceptors will fire on both sides.
     println!("--- Sending ask(SayHello) ---");
     let reply = greeter
-        .ask(SayHello("World".into()))
+        .ask(SayHello("World".into()), None)
         .unwrap()
         .await
         .unwrap();
@@ -209,7 +209,7 @@ async fn main() {
     // Send another message to see a second round of interceptor output.
     println!("--- Sending ask(SayHello) ---");
     let reply = greeter
-        .ask(SayHello("Rust".into()))
+        .ask(SayHello("Rust".into()), None)
         .unwrap()
         .await
         .unwrap();

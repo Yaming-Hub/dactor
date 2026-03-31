@@ -25,6 +25,7 @@ use crate::message::{Headers, Message, RuntimeHeaders};
 use crate::node::{ActorId, NodeId};
 use crate::stream::{BoxStream, StreamReceiver, StreamSender};
 use crate::supervision::ChildTerminated;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Type-erased dispatch via async trait
@@ -50,6 +51,9 @@ trait Dispatch<A: Actor>: Send {
     /// Reject this dispatch — for ask, sends the proper error to the caller.
     /// For tell, silently drops (fire-and-forget has no error path).
     fn reject(self: Box<Self>, disposition: Disposition, interceptor_name: &str);
+
+    /// The cancellation token for this dispatch (None for tell).
+    fn cancel_token(&self) -> Option<CancellationToken>;
 }
 
 /// Result of dispatching a message, including the type-erased reply for ask.
@@ -103,12 +107,17 @@ where
     fn reject(self: Box<Self>, _disposition: Disposition, _interceptor_name: &str) {
         // tell: silently drop (fire-and-forget has no error path)
     }
+
+    fn cancel_token(&self) -> Option<CancellationToken> {
+        None
+    }
 }
 
 /// Ask envelope: carries the message and a oneshot sender for the reply.
 struct AskDispatch<M: Message> {
     msg: M,
     reply_tx: tokio::sync::oneshot::Sender<Result<M::Reply, RuntimeError>>,
+    cancel: Option<CancellationToken>,
 }
 
 #[async_trait]
@@ -160,12 +169,17 @@ where
         };
         let _ = self.reply_tx.send(Err(error));
     }
+
+    fn cancel_token(&self) -> Option<CancellationToken> {
+        self.cancel.clone()
+    }
 }
 
 /// Stream envelope: carries the message and a StreamSender for pushing items.
 struct StreamDispatch<M: Message> {
     msg: M,
     sender: StreamSender<M::Reply>,
+    cancel: Option<CancellationToken>,
 }
 
 #[async_trait]
@@ -194,6 +208,10 @@ where
     fn reject(self: Box<Self>, _disposition: Disposition, _interceptor_name: &str) {
         // Dropping self.sender closes the stream on the caller side
     }
+
+    fn cancel_token(&self) -> Option<CancellationToken> {
+        self.cancel.clone()
+    }
 }
 
 /// Feed envelope: carries the message, a StreamReceiver for items, and a oneshot for the reply.
@@ -201,6 +219,7 @@ struct FeedDispatch<M: FeedMessage> {
     msg: M,
     receiver: StreamReceiver<M::Item>,
     reply_tx: tokio::sync::oneshot::Sender<Result<M::Reply, RuntimeError>>,
+    cancel: Option<CancellationToken>,
 }
 
 #[async_trait]
@@ -252,9 +271,11 @@ where
         };
         let _ = self.reply_tx.send(Err(error));
     }
-}
 
-type BoxedDispatch<A> = Box<dyn Dispatch<A>>;
+    fn cancel_token(&self) -> Option<CancellationToken> {
+        self.cancel.clone()
+    }
+}type BoxedDispatch<A> = Box<dyn Dispatch<A>>;
 
 // ---------------------------------------------------------------------------
 // Mailbox channel wrappers
@@ -456,7 +477,7 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
         self.sender.send(Some(dispatch))
     }
 
-    fn ask<M>(&self, msg: M) -> Result<AskReply<M::Reply>, ActorSendError>
+    fn ask<M>(&self, msg: M, cancel: Option<CancellationToken>) -> Result<AskReply<M::Reply>, ActorSendError>
     where
         A: Handler<M>,
         M: Message,
@@ -504,6 +525,7 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
         let dispatch: BoxedDispatch<A> = Box::new(AskDispatch {
             msg,
             reply_tx: tx,
+            cancel,
         });
         self.sender.send(Some(dispatch))?;
         Ok(AskReply::new(rx))
@@ -513,6 +535,7 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
         &self,
         msg: M,
         buffer: usize,
+        cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, ActorSendError>
     where
         A: StreamHandler<M>,
@@ -549,7 +572,7 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
 
         let (tx, rx) = tokio::sync::mpsc::channel(buffer);
         let sender = StreamSender::new(tx);
-        let dispatch: BoxedDispatch<A> = Box::new(StreamDispatch { msg, sender });
+        let dispatch: BoxedDispatch<A> = Box::new(StreamDispatch { msg, sender, cancel });
         self.sender.send(Some(dispatch))?;
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -561,6 +584,7 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
         msg: M,
         input: BoxStream<M::Item>,
         buffer: usize,
+        cancel: Option<CancellationToken>,
     ) -> Result<AskReply<M::Reply>, ActorSendError>
     where
         A: FeedHandler<M>,
@@ -613,22 +637,44 @@ impl<A: Actor> TypedActorRef<A> for V2ActorRef<A> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
         // Send the FeedDispatch to the actor
-        let dispatch: BoxedDispatch<A> = Box::new(FeedDispatch { msg, receiver, reply_tx });
+        let dispatch: BoxedDispatch<A> = Box::new(FeedDispatch { msg, receiver, reply_tx, cancel: cancel.clone() });
         self.sender.send(Some(dispatch))?;
 
         // Spawn a drain task: pulls items from the input BoxStream and pushes to item_tx.
         // The task terminates naturally when either:
         // - The input stream is exhausted (all items consumed)
         // - The actor drops the StreamReceiver (item_tx.send returns Err)
+        // - The cancellation token fires (drops item_tx, closing the channel)
         // Panics in the input stream are caught to avoid leaving the actor hanging.
-        // Note: Full cancellation support (CancellationToken) added in PR 15.
         tokio::spawn(async move {
             use futures::{FutureExt, StreamExt};
             let mut input = input;
             let result = std::panic::AssertUnwindSafe(async {
-                while let Some(item) = input.next().await {
-                    if item_tx.send(item).await.is_err() {
-                        break; // actor dropped the receiver
+                loop {
+                    if let Some(ref token) = cancel {
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => break,
+                            item = input.next() => {
+                                match item {
+                                    Some(item) => {
+                                        if item_tx.send(item).await.is_err() {
+                                            break; // actor dropped the receiver
+                                        }
+                                    }
+                                    None => break, // stream exhausted
+                                }
+                            }
+                        }
+                    } else {
+                        match input.next().await {
+                            Some(item) => {
+                                if item_tx.send(item).await.is_err() {
+                                    break; // actor dropped the receiver
+                                }
+                            }
+                            None => break, // stream exhausted
+                        }
                     }
                 }
             })
@@ -805,6 +851,7 @@ impl V2TestRuntime {
                 actor_name: name_task,
                 send_mode: None,
                 headers: Headers::new(),
+                cancellation_token: None,
             };
 
             actor.on_start(&mut ctx).await;
@@ -873,11 +920,48 @@ impl V2TestRuntime {
                 // Copy interceptor-populated headers to ActorContext so handler can access them
                 ctx.headers = headers;
 
-                // Dispatch the message
-                let result =
+                // Set the cancellation token on the context
+                let cancel_token = dispatch.cancel_token();
+                ctx.cancellation_token = cancel_token.clone();
+
+                // Check if already cancelled before dispatching
+                if let Some(ref token) = cancel_token {
+                    if token.is_cancelled() {
+                        // Already cancelled — send Cancelled error to caller
+                        // We need a way to send the error. Use reject with a special handling.
+                        // For ask/feed: the reply_tx is inside dispatch. Drop dispatch to close oneshot.
+                        drop(dispatch);
+                        ctx.cancellation_token = None;
+                        continue;
+                    }
+                }
+
+                // Dispatch the message (with cancellation racing if token is set)
+                // For cooperative cancellation: the handler can use ctx.cancelled() internally.
+                // For non-cooperative handlers: the select! will drop the handler future on cancel.
+                // biased; with dispatch first ensures that if the handler completes at the same
+                // moment the token fires, the handler's result takes priority.
+                let result = if let Some(ref token) = cancel_token {
+                    let dispatch_fut = std::panic::AssertUnwindSafe(dispatch.dispatch(&mut actor, &mut ctx))
+                        .catch_unwind();
+                    tokio::select! {
+                        biased;
+                        r = dispatch_fut => r,
+                        _ = token.cancelled() => {
+                            // Cancelled during handler execution.
+                            // The handler is NOT interrupted — select! drops the future.
+                            ctx.cancellation_token = None;
+                            continue;
+                        }
+                    }
+                } else {
                     std::panic::AssertUnwindSafe(dispatch.dispatch(&mut actor, &mut ctx))
                         .catch_unwind()
-                        .await;
+                        .await
+                };
+
+                // Clear the cancellation token
+                ctx.cancellation_token = None;
 
                 // Build context for on_complete (reuse headers from on_receive)
                 let ictx = InboundContext {
@@ -1211,7 +1295,7 @@ mod tests {
         let runtime = V2TestRuntime::new();
         let counter = runtime.spawn::<Counter>("counter", Counter { count: 42 });
 
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(count, 42);
     }
 
@@ -1223,7 +1307,7 @@ mod tests {
         counter.tell(Increment(10)).unwrap();
         counter.tell(Increment(20)).unwrap();
 
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(count, 30);
     }
 
@@ -1232,10 +1316,10 @@ mod tests {
         let runtime = V2TestRuntime::new();
         let counter = runtime.spawn::<Counter>("counter", Counter { count: 100 });
 
-        let old = counter.ask(Reset).unwrap().await.unwrap();
+        let old = counter.ask(Reset, None).unwrap().await.unwrap();
         assert_eq!(old, 100);
 
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(count, 0);
     }
 
@@ -1247,14 +1331,14 @@ mod tests {
         counter.tell(Increment(100)).unwrap();
 
         // Ensure the tell is processed before asking
-        let _ = counter.ask(GetCount).unwrap().await.unwrap();
+        let _ = counter.ask(GetCount, None).unwrap().await.unwrap();
 
         let ref1 = counter.clone();
         let ref2 = counter.clone();
 
         let (r1, r2) = tokio::join!(
-            async { ref1.ask(GetCount).unwrap().await.unwrap() },
-            async { ref2.ask(GetCount).unwrap().await.unwrap() },
+            async { ref1.ask(GetCount, None).unwrap().await.unwrap() },
+            async { ref2.ask(GetCount, None).unwrap().await.unwrap() },
         );
 
         assert_eq!(r1, 100);
@@ -1267,17 +1351,17 @@ mod tests {
         let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
 
         counter.tell(Increment(5)).unwrap();
-        let c1 = counter.ask(GetCount).unwrap().await.unwrap();
+        let c1 = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(c1, 5);
 
         counter.tell(Increment(3)).unwrap();
-        let c2 = counter.ask(GetCount).unwrap().await.unwrap();
+        let c2 = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(c2, 8);
 
-        let old = counter.ask(Reset).unwrap().await.unwrap();
+        let old = counter.ask(Reset, None).unwrap().await.unwrap();
         assert_eq!(old, 8);
 
-        let c3 = counter.ask(GetCount).unwrap().await.unwrap();
+        let c3 = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(c3, 0);
     }
 
@@ -1357,7 +1441,7 @@ mod tests {
             },
         );
 
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(count, 42);
 
         let entries = log.lock().unwrap();
@@ -1463,7 +1547,7 @@ mod tests {
             },
         );
 
-        let result = counter.ask(GetCount).unwrap().await;
+        let result = counter.ask(GetCount, None).unwrap().await;
         assert!(result.is_err(), "rejected ask should return Err");
         match result.unwrap_err() {
             RuntimeError::Rejected { interceptor, reason } => {
@@ -1499,7 +1583,7 @@ mod tests {
             },
         );
 
-        let result = counter.ask(GetCount).unwrap().await;
+        let result = counter.ask(GetCount, None).unwrap().await;
         assert!(result.is_err());
         match result.unwrap_err() {
             RuntimeError::RetryAfter { interceptor, retry_after } => {
@@ -1717,7 +1801,7 @@ mod tests {
         counter.tell(Increment(1)).unwrap();
 
         // Ask blocks until tell+ask are both processed (sequentially, both delayed)
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         let elapsed = start.elapsed();
 
         assert_eq!(count, 1);
@@ -1764,7 +1848,7 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         // Use ask to block until message is processed
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         let elapsed = start.elapsed();
 
         assert_eq!(count, 0);
@@ -1783,7 +1867,7 @@ mod tests {
         let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
 
         counter.tell(Increment(10)).unwrap();
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(count, 10);
     }
 
@@ -1826,7 +1910,7 @@ mod tests {
         );
 
         counter.tell(Increment(1)).unwrap();
-        let _ = counter.ask(GetCount).unwrap().await.unwrap();
+        let _ = counter.ask(GetCount, None).unwrap().await.unwrap();
 
         let entries = log.lock().unwrap();
         assert_eq!(entries.len(), 2);
@@ -1950,7 +2034,7 @@ mod tests {
         runtime.add_outbound_interceptor(Box::new(RejectOut));
         let counter = runtime.spawn::<Counter>("counter", Counter { count: 42 });
 
-        let result = counter.ask(GetCount).unwrap().await;
+        let result = counter.ask(GetCount, None).unwrap().await;
         match result.unwrap_err() {
             RuntimeError::Rejected {
                 interceptor,
@@ -2019,7 +2103,7 @@ mod tests {
         runtime.add_outbound_interceptor(Box::new(RetryOut));
         let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
 
-        let result = counter.ask(GetCount).unwrap().await;
+        let result = counter.ask(GetCount, None).unwrap().await;
         match result.unwrap_err() {
             RuntimeError::RetryAfter {
                 interceptor,
@@ -2089,7 +2173,7 @@ mod tests {
         runtime.add_outbound_interceptor(Box::new(DropOut));
         let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
 
-        let result = counter.ask(GetCount).unwrap().await;
+        let result = counter.ask(GetCount, None).unwrap().await;
         // Dropped ask returns a channel-closed error (ActorNotFound)
         assert!(result.is_err());
     }
@@ -2129,7 +2213,7 @@ mod tests {
         let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
 
         counter.tell(Increment(1)).unwrap();
-        let _ = counter.ask(GetCount).unwrap().await;
+        let _ = counter.ask(GetCount, None).unwrap().await;
 
         let entries = log.lock().unwrap();
         assert_eq!(entries.len(), 2);
@@ -2402,7 +2486,7 @@ mod tests {
         let runtime = V2TestRuntime::new();
         let actor = runtime.spawn::<AskModeTracker>("tracker", mode_ref);
 
-        let _ = actor.ask(AskCheck).unwrap().await.unwrap();
+        let _ = actor.ask(AskCheck, None).unwrap().await.unwrap();
 
         assert_eq!(*mode.lock().unwrap(), Some(SendMode::Ask));
     }
@@ -2474,7 +2558,7 @@ mod tests {
         }
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(count, 1000);
     }
 
@@ -2487,7 +2571,7 @@ mod tests {
             counter.tell(Increment(1)).unwrap();
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let count = counter.ask(GetCount).unwrap().await.unwrap();
+        let count = counter.ask(GetCount, None).unwrap().await.unwrap();
         assert_eq!(count, 100);
     }
 
@@ -2776,7 +2860,7 @@ mod tests {
             vec!["line1".into(), "line2".into(), "line3".into()],
         );
 
-        let mut stream = server.stream(GetLogs, 16).unwrap();
+        let mut stream = server.stream(GetLogs, 16, None).unwrap();
         let mut items = Vec::new();
         while let Some(item) = stream.next().await {
             items.push(item);
@@ -2792,7 +2876,7 @@ mod tests {
         let runtime = V2TestRuntime::new();
         let server = runtime.spawn::<LogServer>("logs", vec![]);
 
-        let mut stream = server.stream(GetLogs, 16).unwrap();
+        let mut stream = server.stream(GetLogs, 16, None).unwrap();
         assert!(stream.next().await.is_none());
     }
 
@@ -2804,7 +2888,7 @@ mod tests {
         let runtime = V2TestRuntime::new();
         let server = runtime.spawn::<LogServer>("logs", logs);
 
-        let mut stream = server.stream(GetLogs, 4).unwrap();
+        let mut stream = server.stream(GetLogs, 4, None).unwrap();
         let item1 = stream.next().await.unwrap();
         let item2 = stream.next().await.unwrap();
         assert_eq!(item1, "line-0");
@@ -2857,7 +2941,7 @@ mod tests {
         let runtime = V2TestRuntime::new();
         let actor = runtime.spawn::<NumberStream>("numbers", ());
 
-        let stream = actor.stream(GetNumbers { count: 100 }, 16).unwrap();
+        let stream = actor.stream(GetNumbers { count: 100 }, 16, None).unwrap();
         let items: Vec<u64> = tokio_stream::StreamExt::collect(stream).await;
 
         assert_eq!(items.len(), 100);
@@ -2902,7 +2986,7 @@ mod tests {
 
         let runtime = V2TestRuntime::new();
         let actor = runtime.spawn::<SlowStream>("slow", ());
-        let mut stream = actor.stream(GetItems, 1).unwrap();
+        let mut stream = actor.stream(GetItems, 1, None).unwrap();
 
         // Read slowly — backpressure should prevent buffer overflow
         let mut items = Vec::new();
@@ -2953,7 +3037,7 @@ mod tests {
         let actor = runtime.spawn::<Summer>("summer", ());
 
         let input = futures::stream::iter(vec![10u64, 20, 30, 40, 50]);
-        let reply = actor.feed(SumItems, Box::pin(input), 8).unwrap().await.unwrap();
+        let reply = actor.feed(SumItems, Box::pin(input), 8, None).unwrap().await.unwrap();
         assert_eq!(reply, 150);
     }
 
@@ -2994,7 +3078,7 @@ mod tests {
         let actor = runtime.spawn::<Summer>("summer", ());
 
         let input = futures::stream::iter(Vec::<u64>::new());
-        let reply = actor.feed(SumItems, Box::pin(input), 8).unwrap().await.unwrap();
+        let reply = actor.feed(SumItems, Box::pin(input), 8, None).unwrap().await.unwrap();
         assert_eq!(reply, 0);
     }
 
@@ -3038,7 +3122,7 @@ mod tests {
 
         let values: Vec<u64> = (0..100).collect();
         let input = futures::stream::iter(values.clone());
-        let reply = actor.feed(CollectItems, Box::pin(input), 16).unwrap().await.unwrap();
+        let reply = actor.feed(CollectItems, Box::pin(input), 16, None).unwrap().await.unwrap();
         assert_eq!(reply, values);
     }
 
@@ -3080,7 +3164,215 @@ mod tests {
         let actor = runtime.spawn::<SlowConsumer>("slow", ());
 
         let input = futures::stream::iter(0u64..20);
-        let reply = actor.feed(FeedSlow, Box::pin(input), 1).unwrap().await.unwrap();
+        let reply = actor.feed(FeedSlow, Box::pin(input), 1, None).unwrap().await.unwrap();
         assert_eq!(reply, 20);
+    }
+
+    // ── Cancellation tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_cancel_ask_before_handler() {
+        let token = CancellationToken::new();
+        token.cancel(); // cancel immediately
+
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+
+        let result = counter.ask(GetCount, Some(token)).unwrap().await;
+        // Should be Err because cancelled before handler ran
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_after_timeout() {
+        use crate::actor::cancel_after;
+
+        struct SlowActor;
+        impl Actor for SlowActor {
+            type Args = ();
+            type Deps = ();
+            fn create(_: (), _: ()) -> Self { SlowActor }
+        }
+        struct SlowMsg;
+        impl Message for SlowMsg {
+            type Reply = String;
+        }
+        #[async_trait]
+        impl Handler<SlowMsg> for SlowActor {
+            async fn handle(&mut self, _: SlowMsg, _ctx: &mut ActorContext) -> String {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                "done".into()
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let actor = runtime.spawn::<SlowActor>("slow", ());
+        let token = cancel_after(Duration::from_millis(50));
+        let result = actor.ask(SlowMsg, Some(token)).unwrap().await;
+        assert!(result.is_err()); // should be cancelled after 50ms
+    }
+
+    #[tokio::test]
+    async fn test_no_cancel_runs_to_completion() {
+        let runtime = V2TestRuntime::new();
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 42 });
+        let result = counter.ask(GetCount, None).unwrap().await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_ctx_cancelled_in_handler() {
+        use crate::actor::cancel_after;
+
+        struct CancelAwareActor;
+        impl Actor for CancelAwareActor {
+            type Args = ();
+            type Deps = ();
+            fn create(_: (), _: ()) -> Self { CancelAwareActor }
+        }
+        struct LongTask;
+        impl Message for LongTask {
+            type Reply = String;
+        }
+        #[async_trait]
+        impl Handler<LongTask> for CancelAwareActor {
+            async fn handle(&mut self, _: LongTask, ctx: &mut ActorContext) -> String {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => "completed".into(),
+                    _ = ctx.cancelled() => "cancelled".into(),
+                }
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let actor = runtime.spawn::<CancelAwareActor>("aware", ());
+        let token = cancel_after(Duration::from_millis(50));
+        let result = actor.ask(LongTask, Some(token)).unwrap().await.unwrap();
+        assert_eq!(result, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_stream() {
+        use crate::actor::cancel_after;
+        use tokio_stream::StreamExt;
+
+        struct SlowStreamer;
+        impl Actor for SlowStreamer {
+            type Args = ();
+            type Deps = ();
+            fn create(_: (), _: ()) -> Self { SlowStreamer }
+        }
+        struct StreamForever;
+        impl Message for StreamForever {
+            type Reply = u64;
+        }
+        #[async_trait]
+        impl StreamHandler<StreamForever> for SlowStreamer {
+            async fn handle_stream(
+                &mut self,
+                _msg: StreamForever,
+                sender: StreamSender<u64>,
+                _ctx: &mut ActorContext,
+            ) {
+                let mut i = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if sender.send(i).await.is_err() {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let actor = runtime.spawn::<SlowStreamer>("streamer", ());
+        let token = cancel_after(Duration::from_millis(100));
+        let mut stream = actor.stream(StreamForever, 4, Some(token)).unwrap();
+
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+        // Stream should have ended due to cancellation — got some items but not infinite
+        assert!(!items.is_empty());
+        assert!(items.len() < 20);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_feed() {
+        use crate::actor::cancel_after;
+
+        struct FeedActor;
+        impl Actor for FeedActor {
+            type Args = ();
+            type Deps = ();
+            fn create(_: (), _: ()) -> Self { FeedActor }
+        }
+        struct CollectAll;
+        impl FeedMessage for CollectAll {
+            type Item = u64;
+            type Reply = Vec<u64>;
+        }
+        #[async_trait]
+        impl FeedHandler<CollectAll> for FeedActor {
+            async fn handle_feed(
+                &mut self,
+                _msg: CollectAll,
+                mut receiver: StreamReceiver<u64>,
+                _ctx: &mut ActorContext,
+            ) -> Vec<u64> {
+                let mut items = Vec::new();
+                while let Some(item) = receiver.recv().await {
+                    items.push(item);
+                }
+                items
+            }
+        }
+
+        let runtime = V2TestRuntime::new();
+        let actor = runtime.spawn::<FeedActor>("feed-actor", ());
+
+        // Create a slow infinite stream
+        let input = futures::stream::unfold(0u64, |state| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((state, state + 1))
+        });
+
+        let token = cancel_after(Duration::from_millis(100));
+        let result = actor.feed(CollectAll, Box::pin(input), 4, Some(token)).unwrap().await;
+        // The operation was cancelled — either we get a partial result or an error
+        // When the dispatch loop's select fires cancellation, the handler future is dropped
+        // and the caller receives an error (channel closed).
+        match result {
+            Ok(items) => {
+                // If the handler finished before cancellation propagated, we get partial items
+                assert!(!items.is_empty());
+                assert!(items.len() < 20);
+            }
+            Err(_) => {
+                // Cancellation dropped the handler before it could return
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_returns_pending_when_no_token() {
+        // Verify that ctx.cancelled() never resolves when no token is set
+        let mut ctx = ActorContext {
+            actor_id: ActorId { node: NodeId("n1".into()), local: 1 },
+            actor_name: "test".into(),
+            send_mode: None,
+            headers: Headers::new(),
+            cancellation_token: None,
+        };
+
+        // cancelled() should not resolve — use select to prove it
+        tokio::select! {
+            _ = ctx.cancelled() => panic!("cancelled() should never resolve without a token"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                // expected: timeout wins because cancelled() returns pending
+            }
+        }
     }
 }

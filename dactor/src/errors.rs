@@ -76,6 +76,8 @@ pub enum RuntimeError {
     RetryAfter { interceptor: String, retry_after: Duration },
     /// A handler-level error occurred.
     Actor(crate::actor::ActorError),
+    /// The operation was cancelled via CancellationToken.
+    Cancelled,
 }
 
 impl fmt::Display for RuntimeError {
@@ -91,6 +93,7 @@ impl fmt::Display for RuntimeError {
                 write!(f, "retry after {:?} (suggested by '{}')", retry_after, interceptor)
             }
             Self::Actor(e) => write!(f, "actor error: {}", e),
+            Self::Cancelled => write!(f, "operation cancelled"),
         }
     }
 }

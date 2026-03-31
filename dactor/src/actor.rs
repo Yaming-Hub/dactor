@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::cluster::ClusterEvents;
 use crate::errors::{ActorSendError, ErrorAction, GroupError, RuntimeError};
@@ -151,6 +152,29 @@ pub struct ActorContext {
     /// Headers attached to the current message.
     /// Empty during on_start/on_stop.
     pub headers: Headers,
+    /// Cancellation token for the current request. `None` if no cancellation was requested.
+    pub(crate) cancellation_token: Option<CancellationToken>,
+}
+
+impl ActorContext {
+    /// Returns a future that completes when the current request is cancelled.
+    /// Use in `tokio::select!` to cooperatively check for cancellation:
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     result = some_long_operation() => { /* use result */ }
+    ///     _ = ctx.cancelled() => { return Err(ActorError::new("cancelled")); }
+    /// }
+    /// ```
+    ///
+    /// Returns `futures::future::pending()` if no cancellation token is set,
+    /// meaning the branch will never trigger.
+    pub async fn cancelled(&self) {
+        match &self.cancellation_token {
+            Some(token) => token.cancelled().await,
+            None => futures::future::pending().await,
+        }
+    }
 }
 
 /// The core actor trait. Implemented by the user's actor struct.
@@ -240,7 +264,7 @@ pub trait FeedHandler<M: FeedMessage>: Actor {
 /// A future that resolves to the reply from an `ask()` call.
 ///
 /// Wraps a `oneshot::Receiver` and implements `Future` so that callers can
-/// `.await` the reply directly: `let count = actor.ask(GetCount)?.await?;`
+/// `.await` the reply directly: `let count = actor.ask(GetCount, None)?.await?;`
 pub struct AskReply<R> {
     rx: oneshot::Receiver<Result<R, RuntimeError>>,
 }
@@ -297,18 +321,23 @@ pub trait TypedActorRef<A: Actor>: Clone + Send + Sync + 'static {
     /// Request-reply: send a message and await the reply.
     ///
     /// Returns an [`AskReply`] future that resolves to the handler's reply.
-    /// Usage: `let reply = actor.ask(msg)?.await?;`
-    fn ask<M>(&self, msg: M) -> Result<AskReply<M::Reply>, ActorSendError>
+    /// Usage: `let reply = actor.ask(msg, None)?.await?;`
+    ///
+    /// Pass a [`CancellationToken`] to cooperatively cancel the operation.
+    fn ask<M>(&self, msg: M, cancel: Option<CancellationToken>) -> Result<AskReply<M::Reply>, ActorSendError>
     where
         A: Handler<M>,
         M: Message;
 
     /// Request-stream: send a request and receive a stream of responses.
     /// `buffer` controls the channel capacity (backpressure).
+    ///
+    /// Pass a [`CancellationToken`] to cooperatively cancel the stream.
     fn stream<M>(
         &self,
         msg: M,
         buffer: usize,
+        cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, ActorSendError>
     where
         A: StreamHandler<M>,
@@ -320,16 +349,30 @@ pub trait TypedActorRef<A: Actor>: Clone + Send + Sync + 'static {
     /// [`StreamReceiver`] and returns a single reply when the stream ends.
     /// `buffer` controls the internal channel capacity (backpressure).
     ///
-    /// Returns an [`AskReply`] future: `let reply = actor.feed(msg, stream, 8)?.await?;`
+    /// Pass a [`CancellationToken`] to cooperatively cancel the feed.
+    ///
+    /// Returns an [`AskReply`] future: `let reply = actor.feed(msg, stream, 8, None)?.await?;`
     fn feed<M>(
         &self,
         msg: M,
         input: BoxStream<M::Item>,
         buffer: usize,
+        cancel: Option<CancellationToken>,
     ) -> Result<AskReply<M::Reply>, ActorSendError>
     where
         A: FeedHandler<M>,
         M: FeedMessage;
+}
+
+/// Create a [`CancellationToken`] that automatically cancels after the given duration.
+pub fn cancel_after(duration: Duration) -> CancellationToken {
+    let token = CancellationToken::new();
+    let child = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(duration).await;
+        child.cancel();
+    });
+    token
 }
 
 /// Configuration for spawning an actor. All fields have defaults
@@ -485,6 +528,7 @@ mod tests {
             actor_name: "test-actor".into(),
             send_mode: None,
             headers: Headers::new(),
+            cancellation_token: None,
         };
         assert_eq!(ctx.actor_name, "test-actor");
         assert_eq!(ctx.actor_id.local, 1);
@@ -499,6 +543,7 @@ mod tests {
             actor_name: "counter".into(),
             send_mode: None,
             headers: Headers::new(),
+            cancellation_token: None,
         };
         counter.on_start(&mut ctx).await;
         counter.on_stop().await;
@@ -515,6 +560,7 @@ mod tests {
             actor_name: "counter".into(),
             send_mode: None,
             headers: Headers::new(),
+            cancellation_token: None,
         };
         counter.handle(Increment(5), &mut ctx).await;
         assert_eq!(counter.count, 5);
@@ -530,6 +576,7 @@ mod tests {
             actor_name: "counter".into(),
             send_mode: None,
             headers: Headers::new(),
+            cancellation_token: None,
         };
         let count = counter.handle(GetCount, &mut ctx).await;
         assert_eq!(count, 42);
@@ -543,6 +590,7 @@ mod tests {
             actor_name: "counter".into(),
             send_mode: None,
             headers: Headers::new(),
+            cancellation_token: None,
         };
         let old = counter.handle(Reset, &mut ctx).await;
         assert_eq!(old, 100);
@@ -557,6 +605,7 @@ mod tests {
             actor_name: "counter".into(),
             send_mode: None,
             headers: Headers::new(),
+            cancellation_token: None,
         };
 
         counter.handle(Increment(10), &mut ctx).await;
