@@ -12,7 +12,7 @@
 | v0.2.0-alpha.2 — Communication (tell/ask) | PR 4–6 | ✅ Complete |
 | v0.2.0-alpha.3 — Messaging & Mailbox | PR 7–11 | ✅ Complete |
 | v0.2.0-beta.1 — Streaming & Cancellation | PR 12–15 | ✅ Complete |
-| v0.2.0-beta.2 — Error Model & Persistence | PR 16–18 | 🟡 In progress (2/3) |
+| v0.2.0-beta.2 — Error Model & Persistence | PR 16–18 | ✅ Complete |
 | v0.2.0-rc.1 — Observability & Remote | PR 19–21 | 🔲 Not started |
 
 ---
@@ -38,7 +38,7 @@
 | 15 | Cancellation (CancellationToken) | impl/pr-15-cancellation | ✅ PR #17 | 146/146 pass | 7 new tests |
 | 16 | Error model (ActorError, ErrorCodec) | impl/pr-16-error-model | ✅ PR #18 | 155/155 pass | 10 new tests |
 | 17 | Persistence (EventSourced + DurableState) | impl/pr-17-persistence | ✅ PR #19 | 172/172 pass | 17 new tests |
-| 18 | Dead letters, Delay, Throttle | | 🔲 Not started | | |
+| 18 | Dead letters, Delay, Throttle | impl/pr-18-dead-letters | ✅ PR #20 | 180/180 pass | 8 new tests |
 | 19 | Observability (MetricsInterceptor) | | 🔲 Not started | | |
 | 20 | Conformance suite & MockCluster | | 🔲 Not started | | |
 | 21 | Remote actors & cluster stubs | | 🔲 Not started | | |
@@ -78,3 +78,4 @@
 | 2026-03-31 | PR 15 | CancellationToken, ctx.cancelled(), cancel_after(), RuntimeError::Cancelled |
 | 2026-04-01 | PR 16 | ActorError with ErrorCode/details/chain, NotSupportedError, 11 error codes |
 | 2026-04-01 | PR 17 | Persistence traits (Journal/Snapshot/State storage), InMemoryStorage, PersistenceId |
+| 2026-04-01 | PR 18 | DeadLetterHandler, CollectingDeadLetterHandler, ActorRateLimiter throttle |
