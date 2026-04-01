@@ -61,3 +61,381 @@ fn reexports_core_types() {
 fn runtime_is_default() {
     let _rt = RactorRuntime::default();
 }
+
+// ---------------------------------------------------------------------------
+// Interceptor tests
+// ---------------------------------------------------------------------------
+
+mod interceptor_tests {
+    use std::any::Any;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use dactor::actor::{Actor, ActorContext, Handler, TypedActorRef};
+    use dactor::errors::RuntimeError;
+    use dactor::interceptor::{
+        Disposition, InboundContext, InboundInterceptor, OutboundContext, OutboundInterceptor,
+        Outcome,
+    };
+    use dactor::message::{Headers, Message, RuntimeHeaders};
+    use dactor_ractor::{RactorRuntime, SpawnOptions};
+
+    // -- Test actor --
+
+    struct Echo;
+
+    impl Actor for Echo {
+        type Args = ();
+        type Deps = ();
+        fn create(_: (), _: ()) -> Self {
+            Echo
+        }
+    }
+
+    struct Ping(String);
+    impl Message for Ping {
+        type Reply = String;
+    }
+
+    #[async_trait]
+    impl Handler<Ping> for Echo {
+        async fn handle(&mut self, msg: Ping, _ctx: &mut ActorContext) -> String {
+            format!("pong:{}", msg.0)
+        }
+    }
+
+    struct Fire(u64);
+    impl Message for Fire {
+        type Reply = ();
+    }
+
+    #[async_trait]
+    impl Handler<Fire> for Echo {
+        async fn handle(&mut self, _msg: Fire, _ctx: &mut ActorContext) {
+            // fire-and-forget
+        }
+    }
+
+    // -- Logging interceptor (inbound) --
+
+    struct LoggingInterceptor {
+        receive_count: Arc<AtomicU64>,
+        complete_count: Arc<AtomicU64>,
+    }
+
+    impl LoggingInterceptor {
+        fn new() -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let receive = Arc::new(AtomicU64::new(0));
+            let complete = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    receive_count: receive.clone(),
+                    complete_count: complete.clone(),
+                },
+                receive,
+                complete,
+            )
+        }
+    }
+
+    impl InboundInterceptor for LoggingInterceptor {
+        fn name(&self) -> &'static str {
+            "logging"
+        }
+
+        fn on_receive(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &mut Headers,
+            _message: &dyn Any,
+        ) -> Disposition {
+            self.receive_count.fetch_add(1, Ordering::SeqCst);
+            Disposition::Continue
+        }
+
+        fn on_complete(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &Headers,
+            _outcome: &Outcome<'_>,
+        ) {
+            self.complete_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // -- Rejecting interceptor (inbound) --
+
+    struct RejectInterceptor {
+        reason: String,
+    }
+
+    impl InboundInterceptor for RejectInterceptor {
+        fn name(&self) -> &'static str {
+            "rejecter"
+        }
+
+        fn on_receive(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &mut Headers,
+            _message: &dyn Any,
+        ) -> Disposition {
+            Disposition::Reject(self.reason.clone())
+        }
+    }
+
+    // -- Outbound logging interceptor --
+
+    struct OutboundLogger {
+        send_count: Arc<AtomicU64>,
+    }
+
+    impl OutboundLogger {
+        fn new() -> (Self, Arc<AtomicU64>) {
+            let count = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    send_count: count.clone(),
+                },
+                count,
+            )
+        }
+    }
+
+    impl OutboundInterceptor for OutboundLogger {
+        fn name(&self) -> &'static str {
+            "outbound-logger"
+        }
+
+        fn on_send(
+            &self,
+            _ctx: &OutboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &mut Headers,
+            _message: &dyn Any,
+        ) -> Disposition {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            Disposition::Continue
+        }
+    }
+
+    // -- Outbound rejecting interceptor --
+
+    struct OutboundRejectInterceptor;
+
+    impl OutboundInterceptor for OutboundRejectInterceptor {
+        fn name(&self) -> &'static str {
+            "outbound-rejecter"
+        }
+
+        fn on_send(
+            &self,
+            _ctx: &OutboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &mut Headers,
+            _message: &dyn Any,
+        ) -> Disposition {
+            Disposition::Reject("blocked by outbound".into())
+        }
+    }
+
+    // -- On-complete outcome-capturing interceptor --
+
+    struct OutcomeCapture {
+        ask_reply_count: Arc<AtomicU64>,
+        tell_success_count: Arc<AtomicU64>,
+    }
+
+    impl OutcomeCapture {
+        fn new() -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let ask = Arc::new(AtomicU64::new(0));
+            let tell = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    ask_reply_count: ask.clone(),
+                    tell_success_count: tell.clone(),
+                },
+                ask,
+                tell,
+            )
+        }
+    }
+
+    impl InboundInterceptor for OutcomeCapture {
+        fn name(&self) -> &'static str {
+            "outcome-capture"
+        }
+
+        fn on_complete(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &Headers,
+            outcome: &Outcome<'_>,
+        ) {
+            match outcome {
+                Outcome::AskSuccess { reply } => {
+                    // Verify we can downcast the reply
+                    if reply.downcast_ref::<String>().is_some() {
+                        self.ask_reply_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Outcome::TellSuccess => {
+                    self.tell_success_count.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // -- Tests --
+
+    #[tokio::test]
+    async fn test_inbound_interceptor_called() {
+        let (interceptor, receive_count, complete_count) = LoggingInterceptor::new();
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(interceptor)],
+        };
+
+        let runtime = RactorRuntime::new();
+        let actor = runtime.spawn_with_options::<Echo>("echo-inbound-called", (), options);
+
+        // Send a tell
+        actor.tell(Fire(1)).unwrap();
+        // Send another tell
+        actor.tell(Fire(2)).unwrap();
+        // Give ractor time to process
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(receive_count.load(Ordering::SeqCst), 2);
+        assert_eq!(complete_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_outbound_interceptor_called() {
+        let (interceptor, send_count) = OutboundLogger::new();
+        let mut runtime = RactorRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(interceptor));
+
+        let actor = runtime.spawn::<Echo>("echo-outbound-called", ());
+
+        actor.tell(Fire(1)).unwrap();
+        actor.tell(Fire(2)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(send_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_reject_ask() {
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(RejectInterceptor {
+                reason: "forbidden".into(),
+            })],
+        };
+
+        let runtime = RactorRuntime::new();
+        let actor = runtime.spawn_with_options::<Echo>("echo-reject-ask", (), options);
+
+        let reply = actor.ask(Ping("hi".into()), None).unwrap();
+        let result = reply.await;
+        match result {
+            Err(RuntimeError::Rejected {
+                interceptor,
+                reason,
+            }) => {
+                assert_eq!(interceptor, "rejecter");
+                assert_eq!(reason, "forbidden");
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_with_ask_reply() {
+        let (outcome_capture, ask_count, tell_count) = OutcomeCapture::new();
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(outcome_capture)],
+        };
+
+        let runtime = RactorRuntime::new();
+        let actor = runtime.spawn_with_options::<Echo>("echo-on-complete", (), options);
+
+        // Send an ask — on_complete should see AskSuccess with the String reply
+        let reply = actor.ask(Ping("test".into()), None).unwrap().await.unwrap();
+        assert_eq!(reply, "pong:test");
+
+        // Send a tell — on_complete should see TellSuccess
+        actor.tell(Fire(42)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(ask_count.load(Ordering::SeqCst), 1);
+        assert_eq!(tell_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_outbound_reject_ask() {
+        let mut runtime = RactorRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(OutboundRejectInterceptor));
+
+        let actor = runtime.spawn::<Echo>("echo-outbound-reject", ());
+
+        let reply = actor.ask(Ping("hi".into()), None).unwrap();
+        let result = reply.await;
+        match result {
+            Err(RuntimeError::Rejected {
+                interceptor,
+                reason,
+            }) => {
+                assert_eq!(interceptor, "outbound-rejecter");
+                assert_eq!(reason, "blocked by outbound");
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inbound_and_outbound_both_called() {
+        let (inbound, in_recv, in_comp) = LoggingInterceptor::new();
+        let (outbound, out_send) = OutboundLogger::new();
+
+        let mut runtime = RactorRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(outbound));
+
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(inbound)],
+        };
+        let actor = runtime.spawn_with_options::<Echo>("echo-both-pipelines", (), options);
+
+        let reply = actor.ask(Ping("x".into()), None).unwrap().await.unwrap();
+        assert_eq!(reply, "pong:x");
+
+        // Both pipelines should have fired
+        assert_eq!(out_send.load(Ordering::SeqCst), 1);
+        assert_eq!(in_recv.load(Ordering::SeqCst), 1);
+        assert_eq!(in_comp.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_reject_tell_silently_dropped() {
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(RejectInterceptor {
+                reason: "nope".into(),
+            })],
+        };
+
+        let runtime = RactorRuntime::new();
+        let actor = runtime.spawn_with_options::<Echo>("echo-reject-tell", (), options);
+
+        // Tell with rejection should not error (fire-and-forget has no error path)
+        actor.tell(Fire(1)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Actor should still be alive
+        assert!(actor.is_alive());
+    }
+}

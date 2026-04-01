@@ -45,7 +45,7 @@ pub mod cluster;
 pub mod runtime;
 
 pub use cluster::RactorClusterEvents;
-pub use runtime::{RactorActorRef, RactorRuntime};
+pub use runtime::{RactorActorRef, RactorRuntime, SpawnOptions};
 
 // Re-export the core dactor crate for convenience
 pub use dactor;

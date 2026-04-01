@@ -6,6 +6,8 @@
 use std::any::Any;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -16,8 +18,11 @@ use dactor::actor::{
     TypedActorRef,
 };
 use dactor::errors::{ActorSendError, ErrorAction, RuntimeError};
-use dactor::interceptor::{Disposition, SendMode};
-use dactor::message::{Headers, Message};
+use dactor::interceptor::{
+    Disposition, InboundContext, InboundInterceptor, OutboundContext, OutboundInterceptor, Outcome,
+    SendMode,
+};
+use dactor::message::{Headers, Message, RuntimeHeaders};
 use dactor::node::{ActorId, NodeId};
 use dactor::stream::{BoxStream, StreamReceiver, StreamSender};
 
@@ -267,6 +272,7 @@ struct RactorDactorActor<A: Actor> {
 struct RactorActorState<A: Actor> {
     actor: A,
     ctx: ActorContext,
+    interceptors: Vec<Box<dyn InboundInterceptor>>,
 }
 
 /// Arguments passed to the ractor actor at spawn time.
@@ -275,6 +281,7 @@ struct RactorSpawnArgs<A: Actor> {
     deps: A::Deps,
     actor_id: ActorId,
     actor_name: String,
+    interceptors: Vec<Box<dyn InboundInterceptor>>,
 }
 
 impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
@@ -290,7 +297,11 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
         let mut actor = A::create(args.args, args.deps);
         let mut ctx = ActorContext::new(args.actor_id, args.actor_name);
         actor.on_start(&mut ctx).await;
-        Ok(RactorActorState { actor, ctx })
+        Ok(RactorActorState {
+            actor,
+            ctx,
+            interceptors: args.interceptors,
+        })
     }
 
     async fn handle(
@@ -300,8 +311,61 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
         state: &mut Self::State,
     ) -> Result<(), ractor::ActorProcessingErr> {
         let dispatch = message.0;
-        state.ctx.send_mode = Some(dispatch.send_mode());
+
+        // Capture metadata before dispatch consumes the message
+        let send_mode = dispatch.send_mode();
+        let message_type = dispatch.message_type_name();
+
+        state.ctx.send_mode = Some(send_mode);
         state.ctx.headers = Headers::new();
+
+        // Run inbound interceptor pipeline
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let mut total_delay = Duration::ZERO;
+        let mut rejection: Option<(String, Disposition)> = None;
+
+        {
+            let ictx = InboundContext {
+                actor_id: state.ctx.actor_id.clone(),
+                actor_name: &state.ctx.actor_name,
+                message_type,
+                send_mode,
+                remote: false,
+                origin_node: None,
+            };
+
+            for interceptor in &state.interceptors {
+                match interceptor.on_receive(
+                    &ictx,
+                    &runtime_headers,
+                    &mut headers,
+                    dispatch.message_any(),
+                ) {
+                    Disposition::Continue => {}
+                    Disposition::Delay(d) => {
+                        total_delay += d;
+                    }
+                    disp @ (Disposition::Drop | Disposition::Reject(_) | Disposition::Retry(_)) => {
+                        rejection = Some((interceptor.name().to_string(), disp));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If rejected/dropped/retry, propagate proper error to caller
+        if let Some((interceptor_name, disposition)) = rejection {
+            dispatch.reject(disposition, &interceptor_name);
+            return Ok(());
+        }
+
+        if !total_delay.is_zero() {
+            tokio::time::sleep(total_delay).await;
+        }
+
+        // Copy interceptor-populated headers to ActorContext so handler can access them
+        state.ctx.headers = headers;
 
         // Propagate cancellation token to context
         let cancel_token = dispatch.cancel_token();
@@ -340,13 +404,39 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
 
         state.ctx.set_cancellation_token(None);
 
+        // Build context for on_complete
+        let ictx = InboundContext {
+            actor_id: state.ctx.actor_id.clone(),
+            actor_name: &state.ctx.actor_name,
+            message_type,
+            send_mode,
+            remote: false,
+            origin_node: None,
+        };
+
         match result {
             Ok(dispatch_result) => {
+                let outcome = match (&dispatch_result.reply, send_mode) {
+                    (Some(reply), SendMode::Ask) => Outcome::AskSuccess { reply: reply.as_ref() },
+                    _ => Outcome::TellSuccess,
+                };
+
+                for interceptor in &state.interceptors {
+                    interceptor.on_complete(&ictx, &runtime_headers, &state.ctx.headers, &outcome);
+                }
+
+                // Send reply to caller AFTER interceptors have seen it
                 dispatch_result.send_reply();
             }
             Err(_panic) => {
                 let error = ActorError::internal("handler panicked");
                 let action = state.actor.on_error(&error);
+
+                let outcome = Outcome::HandlerError { error };
+                for interceptor in &state.interceptors {
+                    interceptor.on_complete(&ictx, &runtime_headers, &state.ctx.headers, &outcome);
+                }
+
                 match action {
                     ErrorAction::Resume => {
                         // Continue processing next message
@@ -355,7 +445,6 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
                         myself.stop(None);
                     }
                     ErrorAction::Restart => {
-                        // TODO: full restart — treat as Resume for now
                         tracing::warn!("Restart not fully implemented, treating as Resume");
                     }
                 }
@@ -391,6 +480,7 @@ pub struct RactorActorRef<A: Actor> {
     id: ActorId,
     name: String,
     inner: ractor::ActorRef<DactorMsg<A>>,
+    outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
 }
 
 impl<A: Actor> Clone for RactorActorRef<A> {
@@ -399,6 +489,7 @@ impl<A: Actor> Clone for RactorActorRef<A> {
             id: self.id.clone(),
             name: self.name.clone(),
             inner: self.inner.clone(),
+            outbound_interceptors: self.outbound_interceptors.clone(),
         }
     }
 }
@@ -436,6 +527,27 @@ impl<A: Actor + 'static> TypedActorRef<A> for RactorActorRef<A> {
         A: Handler<M>,
         M: Message<Reply = ()>,
     {
+        // Run outbound interceptors
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let octx = OutboundContext {
+            target_id: self.id.clone(),
+            target_name: &self.name,
+            message_type: std::any::type_name::<M>(),
+            send_mode: SendMode::Tell,
+            remote: false,
+        };
+
+        for interceptor in self.outbound_interceptors.iter() {
+            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
+                Disposition::Continue => {}
+                Disposition::Delay(_) => {} // Not supported in sync tell
+                Disposition::Drop => return Ok(()),
+                Disposition::Reject(_) => return Ok(()),
+                Disposition::Retry(_) => return Ok(()),
+            }
+        }
+
         let dispatch: Box<dyn Dispatch<A>> = Box::new(TypedDispatch { msg });
         self.inner
             .cast(DactorMsg(dispatch))
@@ -451,6 +563,49 @@ impl<A: Actor + 'static> TypedActorRef<A> for RactorActorRef<A> {
         A: Handler<M>,
         M: Message,
     {
+        // Run outbound interceptors
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let octx = OutboundContext {
+            target_id: self.id.clone(),
+            target_name: &self.name,
+            message_type: std::any::type_name::<M>(),
+            send_mode: SendMode::Ask,
+            remote: false,
+        };
+
+        for interceptor in self.outbound_interceptors.iter() {
+            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
+                Disposition::Continue => {}
+                Disposition::Delay(_) => {} // Not supported in sync context
+                Disposition::Drop => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(Err(RuntimeError::ActorNotFound(
+                        "message dropped by outbound interceptor".into(),
+                    )));
+                    return Ok(AskReply::new(rx));
+                }
+                Disposition::Reject(reason) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let name = interceptor.name().to_string();
+                    let _ = tx.send(Err(RuntimeError::Rejected {
+                        interceptor: name,
+                        reason,
+                    }));
+                    return Ok(AskReply::new(rx));
+                }
+                Disposition::Retry(retry_after) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let name = interceptor.name().to_string();
+                    let _ = tx.send(Err(RuntimeError::RetryAfter {
+                        interceptor: name,
+                        retry_after,
+                    }));
+                    return Ok(AskReply::new(rx));
+                }
+            }
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let dispatch: Box<dyn Dispatch<A>> = Box::new(AskDispatch {
             msg,
@@ -473,6 +628,37 @@ impl<A: Actor + 'static> TypedActorRef<A> for RactorActorRef<A> {
         A: StreamHandler<M>,
         M: Message,
     {
+        // Run outbound interceptors
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let octx = OutboundContext {
+            target_id: self.id.clone(),
+            target_name: &self.name,
+            message_type: std::any::type_name::<M>(),
+            send_mode: SendMode::Stream,
+            remote: false,
+        };
+
+        for interceptor in self.outbound_interceptors.iter() {
+            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
+                Disposition::Continue => {}
+                Disposition::Delay(_) => {}
+                Disposition::Drop => {
+                    return Err(ActorSendError(
+                        "stream dropped by outbound interceptor".into(),
+                    ));
+                }
+                Disposition::Reject(reason) => {
+                    return Err(ActorSendError(format!("stream rejected: {}", reason)));
+                }
+                Disposition::Retry(_) => {
+                    return Err(ActorSendError(
+                        "stream retry requested by interceptor".into(),
+                    ));
+                }
+            }
+        }
+
         let buffer = buffer.max(1);
         let (tx, rx) = tokio::sync::mpsc::channel(buffer);
         let sender = StreamSender::new(tx);
@@ -494,6 +680,49 @@ impl<A: Actor + 'static> TypedActorRef<A> for RactorActorRef<A> {
         A: FeedHandler<M>,
         M: FeedMessage,
     {
+        // Run outbound interceptors
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let octx = OutboundContext {
+            target_id: self.id.clone(),
+            target_name: &self.name,
+            message_type: std::any::type_name::<M>(),
+            send_mode: SendMode::Feed,
+            remote: false,
+        };
+
+        for interceptor in self.outbound_interceptors.iter() {
+            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
+                Disposition::Continue => {}
+                Disposition::Delay(_) => {}
+                Disposition::Drop => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(Err(RuntimeError::ActorNotFound(
+                        "message dropped by outbound interceptor".into(),
+                    )));
+                    return Ok(AskReply::new(rx));
+                }
+                Disposition::Reject(reason) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let name = interceptor.name().to_string();
+                    let _ = tx.send(Err(RuntimeError::Rejected {
+                        interceptor: name,
+                        reason,
+                    }));
+                    return Ok(AskReply::new(rx));
+                }
+                Disposition::Retry(retry_after) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let name = interceptor.name().to_string();
+                    let _ = tx.send(Err(RuntimeError::RetryAfter {
+                        interceptor: name,
+                        retry_after,
+                    }));
+                    return Ok(AskReply::new(rx));
+                }
+            }
+        }
+
         let buffer = buffer.max(1);
         let (item_tx, item_rx) = tokio::sync::mpsc::channel(buffer);
         let receiver = StreamReceiver::new(item_rx);
@@ -548,6 +777,24 @@ impl<A: Actor + 'static> TypedActorRef<A> for RactorActorRef<A> {
 }
 
 // ---------------------------------------------------------------------------
+// SpawnOptions
+// ---------------------------------------------------------------------------
+
+/// Options for spawning an actor, including the inbound interceptor pipeline.
+pub struct SpawnOptions {
+    /// Inbound interceptors to attach to the actor.
+    pub interceptors: Vec<Box<dyn InboundInterceptor>>,
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        Self {
+            interceptors: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RactorRuntime
 // ---------------------------------------------------------------------------
 
@@ -560,6 +807,7 @@ pub struct RactorRuntime {
     node_id: NodeId,
     next_local: AtomicU64,
     cluster_events: RactorClusterEvents,
+    outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
 }
 
 impl RactorRuntime {
@@ -569,7 +817,18 @@ impl RactorRuntime {
             node_id: NodeId("ractor-node".into()),
             next_local: AtomicU64::new(1),
             cluster_events: RactorClusterEvents::new(),
+            outbound_interceptors: Arc::new(Vec::new()),
         }
+    }
+
+    /// Add a global outbound interceptor.
+    ///
+    /// **Must be called before any actors are spawned.** Panics if actors
+    /// already hold references to the interceptor list (i.e., after `spawn()`).
+    pub fn add_outbound_interceptor(&mut self, interceptor: Box<dyn OutboundInterceptor>) {
+        Arc::get_mut(&mut self.outbound_interceptors)
+            .expect("cannot add interceptors after actors are spawned")
+            .push(interceptor);
     }
 
     /// Access the cluster events subsystem.
@@ -587,7 +846,7 @@ impl RactorRuntime {
     where
         A: Actor<Deps = ()> + 'static,
     {
-        self.spawn_with_deps::<A>(name, args, ())
+        self.spawn_internal::<A>(name, args, (), Vec::new())
     }
 
     /// Spawn an actor with explicit dependencies.
@@ -596,6 +855,32 @@ impl RactorRuntime {
         name: &str,
         args: A::Args,
         deps: A::Deps,
+    ) -> RactorActorRef<A>
+    where
+        A: Actor + 'static,
+    {
+        self.spawn_internal::<A>(name, args, deps, Vec::new())
+    }
+
+    /// Spawn an actor with spawn options (including inbound interceptors).
+    pub fn spawn_with_options<A>(
+        &self,
+        name: &str,
+        args: A::Args,
+        options: SpawnOptions,
+    ) -> RactorActorRef<A>
+    where
+        A: Actor<Deps = ()> + 'static,
+    {
+        self.spawn_internal::<A>(name, args, (), options.interceptors)
+    }
+
+    fn spawn_internal<A>(
+        &self,
+        name: &str,
+        args: A::Args,
+        deps: A::Deps,
+        interceptors: Vec<Box<dyn InboundInterceptor>>,
     ) -> RactorActorRef<A>
     where
         A: Actor + 'static,
@@ -615,6 +900,7 @@ impl RactorRuntime {
             deps,
             actor_id: actor_id.clone(),
             actor_name: actor_name.clone(),
+            interceptors,
         };
 
         // Bridge sync → async: use a std thread to avoid blocking the
@@ -647,6 +933,7 @@ impl RactorRuntime {
             id: actor_id,
             name: actor_name,
             inner: actor_ref,
+            outbound_interceptors: self.outbound_interceptors.clone(),
         }
     }
 }
