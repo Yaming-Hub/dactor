@@ -193,6 +193,20 @@ pub struct ActorContext {
 }
 
 impl ActorContext {
+    /// Create a new `ActorContext` for an actor.
+    ///
+    /// Used by runtime adapters to construct the context before calling
+    /// lifecycle hooks and handlers.
+    pub fn new(actor_id: ActorId, actor_name: String) -> Self {
+        Self {
+            actor_id,
+            actor_name,
+            send_mode: None,
+            headers: Headers::new(),
+            cancellation_token: None,
+        }
+    }
+
     /// Returns a future that completes when the current request is cancelled.
     /// Use in `tokio::select!` to cooperatively check for cancellation:
     ///

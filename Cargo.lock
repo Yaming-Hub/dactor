@@ -163,9 +163,14 @@ dependencies = [
 name = "dactor-ractor"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dactor",
+ "futures",
  "ractor",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
