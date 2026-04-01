@@ -19,7 +19,7 @@ pub struct StreamSender<T: Send + 'static> {
 
 impl<T: Send + 'static> StreamSender<T> {
     /// Create a new StreamSender wrapping a tokio mpsc sender.
-    pub(crate) fn new(inner: tokio::sync::mpsc::Sender<T>) -> Self {
+    pub fn new(inner: tokio::sync::mpsc::Sender<T>) -> Self {
         Self { inner }
     }
 
@@ -89,7 +89,7 @@ pub struct StreamReceiver<T: Send + 'static> {
 
 impl<T: Send + 'static> StreamReceiver<T> {
     /// Create a new StreamReceiver wrapping a tokio mpsc receiver.
-    pub(crate) fn new(inner: tokio::sync::mpsc::Receiver<T>) -> Self {
+    pub fn new(inner: tokio::sync::mpsc::Receiver<T>) -> Self {
         Self { inner }
     }
 
