@@ -23,6 +23,7 @@
 //! - [`dactor-kameo`](https://crates.io/crates/dactor-kameo) — kameo adapter
 
 pub mod actor;
+pub mod dispatch;
 pub mod errors;
 pub mod cluster;
 pub mod dead_letter;
