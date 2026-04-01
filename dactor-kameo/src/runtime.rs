@@ -397,6 +397,9 @@ impl<A: Actor + 'static> kameo::message::Message<DactorMsg<A>> for KameoDactorAc
                 biased;
                 r = dispatch_fut => r,
                 _ = token.cancelled() => {
+                    // In-flight cancellation: dispatch_fut is dropped, which drops
+                    // reply_tx inside it. Caller's AskReply sees channel closed.
+                    // Pre-dispatch cancellation (above) sends RuntimeError::Cancelled.
                     self.ctx.set_cancellation_token(None);
                     return;
                 }

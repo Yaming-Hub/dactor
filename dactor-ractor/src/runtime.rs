@@ -390,6 +390,9 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
                 biased;
                 r = dispatch_fut => r,
                 _ = token.cancelled() => {
+                    // In-flight cancellation: dispatch_fut is dropped, which drops
+                    // reply_tx inside it. Caller's AskReply sees channel closed.
+                    // Pre-dispatch cancellation (above) sends RuntimeError::Cancelled.
                     state.ctx.set_cancellation_token(None);
                     return Ok(());
                 }
