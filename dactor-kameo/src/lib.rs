@@ -1,25 +1,43 @@
 //! # dactor-kameo
 //!
-//! Kameo adapter for the [`dactor`] distributed actor framework.
+//! Kameo adapter for the [`dactor`] distributed actor framework (v0.2 API).
 //!
-//! This crate provides [`KameoRuntime`], an implementation of
-//! [`dactor::ActorRuntime`] backed by kameo actors.
-//! Actors are spawned as real kameo actors via kameo's `Spawn::spawn`,
-//! and messages are delivered through kameo's mailbox system.
+//! This crate provides [`KameoRuntime`], which spawns dactor actors as real
+//! kameo actors via kameo's `Spawn` trait. Messages are delivered through
+//! kameo's mailbox as type-erased dispatch envelopes, supporting multiple
+//! `Handler<M>` impls per actor.
 //!
 //! # Quick start
 //!
 //! ```rust,no_run
+//! use dactor::prelude::*;
+//! use dactor::message::Message;
 //! use dactor_kameo::KameoRuntime;
-//! use dactor::{ActorRuntime, ActorRef};
+//! use async_trait::async_trait;
+//!
+//! struct MyActor;
+//!
+//! impl Actor for MyActor {
+//!     type Args = ();
+//!     type Deps = ();
+//!     fn create(_: (), _: ()) -> Self { MyActor }
+//! }
+//!
+//! struct Greet(String);
+//! impl Message for Greet { type Reply = (); }
+//!
+//! #[async_trait]
+//! impl Handler<Greet> for MyActor {
+//!     async fn handle(&mut self, msg: Greet, _ctx: &mut ActorContext) {
+//!         println!("Got: {}", msg.0);
+//!     }
+//! }
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let runtime = KameoRuntime::new();
-//!     let actor = runtime.spawn("greeter", |msg: String| {
-//!         println!("Got: {msg}");
-//!     });
-//!     actor.send("hello".into()).unwrap();
+//!     let actor = runtime.spawn::<MyActor>("greeter", ());
+//!     actor.tell(Greet("hello".into())).unwrap();
 //! }
 //! ```
 
@@ -27,7 +45,7 @@ pub mod cluster;
 pub mod runtime;
 
 pub use cluster::KameoClusterEvents;
-pub use runtime::{KameoActorRef, KameoRuntime, KameoTimerHandle};
+pub use runtime::{KameoActorRef, KameoRuntime, SpawnOptions};
 
 // Re-export the core dactor crate for convenience
 pub use dactor;

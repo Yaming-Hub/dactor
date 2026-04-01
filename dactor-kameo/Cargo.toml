@@ -13,8 +13,13 @@ categories = ["concurrency", "network-programming"]
 [dependencies]
 dactor = { version = "0.2.0", path = "../dactor", features = ["serde"] }
 kameo = "0.19.2"
-tokio = { version = "1", features = ["time", "rt", "sync"] }
+tokio = { version = "1", features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }
+async-trait = "0.1"
+tokio-util = "0.7"
+tokio-stream = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tracing = "0.1"
 
 [dev-dependencies]
 dactor = { version = "0.2.0", path = "../dactor", features = ["serde", "test-support"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
