@@ -262,7 +262,6 @@ impl<A: Actor + 'static> kameo::message::Message<DactorMsg<A>> for KameoDactorAc
                 dispatch_result.send_reply();
             }
             Err(_panic) => {
-                self.stop_reason = Some("handler panicked".into());
                 let error = ActorError::internal("handler panicked");
                 let action = self.actor.on_error(&error);
 
@@ -273,9 +272,10 @@ impl<A: Actor + 'static> kameo::message::Message<DactorMsg<A>> for KameoDactorAc
 
                 match action {
                     ErrorAction::Resume => {
-                        // Continue processing next message
+                        // Actor resumes — do NOT set stop_reason (graceful lifecycle continues)
                     }
                     ErrorAction::Stop | ErrorAction::Escalate => {
+                        self.stop_reason = Some("handler panicked".into());
                         // Signal kameo to stop via the context — but we don't
                         // have access to the kameo Context here since we
                         // consumed it in the signature. Instead, use kill on
