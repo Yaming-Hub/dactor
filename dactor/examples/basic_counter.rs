@@ -96,14 +96,14 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 3. Ask for the current count via ask().
-    let count = counter.ask(GetCount).unwrap().await.unwrap();
+    let count = counter.ask(GetCount, None).unwrap().await.unwrap();
     println!("\nask(GetCount) → {}", count);
 
     // 4. Reset and get the old value back.
-    let old = counter.ask(Reset).unwrap().await.unwrap();
+    let old = counter.ask(Reset, None).unwrap().await.unwrap();
     println!("ask(Reset)    → old value was {}", old);
 
-    let count = counter.ask(GetCount).unwrap().await.unwrap();
+    let count = counter.ask(GetCount, None).unwrap().await.unwrap();
     println!("ask(GetCount) → {} (after reset)", count);
 
     // 5. Stop the actor gracefully.

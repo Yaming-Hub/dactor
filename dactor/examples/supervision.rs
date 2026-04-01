@@ -147,7 +147,7 @@ async fn main() {
     worker.tell(DoWork("task-C".into())).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let completed = worker.ask(GetCompleted).unwrap().await.unwrap();
+    let completed = worker.ask(GetCompleted, None).unwrap().await.unwrap();
     println!("  [Main] worker completed {} tasks", completed);
 
     // 4. Gracefully stop the worker — supervisor receives ChildTerminated.

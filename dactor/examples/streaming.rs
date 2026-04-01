@@ -109,7 +109,7 @@ async fn main() {
         ],
     );
 
-    let mut stream = server.stream(GetLogs, 16).unwrap();
+    let mut stream = server.stream(GetLogs, 16, None).unwrap();
     while let Some(entry) = stream.next().await {
         println!("  [Client] log entry: {}", entry);
     }
@@ -121,7 +121,7 @@ async fn main() {
 
     let input = futures::stream::iter(vec![10u64, 20, 30, 40, 50]);
     let total = aggregator
-        .feed(SumItems, Box::pin(input), 8)
+        .feed(SumItems, Box::pin(input), 8, None)
         .unwrap()
         .await
         .unwrap();
