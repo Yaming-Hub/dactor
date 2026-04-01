@@ -4511,10 +4511,10 @@ account_ref.tell(Deposit { amount: 100 }).await?;
 | dactor Feature | coerce | ractor | kameo |
 |---|---|---|---|
 | `EventSourced` trait | ✅ Maps to `PersistentActor` + `Recover<M>` | ⚙️ Adapter (hooks + external storage) | ⚙️ Adapter (hooks + external storage) |
-| `DurableState` trait | ⚙️ Adapter (use snapshot store only) | ⚙️ Adapter (hooks + external storage) | ⚙️ Adapter (hooks + external storage) |
-| `JournalStorage` | ✅ Maps to `JournalStorage` | ⚙️ Adapter provides | ⚙️ Adapter provides |
-| `SnapshotStorage` | ✅ Maps to snapshot in `JournalStorage` | ⚙️ Adapter provides | ⚙️ Adapter provides |
-| `StateStorage` | ⚙️ Adapter (snapshot store) | ⚙️ Adapter provides | ⚙️ Adapter provides |
+| `DurableState` trait | ⚙️ Adapter (use snapshot store only) | ⚙️ Adapter (hooks + external storage) | ✅ Maps to `kameo-persistence` snapshots |
+| `JournalStorage` | ✅ Maps to `JournalStorage` | ⚙️ Adapter provides | ⚙️ Adapter provides (kameo has no journal) |
+| `SnapshotStorage` | ✅ Maps to snapshot in `JournalStorage` | ⚙️ Adapter provides | ✅ Maps to `kameo-persistence` |
+| `StateStorage` | ⚙️ Adapter (snapshot store) | ⚙️ Adapter provides | ✅ Maps to `kameo-persistence` |
 | Recovery on start | ✅ Native (`started()` runs recovery) | ⚙️ Adapter (in `pre_start`) | ⚙️ Adapter (in `on_start`) |
 | `RecoveryFailurePolicy` | ✅ Maps to `recovery_failure_policy()` | ⚙️ Adapter logic | ⚙️ Adapter logic |
 | `SnapshotConfig` | ⚙️ Adapter (coerce has manual-only) | ⚙️ Adapter logic | ⚙️ Adapter logic |
@@ -4524,6 +4524,19 @@ account_ref.tell(Deposit { amount: 100 }).await?;
 > `handle` to auto-persist events, and intercepts `on_stop` for cleanup.
 > The adapter owns the `JournalStorage`/`StateStorage` instance — the provider
 > runtime is unaware of persistence.
+>
+> **Provider-specific persistence mapping:**
+>
+> - **coerce:** Native event sourcing. dactor's `EventSourced` maps directly to
+>   coerce's `PersistentActor` + `Recover<M>`. Journal and snapshot storage
+>   delegate to coerce's built-in backends (in-memory, Redis).
+> - **kameo:** `kameo-persistence` supports **snapshots only** (no event journal).
+>   `DurableState` maps to kameo-persistence's snapshot API. `EventSourced` is
+>   **not natively supported** — the adapter provides its own `JournalStorage`
+>   implementation (e.g., `InMemoryStorage` for tests, pluggable DB for production),
+>   bypassing kameo's persistence entirely for event sourcing.
+> - **ractor:** No built-in persistence. The adapter provides all storage
+>   implementations and manages the full recovery lifecycle in `pre_start`.
 
 #### 6.3.11 Event Sourcing vs Durable State — When to Use Which
 
