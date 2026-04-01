@@ -24,12 +24,14 @@
 pub mod actor;
 pub mod errors;
 pub mod cluster;
+pub mod dead_letter;
 pub mod interceptor;
 pub mod mailbox;
 pub mod message;
 pub mod persistence;
 pub mod stream;
 pub mod supervision;
+pub mod throttle;
 pub mod timer;
 pub mod clock;
 pub mod node;
@@ -66,6 +68,11 @@ pub use node::{NodeId, ActorId};
 pub use supervision::ChildTerminated;
 pub use interceptor::{InboundInterceptor, InboundContext, Disposition, Outcome, SendMode};
 pub use interceptor::{OutboundInterceptor, OutboundContext};
+pub use dead_letter::{
+    DeadLetterHandler, DeadLetterEvent, DeadLetterReason,
+    LoggingDeadLetterHandler, CollectingDeadLetterHandler, DeadLetterInfo,
+};
+pub use throttle::ActorRateLimiter;
 pub use mailbox::{MailboxConfig, OverflowStrategy};
 pub use stream::{BoxStream, StreamSendError, StreamSender};
 pub use stream::StreamReceiver;
