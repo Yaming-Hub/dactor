@@ -25,8 +25,8 @@ impl MockNetwork {
         parts.push((a.clone(), b.clone()));
     }
 
-    /// Heal a partition between two nodes.
-    pub fn heal(&self, a: &NodeId, b: &NodeId) {
+    /// Remove a partition between two nodes, restoring connectivity.
+    pub fn remove_partition(&self, a: &NodeId, b: &NodeId) {
         let mut parts = self.partitions.lock().unwrap();
         parts.retain(|(x, y)| !((x == a && y == b) || (x == b && y == a)));
     }

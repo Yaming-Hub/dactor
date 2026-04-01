@@ -61,7 +61,7 @@ async fn test_network_partition() {
     network.partition(&NodeId("node-1".into()), &NodeId("node-2".into()));
     assert!(network.is_partitioned(&NodeId("node-1".into()), &NodeId("node-2".into())));
 
-    network.heal(&NodeId("node-1".into()), &NodeId("node-2".into()));
+    network.remove_partition(&NodeId("node-1".into()), &NodeId("node-2".into()));
     assert!(!network.is_partitioned(&NodeId("node-1".into()), &NodeId("node-2".into())));
 }
 
