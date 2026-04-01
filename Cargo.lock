@@ -154,9 +154,14 @@ dependencies = [
 name = "dactor-kameo"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dactor",
+ "futures",
  "kameo",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

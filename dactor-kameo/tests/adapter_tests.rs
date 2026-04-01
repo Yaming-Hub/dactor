@@ -1,504 +1,857 @@
-//! Integration tests for the dactor-kameo adapter.
+//! Integration tests for the dactor-kameo v0.2 adapter.
 //!
-//! Covers ADAPT-01 through ADAPT-06 (adapter conformance) and KAMEO-02
-//! through KAMEO-11 (kameo-specific implementation tests).
+//! Runs the conformance suite plus kameo-specific tests for the v0.2
+//! `Actor` / `Handler<M>` / `TypedActorRef<A>` API.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use dactor::{ActorRef, ActorRuntime, ClusterEvent, ClusterEvents, NodeId, TimerHandle};
+use dactor::test_support::conformance::*;
 use dactor_kameo::KameoRuntime;
 
 // ---------------------------------------------------------------------------
-// ADAPT-01: spawn + send round-trip
+// Conformance suite
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn adapt_01_spawn_and_send() {
-    let rt = KameoRuntime::new();
-    let received = Arc::new(AtomicU64::new(0));
-    let r = received.clone();
-
-    let actor = rt.spawn("adapt01", move |msg: u64| {
-        r.fetch_add(msg, Ordering::SeqCst);
-    });
-
-    actor.send(42).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    assert_eq!(received.load(Ordering::SeqCst), 42);
+async fn conformance_tell_and_ask() {
+    let runtime = KameoRuntime::new();
+    test_tell_and_ask(|name, init| runtime.spawn::<ConformanceCounter>(name, init)).await;
 }
 
 #[tokio::test]
-async fn adapt_01_multiple_messages_in_order() {
-    let rt = KameoRuntime::new();
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let l = log.clone();
-
-    let actor = rt.spawn("adapt01_order", move |msg: u64| {
-        l.lock().unwrap().push(msg);
-    });
-
-    for i in 1..=5 {
-        actor.send(i).unwrap();
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let msgs = log.lock().unwrap().clone();
-    assert_eq!(msgs, vec![1, 2, 3, 4, 5]);
-}
-
-// ---------------------------------------------------------------------------
-// ADAPT-02: Processing group join / leave / broadcast
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn adapt_02_group_broadcast_reaches_all() {
-    let rt = KameoRuntime::new();
-    let c1 = Arc::new(AtomicU64::new(0));
-    let c2 = Arc::new(AtomicU64::new(0));
-    let c3 = Arc::new(AtomicU64::new(0));
-
-    let r1 = c1.clone();
-    let r2 = c2.clone();
-    let r3 = c3.clone();
-
-    let a1 = rt.spawn("g1", move |msg: u64| {
-        r1.fetch_add(msg, Ordering::SeqCst);
-    });
-    let a2 = rt.spawn("g2", move |msg: u64| {
-        r2.fetch_add(msg, Ordering::SeqCst);
-    });
-    let a3 = rt.spawn("g3", move |msg: u64| {
-        r3.fetch_add(msg, Ordering::SeqCst);
-    });
-
-    rt.join_group("test_group", &a1).unwrap();
-    rt.join_group("test_group", &a2).unwrap();
-    rt.join_group("test_group", &a3).unwrap();
-
-    rt.broadcast_group("test_group", 10u64).unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    assert_eq!(c1.load(Ordering::SeqCst), 10);
-    assert_eq!(c2.load(Ordering::SeqCst), 10);
-    assert_eq!(c3.load(Ordering::SeqCst), 10);
+async fn conformance_message_ordering() {
+    let runtime = KameoRuntime::new();
+    test_message_ordering(|name, init| runtime.spawn::<ConformanceCounter>(name, init)).await;
 }
 
 #[tokio::test]
-async fn adapt_02_leave_group_excludes_from_broadcast() {
-    let rt = KameoRuntime::new();
-    let c1 = Arc::new(AtomicU64::new(0));
-    let c2 = Arc::new(AtomicU64::new(0));
-
-    let r1 = c1.clone();
-    let r2 = c2.clone();
-
-    let a1 = rt.spawn("leave1", move |msg: u64| {
-        r1.fetch_add(msg, Ordering::SeqCst);
-    });
-    let a2 = rt.spawn("leave2", move |msg: u64| {
-        r2.fetch_add(msg, Ordering::SeqCst);
-    });
-
-    rt.join_group("leave_group", &a1).unwrap();
-    rt.join_group("leave_group", &a2).unwrap();
-
-    rt.leave_group("leave_group", &a1).unwrap();
-    rt.broadcast_group("leave_group", 5u64).unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    assert_eq!(c1.load(Ordering::SeqCst), 0, "left actor should not receive");
-    assert_eq!(c2.load(Ordering::SeqCst), 5, "remaining actor should receive");
-}
-
-// ---------------------------------------------------------------------------
-// ADAPT-03: Cluster events subscribe / emit
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn adapt_03_cluster_events_node_joined() {
-    let rt = KameoRuntime::new();
-    let joined = Arc::new(Mutex::new(Vec::new()));
-    let j = joined.clone();
-
-    rt.cluster_events()
-        .subscribe(Box::new(move |event| {
-            if let ClusterEvent::NodeJoined(id) = event {
-                j.lock().unwrap().push(id);
-            }
-        }))
-        .unwrap();
-
-    rt.cluster_events_handle()
-        .emit(ClusterEvent::NodeJoined(NodeId("5".into())));
-
-    let events = joined.lock().unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0], NodeId("5".into()));
+async fn conformance_ask_reply() {
+    let runtime = KameoRuntime::new();
+    test_ask_reply(|name, init| runtime.spawn::<ConformanceCounter>(name, init)).await;
 }
 
 #[tokio::test]
-async fn adapt_03_cluster_events_unsubscribe() {
-    let rt = KameoRuntime::new();
-    let count = Arc::new(AtomicU64::new(0));
-    let c = count.clone();
-
-    let sub_id = rt
-        .cluster_events()
-        .subscribe(Box::new(move |_event| {
-            c.fetch_add(1, Ordering::SeqCst);
-        }))
-        .unwrap();
-
-    rt.cluster_events_handle()
-        .emit(ClusterEvent::NodeJoined(NodeId("1".into())));
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-
-    rt.cluster_events().unsubscribe(sub_id).unwrap();
-    rt.cluster_events_handle()
-        .emit(ClusterEvent::NodeJoined(NodeId("2".into())));
-    assert_eq!(count.load(Ordering::SeqCst), 1, "unsubscribed callback should not fire");
+async fn conformance_stop() {
+    let runtime = KameoRuntime::new();
+    test_stop(|name, init| runtime.spawn::<ConformanceCounter>(name, init)).await;
 }
-
-// ---------------------------------------------------------------------------
-// ADAPT-04: send_interval fires periodically
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn adapt_04_send_interval_fires_periodically() {
-    let rt = KameoRuntime::new();
-    let count = Arc::new(AtomicU64::new(0));
-    let c = count.clone();
-
-    let actor = rt.spawn("ticker", move |_msg: u64| {
-        c.fetch_add(1, Ordering::SeqCst);
-    });
-
-    let _timer = rt.send_interval(&actor, Duration::from_millis(50), 1u64);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let n = count.load(Ordering::SeqCst);
-    assert!(n >= 3, "expected at least 3 timer fires, got {n}");
+async fn conformance_unique_ids() {
+    let runtime = KameoRuntime::new();
+    test_unique_ids(|name, init| runtime.spawn::<ConformanceCounter>(name, init)).await;
 }
-
-// ---------------------------------------------------------------------------
-// ADAPT-05: send_after fires once
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn adapt_05_send_after_fires_once() {
-    let rt = KameoRuntime::new();
-    let count = Arc::new(AtomicU64::new(0));
-    let c = count.clone();
-
-    let actor = rt.spawn("one_shot", move |_msg: u64| {
-        c.fetch_add(1, Ordering::SeqCst);
-    });
-
-    let _timer = rt.send_after(&actor, Duration::from_millis(100), 1u64);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    assert_eq!(count.load(Ordering::SeqCst), 1, "send_after should fire exactly once");
+async fn conformance_actor_name() {
+    let runtime = KameoRuntime::new();
+    test_actor_name(|name, init| runtime.spawn::<ConformanceCounter>(name, init)).await;
 }
 
 // ---------------------------------------------------------------------------
-// ADAPT-06: TimerHandle::cancel stops delivery
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn adapt_06_timer_cancel_stops_delivery() {
-    let rt = KameoRuntime::new();
-    let count = Arc::new(AtomicU64::new(0));
-    let c = count.clone();
-
-    let actor = rt.spawn("cancel_test", move |_msg: u64| {
-        c.fetch_add(1, Ordering::SeqCst);
-    });
-
-    let timer = rt.send_interval(&actor, Duration::from_millis(30), 1u64);
-    tokio::time::sleep(Duration::from_millis(120)).await;
-
-    let before = count.load(Ordering::SeqCst);
-    assert!(before >= 1, "should have received at least 1 message before cancel");
-    timer.cancel();
-
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let after = count.load(Ordering::SeqCst);
-
-    // Allow at most 1 in-flight message after cancel
-    assert!(
-        after <= before + 1,
-        "expected no more than 1 extra after cancel, before={before} after={after}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// KAMEO-02: send() maps to kameo tell() — fire-and-forget
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn kameo_02_send_is_fire_and_forget() {
-    let rt = KameoRuntime::new();
-    let received = Arc::new(Mutex::new(Vec::new()));
-    let r = received.clone();
-
-    let actor = rt.spawn("kameo02", move |msg: String| {
-        r.lock().unwrap().push(msg);
-    });
-
-    actor.send("hello".to_string()).unwrap();
-    actor.send("world".to_string()).unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let msgs = received.lock().unwrap().clone();
-    assert_eq!(msgs, vec!["hello", "world"]);
-}
-
-// ---------------------------------------------------------------------------
-// KAMEO-04: get_group_members returns typed refs
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn kameo_04_get_group_members() {
-    let rt = KameoRuntime::new();
-
-    let a1 = rt.spawn("mem1", move |_msg: u64| {});
-    let a2 = rt.spawn("mem2", move |_msg: u64| {});
-
-    rt.join_group("members_group", &a1).unwrap();
-    rt.join_group("members_group", &a2).unwrap();
-
-    let members = rt.get_group_members::<u64>("members_group").unwrap();
-    assert_eq!(members.len(), 2);
-
-    // Verify the returned refs work — send through them
-    let count = Arc::new(AtomicU64::new(0));
-    let c = count.clone();
-    let collector = rt.spawn("collector", move |msg: u64| {
-        c.fetch_add(msg, Ordering::SeqCst);
-    });
-    rt.join_group("members_group", &collector).unwrap();
-
-    rt.broadcast_group("members_group", 1u64).unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    assert_eq!(count.load(Ordering::SeqCst), 1);
-}
-
-// ---------------------------------------------------------------------------
-// KAMEO-07 / KAMEO-08: Timer via tokio + cancel before fire
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn kameo_07_send_after_cancel_before_fire() {
-    let rt = KameoRuntime::new();
-    let count = Arc::new(AtomicU64::new(0));
-    let c = count.clone();
-
-    let actor = rt.spawn("cancel_before", move |_msg: u64| {
-        c.fetch_add(1, Ordering::SeqCst);
-    });
-
-    let timer = rt.send_after(&actor, Duration::from_millis(200), 1u64);
-    timer.cancel();
-
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(
-        count.load(Ordering::SeqCst),
-        0,
-        "cancelled send_after should not fire"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// KAMEO-11: Re-exports core crate types
+// Kameo-specific: re-exports & default
 // ---------------------------------------------------------------------------
 
 #[test]
-fn kameo_11_reexports_core_types() {
-    // Verify that the dactor crate is re-exported and types are accessible
+fn reexports_core_types() {
     let _ = dactor_kameo::dactor::NodeId("1".into());
-
-    // Verify adapter types are exported
     let _rt = dactor_kameo::KameoRuntime::new();
     let _events = dactor_kameo::KameoClusterEvents::new();
 }
 
-// ---------------------------------------------------------------------------
-// Additional: KameoRuntime is Clone and Default
-// ---------------------------------------------------------------------------
-
 #[test]
-fn runtime_is_clone_and_default() {
-    let rt = KameoRuntime::default();
-    let _rt2 = rt.clone();
+fn runtime_is_default() {
+    let _rt = KameoRuntime::default();
 }
 
 // ---------------------------------------------------------------------------
-// Additional: Cluster events emit NodeLeft
+// Interceptor tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn cluster_events_node_left() {
-    let rt = KameoRuntime::new();
-    let left = Arc::new(Mutex::new(Vec::new()));
-    let l = left.clone();
+mod interceptor_tests {
+    use std::any::Any;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
-    rt.cluster_events()
-        .subscribe(Box::new(move |event| {
-            if let ClusterEvent::NodeLeft(id) = event {
-                l.lock().unwrap().push(id);
+    use async_trait::async_trait;
+
+    use dactor::actor::{Actor, ActorContext, Handler, TypedActorRef};
+    use dactor::errors::RuntimeError;
+    use dactor::interceptor::{
+        Disposition, InboundContext, InboundInterceptor, OutboundContext, OutboundInterceptor,
+        Outcome,
+    };
+    use dactor::message::{Headers, Message, RuntimeHeaders};
+    use dactor_kameo::{KameoRuntime, SpawnOptions};
+
+    // -- Test actor --
+
+    struct Echo;
+
+    impl Actor for Echo {
+        type Args = ();
+        type Deps = ();
+        fn create(_: (), _: ()) -> Self {
+            Echo
+        }
+    }
+
+    struct Ping(String);
+    impl Message for Ping {
+        type Reply = String;
+    }
+
+    #[async_trait]
+    impl Handler<Ping> for Echo {
+        async fn handle(&mut self, msg: Ping, _ctx: &mut ActorContext) -> String {
+            format!("pong:{}", msg.0)
+        }
+    }
+
+    struct Fire(u64);
+    impl Message for Fire {
+        type Reply = ();
+    }
+
+    #[async_trait]
+    impl Handler<Fire> for Echo {
+        async fn handle(&mut self, _msg: Fire, _ctx: &mut ActorContext) {
+            // fire-and-forget
+        }
+    }
+
+    // -- Logging interceptor (inbound) --
+
+    struct LoggingInterceptor {
+        receive_count: Arc<AtomicU64>,
+        complete_count: Arc<AtomicU64>,
+    }
+
+    impl LoggingInterceptor {
+        fn new() -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let receive = Arc::new(AtomicU64::new(0));
+            let complete = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    receive_count: receive.clone(),
+                    complete_count: complete.clone(),
+                },
+                receive,
+                complete,
+            )
+        }
+    }
+
+    impl InboundInterceptor for LoggingInterceptor {
+        fn name(&self) -> &'static str {
+            "logging"
+        }
+
+        fn on_receive(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &mut Headers,
+            _message: &dyn Any,
+        ) -> Disposition {
+            self.receive_count.fetch_add(1, Ordering::SeqCst);
+            Disposition::Continue
+        }
+
+        fn on_complete(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &Headers,
+            _outcome: &Outcome<'_>,
+        ) {
+            self.complete_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // -- Rejecting interceptor (inbound) --
+
+    struct RejectInterceptor {
+        reason: String,
+    }
+
+    impl InboundInterceptor for RejectInterceptor {
+        fn name(&self) -> &'static str {
+            "rejecter"
+        }
+
+        fn on_receive(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &mut Headers,
+            _message: &dyn Any,
+        ) -> Disposition {
+            Disposition::Reject(self.reason.clone())
+        }
+    }
+
+    // -- Outbound logging interceptor --
+
+    struct OutboundLogger {
+        send_count: Arc<AtomicU64>,
+    }
+
+    impl OutboundLogger {
+        fn new() -> (Self, Arc<AtomicU64>) {
+            let count = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    send_count: count.clone(),
+                },
+                count,
+            )
+        }
+    }
+
+    impl OutboundInterceptor for OutboundLogger {
+        fn name(&self) -> &'static str {
+            "outbound-logger"
+        }
+
+        fn on_send(
+            &self,
+            _ctx: &OutboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &mut Headers,
+            _message: &dyn Any,
+        ) -> Disposition {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            Disposition::Continue
+        }
+    }
+
+    // -- Outbound rejecting interceptor --
+
+    struct OutboundRejectInterceptor;
+
+    impl OutboundInterceptor for OutboundRejectInterceptor {
+        fn name(&self) -> &'static str {
+            "outbound-rejecter"
+        }
+
+        fn on_send(
+            &self,
+            _ctx: &OutboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &mut Headers,
+            _message: &dyn Any,
+        ) -> Disposition {
+            Disposition::Reject("blocked by outbound".into())
+        }
+    }
+
+    // -- On-complete outcome-capturing interceptor --
+
+    struct OutcomeCapture {
+        ask_reply_count: Arc<AtomicU64>,
+        tell_success_count: Arc<AtomicU64>,
+    }
+
+    impl OutcomeCapture {
+        fn new() -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let ask = Arc::new(AtomicU64::new(0));
+            let tell = Arc::new(AtomicU64::new(0));
+            (
+                Self {
+                    ask_reply_count: ask.clone(),
+                    tell_success_count: tell.clone(),
+                },
+                ask,
+                tell,
+            )
+        }
+    }
+
+    impl InboundInterceptor for OutcomeCapture {
+        fn name(&self) -> &'static str {
+            "outcome-capture"
+        }
+
+        fn on_complete(
+            &self,
+            _ctx: &InboundContext<'_>,
+            _rh: &RuntimeHeaders,
+            _headers: &Headers,
+            outcome: &Outcome<'_>,
+        ) {
+            match outcome {
+                Outcome::AskSuccess { reply } => {
+                    // Verify we can downcast the reply
+                    if reply.downcast_ref::<String>().is_some() {
+                        self.ask_reply_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Outcome::TellSuccess => {
+                    self.tell_success_count.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
             }
-        }))
-        .unwrap();
-
-    rt.cluster_events_handle()
-        .emit(ClusterEvent::NodeLeft(NodeId("99".into())));
-
-    let events = left.lock().unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0], NodeId("99".into()));
-}
-
-// ---------------------------------------------------------------------------
-// Additional: Multiple subscribers receive the same event
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn cluster_events_multiple_subscribers() {
-    let rt = KameoRuntime::new();
-    let c1 = Arc::new(AtomicU64::new(0));
-    let c2 = Arc::new(AtomicU64::new(0));
-
-    let r1 = c1.clone();
-    let r2 = c2.clone();
-
-    rt.cluster_events()
-        .subscribe(Box::new(move |_| {
-            r1.fetch_add(1, Ordering::SeqCst);
-        }))
-        .unwrap();
-
-    rt.cluster_events()
-        .subscribe(Box::new(move |_| {
-            r2.fetch_add(1, Ordering::SeqCst);
-        }))
-        .unwrap();
-
-    rt.cluster_events_handle()
-        .emit(ClusterEvent::NodeJoined(NodeId("1".into())));
-
-    assert_eq!(c1.load(Ordering::SeqCst), 1);
-    assert_eq!(c2.load(Ordering::SeqCst), 1);
-}
-
-// ---------------------------------------------------------------------------
-// Additional: Empty group operations are no-ops
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn empty_group_broadcast_is_noop() {
-    let rt = KameoRuntime::new();
-    rt.broadcast_group::<u64>("nonexistent", 42).unwrap();
-}
-
-#[tokio::test]
-async fn empty_group_get_members_returns_empty() {
-    let rt = KameoRuntime::new();
-    let members = rt.get_group_members::<u64>("nonexistent").unwrap();
-    assert!(members.is_empty());
-}
-
-// ---------------------------------------------------------------------------
-// Timer handle Drop aborts the task (no leak on drop without cancel)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn timer_drop_aborts_interval() {
-    let rt = KameoRuntime::new();
-    let count = Arc::new(AtomicU64::new(0));
-    let c = count.clone();
-
-    let actor = rt.spawn("timer_drop", move |_msg: u64| {
-        c.fetch_add(1, Ordering::SeqCst);
-    });
-
-    {
-        let _timer = rt.send_interval(&actor, Duration::from_millis(20), 1u64);
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        // _timer dropped here without calling cancel()
+        }
     }
 
-    let count_at_drop = count.load(Ordering::SeqCst);
-    assert!(count_at_drop > 0, "timer should have fired before drop");
+    // -- Tests --
 
-    // After drop, no more messages should arrive
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let count_after = count.load(Ordering::SeqCst);
-    assert_eq!(count_at_drop, count_after, "timer should stop after handle drop");
-}
+    #[tokio::test]
+    async fn test_inbound_interceptor_called() {
+        let (interceptor, receive_count, complete_count) = LoggingInterceptor::new();
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(interceptor)],
+        };
 
-#[tokio::test]
-async fn timer_drop_aborts_send_after() {
-    let rt = KameoRuntime::new();
-    let count = Arc::new(AtomicU64::new(0));
-    let c = count.clone();
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn_with_options::<Echo>("echo-inbound-called", (), options);
 
-    let actor = rt.spawn("timer_drop_after", move |_msg: u64| {
-        c.fetch_add(1, Ordering::SeqCst);
-    });
+        // Send a tell
+        actor.tell(Fire(1)).unwrap();
+        // Send another tell
+        actor.tell(Fire(2)).unwrap();
+        // Give kameo time to process
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    {
-        let _timer = rt.send_after(&actor, Duration::from_millis(200), 1u64);
-        // _timer dropped immediately — should abort before firing
+        assert_eq!(receive_count.load(Ordering::SeqCst), 2);
+        assert_eq!(complete_count.load(Ordering::SeqCst), 2);
     }
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(count.load(Ordering::SeqCst), 0, "send_after should not fire after drop");
+    #[tokio::test]
+    async fn test_outbound_interceptor_called() {
+        let (interceptor, send_count) = OutboundLogger::new();
+        let mut runtime = KameoRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(interceptor));
+
+        let actor = runtime.spawn::<Echo>("echo-outbound-called", ());
+
+        actor.tell(Fire(1)).unwrap();
+        actor.tell(Fire(2)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(send_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_reject_ask() {
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(RejectInterceptor {
+                reason: "forbidden".into(),
+            })],
+        };
+
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn_with_options::<Echo>("echo-reject-ask", (), options);
+
+        let reply = actor.ask(Ping("hi".into()), None).unwrap();
+        let result = reply.await;
+        match result {
+            Err(RuntimeError::Rejected {
+                interceptor,
+                reason,
+            }) => {
+                assert_eq!(interceptor, "rejecter");
+                assert_eq!(reason, "forbidden");
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_with_ask_reply() {
+        let (outcome_capture, ask_count, tell_count) = OutcomeCapture::new();
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(outcome_capture)],
+        };
+
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn_with_options::<Echo>("echo-on-complete", (), options);
+
+        // Send an ask — on_complete should see AskSuccess with the String reply
+        let reply = actor.ask(Ping("test".into()), None).unwrap().await.unwrap();
+        assert_eq!(reply, "pong:test");
+
+        // Send a tell — on_complete should see TellSuccess
+        actor.tell(Fire(42)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(ask_count.load(Ordering::SeqCst), 1);
+        assert_eq!(tell_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_outbound_reject_ask() {
+        let mut runtime = KameoRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(OutboundRejectInterceptor));
+
+        let actor = runtime.spawn::<Echo>("echo-outbound-reject", ());
+
+        let reply = actor.ask(Ping("hi".into()), None).unwrap();
+        let result = reply.await;
+        match result {
+            Err(RuntimeError::Rejected {
+                interceptor,
+                reason,
+            }) => {
+                assert_eq!(interceptor, "outbound-rejecter");
+                assert_eq!(reason, "blocked by outbound");
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inbound_and_outbound_both_called() {
+        let (inbound, in_recv, in_comp) = LoggingInterceptor::new();
+        let (outbound, out_send) = OutboundLogger::new();
+
+        let mut runtime = KameoRuntime::new();
+        runtime.add_outbound_interceptor(Box::new(outbound));
+
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(inbound)],
+        };
+        let actor = runtime.spawn_with_options::<Echo>("echo-both-pipelines", (), options);
+
+        let reply = actor.ask(Ping("x".into()), None).unwrap().await.unwrap();
+        assert_eq!(reply, "pong:x");
+
+        // Both pipelines should have fired
+        assert_eq!(out_send.load(Ordering::SeqCst), 1);
+        assert_eq!(in_recv.load(Ordering::SeqCst), 1);
+        assert_eq!(in_comp.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_reject_tell_silently_dropped() {
+        let options = SpawnOptions {
+            interceptors: vec![Box::new(RejectInterceptor {
+                reason: "nope".into(),
+            })],
+        };
+
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn_with_options::<Echo>("echo-reject-tell", (), options);
+
+        // Tell with rejection should not error (fire-and-forget has no error path)
+        actor.tell(Fire(1)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Actor should still be alive
+        assert!(actor.is_alive());
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Group type mismatch: broadcast with wrong type is a silent no-op
+// Lifecycle tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn group_type_mismatch_broadcast_is_noop() {
-    let rt = KameoRuntime::new();
-    let received = Arc::new(AtomicU64::new(0));
-    let r = received.clone();
+mod lifecycle_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
-    // Join with u64 message type
-    let actor = rt.spawn("type_mismatch", move |msg: u64| {
-        r.fetch_add(msg, Ordering::SeqCst);
-    });
-    rt.join_group("mixed", &actor).unwrap();
+    use async_trait::async_trait;
+    use tokio::sync::Mutex;
 
-    // Broadcast with String type — should silently skip the u64 actor
-    rt.broadcast_group::<String>("mixed", "hello".to_string()).unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    use dactor::actor::{Actor, ActorContext, ActorError, Handler, TypedActorRef};
+    use dactor::errors::ErrorAction;
+    use dactor::message::Message;
+    use dactor_kameo::KameoRuntime;
 
-    assert_eq!(received.load(Ordering::SeqCst), 0, "mismatched type should not deliver");
+    // -- Actor that records lifecycle events --
 
-    // Broadcast with correct type — should deliver
-    rt.broadcast_group::<u64>("mixed", 10).unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    struct LifecycleActor {
+        events: Arc<Mutex<Vec<String>>>,
+    }
 
-    assert_eq!(received.load(Ordering::SeqCst), 10, "correct type should deliver");
+    #[async_trait]
+    impl Actor for LifecycleActor {
+        type Args = Arc<Mutex<Vec<String>>>;
+        type Deps = ();
+        fn create(args: Self::Args, _deps: ()) -> Self {
+            Self { events: args }
+        }
+        async fn on_start(&mut self, _ctx: &mut ActorContext) {
+            self.events.lock().await.push("on_start".into());
+        }
+        async fn on_stop(&mut self) {
+            self.events.lock().await.push("on_stop".into());
+        }
+    }
+
+    struct Greet;
+    impl Message for Greet {
+        type Reply = ();
+    }
+
+    #[async_trait]
+    impl Handler<Greet> for LifecycleActor {
+        async fn handle(&mut self, _msg: Greet, _ctx: &mut ActorContext) {
+            self.events.lock().await.push("handle".into());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_start_called_before_messages() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<LifecycleActor>("lifecycle-start", events.clone());
+
+        actor.tell(Greet).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let log = events.lock().await;
+        assert!(log.len() >= 2, "expected at least on_start + handle");
+        assert_eq!(log[0], "on_start");
+        assert_eq!(log[1], "handle");
+    }
+
+    #[tokio::test]
+    async fn test_on_stop_called_after_stop() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<LifecycleActor>("lifecycle-stop", events.clone());
+
+        // Let on_start finish
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        actor.stop();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let log = events.lock().await;
+        assert!(log.contains(&"on_stop".to_string()), "on_stop should be called");
+    }
+
+    // -- Actor that panics on a specific message, with configurable on_error --
+
+    struct PanicActor {
+        action: ErrorAction,
+        error_count: Arc<AtomicU64>,
+        handle_count: Arc<AtomicU64>,
+    }
+
+    impl Actor for PanicActor {
+        type Args = (ErrorAction, Arc<AtomicU64>, Arc<AtomicU64>);
+        type Deps = ();
+        fn create(args: Self::Args, _deps: ()) -> Self {
+            Self {
+                action: args.0,
+                error_count: args.1,
+                handle_count: args.2,
+            }
+        }
+        fn on_error(&mut self, _error: &ActorError) -> ErrorAction {
+            self.error_count.fetch_add(1, Ordering::SeqCst);
+            self.action.clone()
+        }
+    }
+
+    struct DoPanic;
+    impl Message for DoPanic {
+        type Reply = ();
+    }
+
+    #[async_trait]
+    impl Handler<DoPanic> for PanicActor {
+        async fn handle(&mut self, _msg: DoPanic, _ctx: &mut ActorContext) {
+            panic!("intentional test panic");
+        }
+    }
+
+    struct SafeMsg;
+    impl Message for SafeMsg {
+        type Reply = String;
+    }
+
+    #[async_trait]
+    impl Handler<SafeMsg> for PanicActor {
+        async fn handle(&mut self, _msg: SafeMsg, _ctx: &mut ActorContext) -> String {
+            self.handle_count.fetch_add(1, Ordering::SeqCst);
+            "ok".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_error_resume_continues() {
+        let error_count = Arc::new(AtomicU64::new(0));
+        let handle_count = Arc::new(AtomicU64::new(0));
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<PanicActor>(
+            "panic-resume",
+            (ErrorAction::Resume, error_count.clone(), handle_count.clone()),
+        );
+
+        // Cause a panic
+        actor.tell(DoPanic).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // on_error should have been called
+        assert_eq!(error_count.load(Ordering::SeqCst), 1);
+
+        // Actor should still be alive and handle messages after resume
+        let reply = actor.ask(SafeMsg, None).unwrap().await.unwrap();
+        assert_eq!(reply, "ok");
+        assert_eq!(handle_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_on_error_stop_terminates() {
+        let error_count = Arc::new(AtomicU64::new(0));
+        let handle_count = Arc::new(AtomicU64::new(0));
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<PanicActor>(
+            "panic-stop",
+            (ErrorAction::Stop, error_count.clone(), handle_count.clone()),
+        );
+
+        // Cause a panic
+        actor.tell(DoPanic).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // on_error should have been called
+        assert_eq!(error_count.load(Ordering::SeqCst), 1);
+        // Actor should be dead
+        assert!(!actor.is_alive());
+    }
 }
 
-#[tokio::test]
-async fn group_get_members_wrong_type_returns_empty() {
-    let rt = KameoRuntime::new();
-    let actor = rt.spawn::<u64, _>("member_type", move |_| {});
-    rt.join_group("typed", &actor).unwrap();
+// ---------------------------------------------------------------------------
+// Stream tests
+// ---------------------------------------------------------------------------
 
-    // Query with wrong type returns empty
-    let members = rt.get_group_members::<String>("typed").unwrap();
-    assert!(members.is_empty(), "wrong type should return no members");
+mod stream_tests {
+    use async_trait::async_trait;
+    use futures::StreamExt;
 
-    // Query with correct type returns the member
-    let members = rt.get_group_members::<u64>("typed").unwrap();
-    assert_eq!(members.len(), 1);
+    use dactor::actor::{Actor, ActorContext, StreamHandler, TypedActorRef};
+    use dactor::message::Message;
+    use dactor::stream::StreamSender;
+    use dactor_kameo::KameoRuntime;
+
+    // -- Actor that streams N items --
+
+    struct Streamer;
+
+    impl Actor for Streamer {
+        type Args = ();
+        type Deps = ();
+        fn create(_: (), _: ()) -> Self {
+            Streamer
+        }
+    }
+
+    struct StreamN(u32);
+    impl Message for StreamN {
+        type Reply = u32;
+    }
+
+    #[async_trait]
+    impl StreamHandler<StreamN> for Streamer {
+        async fn handle_stream(
+            &mut self,
+            msg: StreamN,
+            sender: StreamSender<u32>,
+            _ctx: &mut ActorContext,
+        ) {
+            for i in 0..msg.0 {
+                if sender.send(i).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    struct StreamEmpty;
+    impl Message for StreamEmpty {
+        type Reply = u32;
+    }
+
+    #[async_trait]
+    impl StreamHandler<StreamEmpty> for Streamer {
+        async fn handle_stream(
+            &mut self,
+            _msg: StreamEmpty,
+            _sender: StreamSender<u32>,
+            _ctx: &mut ActorContext,
+        ) {
+            // Send nothing — stream closes when handler returns
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_returns_items() {
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<Streamer>("streamer-items", ());
+
+        let stream = actor.stream(StreamN(5), 8, None).unwrap();
+        let items: Vec<u32> = stream.collect().await;
+        assert_eq!(items, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_stream_empty() {
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<Streamer>("streamer-empty", ());
+
+        let stream = actor.stream(StreamEmpty, 8, None).unwrap();
+        let items: Vec<u32> = stream.collect().await;
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stream_consumer_drops_early() {
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<Streamer>("streamer-drop", ());
+
+        // Request a stream of 1000 items but only take 2
+        let stream = actor.stream(StreamN(1000), 1, None).unwrap();
+        let items: Vec<u32> = stream.take(2).collect().await;
+        assert_eq!(items, vec![0, 1]);
+
+        // Actor should still be alive after consumer drop
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(actor.is_alive());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feed tests
+// ---------------------------------------------------------------------------
+
+mod feed_tests {
+    use async_trait::async_trait;
+
+    use dactor::actor::{Actor, ActorContext, FeedHandler, FeedMessage, TypedActorRef};
+    use dactor::stream::{BoxStream, StreamReceiver};
+    use dactor_kameo::KameoRuntime;
+
+    // -- Actor that sums fed integers --
+
+    struct Summer;
+
+    impl Actor for Summer {
+        type Args = ();
+        type Deps = ();
+        fn create(_: (), _: ()) -> Self {
+            Summer
+        }
+    }
+
+    struct SumFeed;
+    impl FeedMessage for SumFeed {
+        type Item = u64;
+        type Reply = u64;
+    }
+
+    #[async_trait]
+    impl FeedHandler<SumFeed> for Summer {
+        async fn handle_feed(
+            &mut self,
+            _msg: SumFeed,
+            mut receiver: StreamReceiver<u64>,
+            _ctx: &mut ActorContext,
+        ) -> u64 {
+            let mut sum = 0u64;
+            while let Some(val) = receiver.recv().await {
+                sum += val;
+            }
+            sum
+        }
+    }
+
+    fn items_stream(items: Vec<u64>) -> BoxStream<u64> {
+        Box::pin(futures::stream::iter(items))
+    }
+
+    #[tokio::test]
+    async fn test_feed_sum_items() {
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<Summer>("summer-feed", ());
+
+        let input = items_stream(vec![1, 2, 3, 4, 5]);
+        let reply = actor.feed(SumFeed, input, 8, None).unwrap().await.unwrap();
+        assert_eq!(reply, 15);
+    }
+
+    #[tokio::test]
+    async fn test_feed_empty_stream() {
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<Summer>("summer-empty", ());
+
+        let input = items_stream(vec![]);
+        let reply = actor.feed(SumFeed, input, 8, None).unwrap().await.unwrap();
+        assert_eq!(reply, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation tests
+// ---------------------------------------------------------------------------
+
+mod cancellation_tests {
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    use dactor::actor::{Actor, ActorContext, Handler, TypedActorRef};
+    use dactor::errors::RuntimeError;
+    use dactor::message::Message;
+    use dactor_kameo::KameoRuntime;
+
+    struct SlowActor;
+
+    impl Actor for SlowActor {
+        type Args = ();
+        type Deps = ();
+        fn create(_: (), _: ()) -> Self {
+            SlowActor
+        }
+    }
+
+    struct SlowPing;
+    impl Message for SlowPing {
+        type Reply = String;
+    }
+
+    #[async_trait]
+    impl Handler<SlowPing> for SlowActor {
+        async fn handle(&mut self, _msg: SlowPing, _ctx: &mut ActorContext) -> String {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            "done".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_ask_before_handler() {
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<SlowActor>("cancel-pre", ());
+
+        // Pre-cancel the token before sending
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = actor.ask(SlowPing, Some(token)).unwrap().await;
+        match result {
+            Err(RuntimeError::Cancelled) => {} // expected
+            Err(RuntimeError::ActorNotFound(_)) => {} // also acceptable
+            other => panic!("expected Cancelled or ActorNotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_cancel_runs_normally() {
+        let runtime = KameoRuntime::new();
+        let actor = runtime.spawn::<SlowActor>("cancel-none", ());
+
+        struct QuickPing;
+        impl Message for QuickPing {
+            type Reply = String;
+        }
+
+        #[async_trait]
+        impl Handler<QuickPing> for SlowActor {
+            async fn handle(&mut self, _msg: QuickPing, _ctx: &mut ActorContext) -> String {
+                "quick".into()
+            }
+        }
+
+        let reply = actor.ask(QuickPing, None).unwrap().await.unwrap();
+        assert_eq!(reply, "quick");
+    }
 }
