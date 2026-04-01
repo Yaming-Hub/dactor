@@ -143,7 +143,9 @@ where
             reply: Some(reply_any),
             reply_sender: Some(Box::new(move |boxed_reply| {
                 if let Ok(reply) = boxed_reply.downcast::<M::Reply>() {
-                    let _ = reply_tx.send(Ok(*reply));
+                    if reply_tx.send(Ok(*reply)).is_err() {
+                        tracing::debug!("reply dropped — caller may have timed out or been cancelled");
+                    }
                 }
             })),
         }
@@ -257,7 +259,9 @@ where
             reply: Some(reply_any),
             reply_sender: Some(Box::new(move |boxed_reply| {
                 if let Ok(reply) = boxed_reply.downcast::<M::Reply>() {
-                    let _ = reply_tx.send(Ok(*reply));
+                    if reply_tx.send(Ok(*reply)).is_err() {
+                        tracing::debug!("reply dropped — caller may have timed out or been cancelled");
+                    }
                 }
             })),
         }
