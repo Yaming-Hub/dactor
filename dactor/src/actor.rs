@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::cluster::ClusterEvents;
-use crate::errors::{ActorSendError, ErrorAction, GroupError, RuntimeError};
+use crate::errors::{ActorSendError, ErrorAction, ErrorCode, GroupError, RuntimeError};
 use crate::interceptor::SendMode;
 use crate::mailbox::MailboxConfig;
 use crate::message::{Headers, Message};
@@ -112,25 +112,61 @@ pub trait ActorRuntime: Send + Sync + 'static {
 
 /// An error originating from within an actor's handler or lifecycle hook.
 ///
-/// Carries a human-readable message describing the failure. Passed to
-/// `Actor::on_error` so the actor can decide how to recover.
+/// Structured error type for actor handler failures.
+/// Inspired by gRPC status codes — carries a code, message, optional details,
+/// and an error chain for causal tracing.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ActorError {
-    /// Human-readable description of the error.
+    /// The error category (e.g., Internal, InvalidArgument, NotFound).
+    pub code: ErrorCode,
+    /// Human-readable error description.
     pub message: String,
+    /// Optional structured details (JSON string or domain-specific data).
+    pub details: Option<String>,
+    /// Causal chain — the error that caused this one.
+    pub cause: Option<Box<ActorError>>,
 }
 
 impl ActorError {
-    /// Create a new `ActorError` with the given message.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+    /// Create a simple error with code and message.
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details: None,
+            cause: None,
+        }
+    }
+
+    /// Create an internal error (most common for unexpected failures).
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Internal, message)
+    }
+
+    /// Add details to the error.
+    pub fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
+
+    /// Chain a cause to this error.
+    pub fn with_cause(mut self, cause: ActorError) -> Self {
+        self.cause = Some(Box::new(cause));
+        self
     }
 }
 
 impl fmt::Display for ActorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ActorError: {}", self.message)
+        write!(f, "[{:?}] {}", self.code, self.message)?;
+        if let Some(ref details) = self.details {
+            write!(f, " ({})", details)?;
+        }
+        if let Some(ref cause) = self.cause {
+            write!(f, " caused by: {}", cause)?;
+        }
+        Ok(())
     }
 }
 
@@ -163,7 +199,7 @@ impl ActorContext {
     /// ```ignore
     /// tokio::select! {
     ///     result = some_long_operation() => { /* use result */ }
-    ///     _ = ctx.cancelled() => { return Err(ActorError::new("cancelled")); }
+    ///     _ = ctx.cancelled() => { return Err(ActorError::internal("cancelled")); }
     /// }
     /// ```
     ///
@@ -450,7 +486,7 @@ mod tests {
     #[test]
     fn test_actor_default_on_error_returns_stop() {
         let mut counter = Counter { count: 0 };
-        let action = counter.on_error(&ActorError::new("test error"));
+        let action = counter.on_error(&ActorError::internal("test error"));
         assert_eq!(action, ErrorAction::Stop);
     }
 
@@ -625,5 +661,93 @@ mod tests {
         assert_handler::<Counter, Increment>();
         assert_handler::<Counter, GetCount>();
         assert_handler::<Counter, Reset>();
+    }
+
+    #[test]
+    fn test_actor_error_construction() {
+        let err = ActorError::new(ErrorCode::InvalidArgument, "bad input");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.message, "bad input");
+        assert!(err.details.is_none());
+        assert!(err.cause.is_none());
+    }
+
+    #[test]
+    fn test_actor_error_with_details() {
+        let err = ActorError::new(ErrorCode::NotFound, "user not found")
+            .with_details("user_id=42");
+        assert_eq!(err.details.as_deref(), Some("user_id=42"));
+    }
+
+    #[test]
+    fn test_actor_error_chain() {
+        let root = ActorError::new(ErrorCode::Unavailable, "db connection failed");
+        let err = ActorError::new(ErrorCode::Internal, "query failed")
+            .with_cause(root);
+        assert!(err.cause.is_some());
+        assert_eq!(err.cause.as_ref().unwrap().code, ErrorCode::Unavailable);
+    }
+
+    #[test]
+    fn test_actor_error_display() {
+        let err = ActorError::new(ErrorCode::Internal, "something broke")
+            .with_details("stack: foo.rs:42");
+        let display = format!("{}", err);
+        assert!(display.contains("Internal"));
+        assert!(display.contains("something broke"));
+        assert!(display.contains("stack: foo.rs:42"));
+    }
+
+    #[test]
+    fn test_actor_error_display_with_chain() {
+        let root = ActorError::new(ErrorCode::Unavailable, "db down");
+        let err = ActorError::new(ErrorCode::Internal, "query failed").with_cause(root);
+        let display = format!("{}", err);
+        assert!(display.contains("caused by"));
+        assert!(display.contains("db down"));
+    }
+
+    #[test]
+    fn test_error_code_variants() {
+        let codes = vec![
+            ErrorCode::Internal, ErrorCode::InvalidArgument, ErrorCode::NotFound,
+            ErrorCode::Unavailable, ErrorCode::Timeout, ErrorCode::PermissionDenied,
+            ErrorCode::FailedPrecondition, ErrorCode::ResourceExhausted,
+            ErrorCode::Unimplemented, ErrorCode::Unknown, ErrorCode::Cancelled,
+        ];
+        assert_eq!(codes.len(), 11);
+        // All distinct
+        for (i, a) in codes.iter().enumerate() {
+            for (j, b) in codes.iter().enumerate() {
+                if i != j { assert_ne!(a, b); }
+            }
+        }
+    }
+
+    #[test]
+    fn test_actor_error_internal_helper() {
+        let err = ActorError::internal("oops");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(err.message, "oops");
+    }
+
+    #[test]
+    fn test_not_supported_error() {
+        use crate::errors::NotSupportedError;
+        let err = NotSupportedError {
+            capability: "BoundedMailbox".into(),
+            message: "ractor does not support bounded mailboxes".into(),
+        };
+        assert!(format!("{}", err).contains("BoundedMailbox"));
+    }
+
+    #[test]
+    fn test_runtime_error_not_supported() {
+        use crate::errors::NotSupportedError;
+        let err = RuntimeError::NotSupported(NotSupportedError {
+            capability: "PriorityMailbox".into(),
+            message: "not available".into(),
+        });
+        assert!(format!("{}", err).contains("PriorityMailbox"));
     }
 }

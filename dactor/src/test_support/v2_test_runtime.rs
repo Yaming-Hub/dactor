@@ -1006,7 +1006,7 @@ impl V2TestRuntime {
                         dispatch_result.send_reply();
                     }
                     Err(_panic) => {
-                        let error = ActorError::new("handler panicked");
+                        let error = ActorError::internal("handler panicked");
                         let action = actor.on_error(&error);
 
                         let outcome = Outcome::HandlerError {

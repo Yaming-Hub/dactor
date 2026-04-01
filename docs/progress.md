@@ -12,7 +12,7 @@
 | v0.2.0-alpha.2 — Communication (tell/ask) | PR 4–6 | ✅ Complete |
 | v0.2.0-alpha.3 — Messaging & Mailbox | PR 7–11 | ✅ Complete |
 | v0.2.0-beta.1 — Streaming & Cancellation | PR 12–15 | ✅ Complete |
-| v0.2.0-beta.2 — Error Model & Persistence | PR 16–18 | 🔲 Not started |
+| v0.2.0-beta.2 — Error Model & Persistence | PR 16–18 | 🟡 In progress (1/3) |
 | v0.2.0-rc.1 — Observability & Remote | PR 19–21 | 🔲 Not started |
 
 ---
@@ -36,7 +36,7 @@
 | 13 | Stream (server-streaming) | impl/pr-13-stream | ✅ PR #15 | 135/135 pass | 5 new tests |
 | 14 | Feed (client-streaming) | impl/pr-14-feed | ✅ PR #16 | 139/139 pass | 4 new tests |
 | 15 | Cancellation (CancellationToken) | impl/pr-15-cancellation | ✅ PR #17 | 146/146 pass | 7 new tests |
-| 16 | Error model (ActorError, ErrorCodec) | | 🔲 Not started | | |
+| 16 | Error model (ActorError, ErrorCodec) | impl/pr-16-error-model | ✅ PR #18 | 155/155 pass | 10 new tests |
 | 17 | Persistence (EventSourced + DurableState) | | 🔲 Not started | | |
 | 18 | Dead letters, Delay, Throttle | | 🔲 Not started | | |
 | 19 | Observability (MetricsInterceptor) | | 🔲 Not started | | |
@@ -76,3 +76,4 @@
 | 2026-03-31 | PR 13 | StreamHandler, StreamSender, BoxStream, stream() on TypedActorRef |
 | 2026-03-31 | PR 14 | FeedMessage, FeedHandler, StreamReceiver, feed() with drain task |
 | 2026-03-31 | PR 15 | CancellationToken, ctx.cancelled(), cancel_after(), RuntimeError::Cancelled |
+| 2026-04-01 | PR 16 | ActorError with ErrorCode/details/chain, NotSupportedError, 11 error codes |

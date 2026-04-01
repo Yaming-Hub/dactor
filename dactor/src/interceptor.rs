@@ -245,7 +245,7 @@ mod tests {
         let val = 42u64;
         let _ = Outcome::AskSuccess { reply: &val };
         let _ = Outcome::HandlerError {
-            error: ActorError::new("test"),
+            error: ActorError::internal("test"),
         };
         let _ = Outcome::StreamCompleted { items_emitted: 10 };
         let _ = Outcome::StreamCancelled { items_emitted: 5 };
