@@ -1,6 +1,35 @@
 use std::fmt;
 use std::time::Duration;
 
+/// Error category codes inspired by gRPC status codes.
+/// Used in `ActorError` to classify the failure type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ErrorCode {
+    /// Unexpected internal error.
+    Internal,
+    /// Invalid argument provided by the caller.
+    InvalidArgument,
+    /// The requested actor or resource was not found.
+    NotFound,
+    /// The actor is temporarily unavailable (e.g., overloaded).
+    Unavailable,
+    /// The operation timed out.
+    Timeout,
+    /// The caller lacks permission for this operation.
+    PermissionDenied,
+    /// A precondition for the operation was not met.
+    FailedPrecondition,
+    /// A resource limit was exceeded (e.g., rate limit, quota).
+    ResourceExhausted,
+    /// The operation is not implemented by this actor/adapter.
+    Unimplemented,
+    /// Unknown error category.
+    Unknown,
+    /// The operation was cancelled.
+    Cancelled,
+}
+
 /// Error returned when sending a message to an actor fails.
 ///
 /// Common causes: the actor has stopped, the mailbox is full (bounded),
@@ -57,6 +86,21 @@ pub enum ErrorAction {
     Escalate,
 }
 
+/// Error returned when a runtime capability is not supported by the adapter.
+#[derive(Debug, Clone)]
+pub struct NotSupportedError {
+    pub capability: String,
+    pub message: String,
+}
+
+impl fmt::Display for NotSupportedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "not supported: {} — {}", self.capability, self.message)
+    }
+}
+
+impl std::error::Error for NotSupportedError {}
+
 /// Unified error returned by runtime operations (ask, stream, feed, etc.).
 ///
 /// Covers all failure modes: delivery errors, timeouts, interceptor
@@ -78,6 +122,8 @@ pub enum RuntimeError {
     Actor(crate::actor::ActorError),
     /// The operation was cancelled via CancellationToken.
     Cancelled,
+    /// The requested capability is not supported by this adapter.
+    NotSupported(NotSupportedError),
 }
 
 impl fmt::Display for RuntimeError {
@@ -94,6 +140,7 @@ impl fmt::Display for RuntimeError {
             }
             Self::Actor(e) => write!(f, "actor error: {}", e),
             Self::Cancelled => write!(f, "operation cancelled"),
+            Self::NotSupported(e) => write!(f, "{}", e),
         }
     }
 }
