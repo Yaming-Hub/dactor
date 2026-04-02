@@ -11,40 +11,6 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check core
-        run: cargo check -p dactor --all-features
-      - name: Check adapters
-        run: |
-          cargo check -p dactor-ractor
-          cargo check -p dactor-kameo
-          cargo check -p dactor-coerce
-          cargo check -p dactor-mock
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Test core
-        run: cargo test -p dactor --features test-support
-      - name: Test ractor adapter
-        run: cargo test -p dactor-ractor
-      - name: Test kameo adapter
-        run: cargo test -p dactor-kameo
-      - name: Test coerce adapter
-        run: cargo test -p dactor-coerce
-      - name: Test mock cluster
-        run: cargo test -p dactor-mock
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -53,10 +19,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+
+  check:
+    name: Check
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check core
+        run: cargo check -p dactor --features test-support
+      - name: Check adapters
+        run: |
+          cargo check -p dactor-ractor
+          cargo check -p dactor-kameo
+          cargo check -p dactor-coerce
+          cargo check -p dactor-mock
+          # dactor-test-harness excluded: requires protoc installed
 
   clippy:
     name: Clippy
+    needs: [check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,8 +61,28 @@ jobs:
       - name: Clippy mock
         run: cargo clippy -p dactor-mock -- -D warnings
 
+  test:
+    name: Test
+    needs: [clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test core
+        run: cargo test -p dactor --features test-support
+      - name: Test ractor adapter
+        run: cargo test -p dactor-ractor
+      - name: Test kameo adapter
+        run: cargo test -p dactor-kameo
+      - name: Test coerce adapter
+        run: cargo test -p dactor-coerce
+      - name: Test mock cluster
+        run: cargo test -p dactor-mock
+
   doc:
     name: Documentation
+    needs: [check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -89,6 +95,7 @@ jobs:
 
   examples:
     name: Examples
+    needs: [check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
