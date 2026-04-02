@@ -236,18 +236,19 @@ impl<T: Send + 'static> BatchReader<T> {
     }
 
     /// Receive the next individual item (transparently unbatching).
+    /// Empty batches are skipped automatically.
     pub async fn recv(&mut self) -> Option<T> {
-        if let Some(item) = self.current_batch.pop_front() {
-            return Some(item);
-        }
-        match self.receiver.recv().await {
-            Some(batch) => {
-                let mut deque = VecDeque::from(batch);
-                let first = deque.pop_front();
-                self.current_batch = deque;
-                first
+        loop {
+            if let Some(item) = self.current_batch.pop_front() {
+                return Some(item);
             }
-            None => None,
+            match self.receiver.recv().await {
+                Some(batch) => {
+                    self.current_batch = VecDeque::from(batch);
+                    // Loop back to pop_front — skips empty batches
+                }
+                None => return None,
+            }
         }
     }
 
@@ -366,23 +367,15 @@ mod tests {
     #[tokio::test]
     async fn test_batch_reader_empty_batch_skipped() {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        // Manually send an empty vec (edge case)
+        // Send an empty batch followed by a real batch
         tx.send(vec![]).await.unwrap();
         tx.send(vec![1, 2]).await.unwrap();
         drop(tx);
 
         let mut reader = BatchReader::new(rx);
-        // Empty batch yields None from pop_front, so reader fetches next batch
-        // Actually the first batch returns None from pop_front for the "first" element,
-        // so let's verify behavior: an empty batch effectively has first = None
-        // The reader will get None from the empty batch and return None
-        // (this is the edge case — empty batches terminate early)
-        // With our implementation, VecDeque::from(vec![]).pop_front() = None,
-        // so first = None and we return None. That's acceptable.
-        let item = reader.recv().await;
-        // Empty batch → pop_front returns None → recv returns None (channel still open
-        // but the empty batch is consumed as "end"). This is an edge case that callers
-        // shouldn't trigger (BatchWriter never sends empty batches).
-        assert_eq!(item, None);
+        // Empty batch is skipped, reader proceeds to next batch
+        assert_eq!(reader.recv().await, Some(1));
+        assert_eq!(reader.recv().await, Some(2));
+        assert_eq!(reader.recv().await, None); // channel closed
     }
 }

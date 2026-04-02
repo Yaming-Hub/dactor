@@ -81,7 +81,7 @@ impl OutboundPipeline {
 
 /// Wrap a stream with per-item outbound interception.
 /// Each item goes through `on_stream_item` — Drop skips (notifies observer),
-/// Delay sleeps, Reject/Retry terminates.
+/// Delay sleeps, Reject terminates.
 pub fn wrap_stream_with_interception<T: Send + 'static>(
     rx: tokio::sync::mpsc::Receiver<T>,
     buffer: usize,
@@ -109,7 +109,7 @@ pub fn wrap_stream_with_interception<T: Send + 'static>(
                 Disposition::Continue => {
                     if out_tx.send(item).await.is_err() { break; }
                 }
-                Disposition::Drop => {
+                Disposition::Drop | Disposition::Retry(_) => {
                     pipeline.notify_item_drop(message_type, SendMode::Stream, "stream reply", interception_result.interceptor_name, seq - 1);
                     continue;
                 }
@@ -117,7 +117,7 @@ pub fn wrap_stream_with_interception<T: Send + 'static>(
                     tokio::time::sleep(d).await;
                     if out_tx.send(item).await.is_err() { break; }
                 }
-                Disposition::Reject(_) | Disposition::Retry(_) => break,
+                Disposition::Reject(_) => break,
             }
         }
     });
@@ -152,7 +152,7 @@ pub fn wrap_batched_stream_with_interception<T: Send + 'static>(
                 Disposition::Continue => {
                     if out_tx.send(item).await.is_err() { break; }
                 }
-                Disposition::Drop => {
+                Disposition::Drop | Disposition::Retry(_) => {
                     pipeline.notify_item_drop(message_type, SendMode::Stream, "stream reply (batched)", interception_result.interceptor_name, seq - 1);
                     continue;
                 }
@@ -160,7 +160,7 @@ pub fn wrap_batched_stream_with_interception<T: Send + 'static>(
                     tokio::time::sleep(d).await;
                     if out_tx.send(item).await.is_err() { break; }
                 }
-                Disposition::Reject(_) | Disposition::Retry(_) => break,
+                Disposition::Reject(_) => break,
             }
         }
     });
@@ -208,7 +208,7 @@ pub fn spawn_feed_drain<T: Send + 'static>(
                             Disposition::Continue => {
                                 if item_tx.send(item).await.is_err() { break; }
                             }
-                            Disposition::Drop => {
+                            Disposition::Drop | Disposition::Retry(_) => {
                                 pipeline.notify_item_drop(message_type, SendMode::Feed, "feed item", interception_result.interceptor_name, seq - 1);
                                 continue;
                             }
@@ -216,7 +216,7 @@ pub fn spawn_feed_drain<T: Send + 'static>(
                                 tokio::time::sleep(d).await;
                                 if item_tx.send(item).await.is_err() { break; }
                             }
-                            Disposition::Reject(_) | Disposition::Retry(_) => break,
+                            Disposition::Reject(_) => break,
                         }
                     }
                     None => break,
@@ -280,7 +280,7 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
                                 Disposition::Continue => {
                                     if intercepted_tx.send(item).await.is_err() { break; }
                                 }
-                                Disposition::Drop => {
+                                Disposition::Drop | Disposition::Retry(_) => {
                                     pipeline.notify_item_drop(message_type, SendMode::Feed, "feed item (batched)", interception_result.interceptor_name, seq - 1);
                                     continue;
                                 }
@@ -288,7 +288,7 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
                                     tokio::time::sleep(d).await;
                                     if intercepted_tx.send(item).await.is_err() { break; }
                                 }
-                                Disposition::Reject(_) | Disposition::Retry(_) => break,
+                                Disposition::Reject(_) => break,
                             }
                         }
                         None => break,
@@ -301,12 +301,12 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<T>>(buffer);
         let writer_handle = tokio::spawn(async move {
             let mut intercepted_rx = intercepted_rx;
-            let batch_delay = batch_config.max_delay;
             let mut writer = BatchWriter::new(batch_tx, batch_config);
             let result = std::panic::AssertUnwindSafe(async {
                 loop {
                     if writer.buffered_count() > 0 {
-                        let deadline = tokio::time::Instant::now() + batch_delay;
+                        // Use the writer's own flush deadline (set when first item was buffered)
+                        let delay = writer.max_delay();
                         tokio::select! {
                             biased;
                             item = intercepted_rx.recv() => match item {
@@ -315,7 +315,7 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
                                 }
                                 None => break,
                             },
-                            _ = tokio::time::sleep_until(deadline) => {
+                            _ = tokio::time::sleep(delay) => {
                                 if writer.check_deadline().await.is_err() { break; }
                             }
                         }
@@ -337,7 +337,10 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
             }
         });
 
-        // Stage 3: unbatch and forward to actor
+        // Stage 3: unbatch and forward to actor.
+        // Drop batch_rx before awaiting handles to prevent deadlock:
+        // if item_tx.send fails (actor stopped), we must close batch_rx
+        // so the writer task's batch_tx.send unblocks and terminates.
         let mut send_failed = false;
         while let Some(batch) = batch_rx.recv().await {
             for item in batch {
@@ -348,6 +351,8 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
             }
             if send_failed { break; }
         }
+        drop(batch_rx);
+        drop(item_tx);
 
         let _ = writer_handle.await;
         let _ = intercept_handle.await;

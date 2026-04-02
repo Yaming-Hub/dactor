@@ -174,7 +174,7 @@ where
                 retry_after,
             },
             Disposition::Drop => {
-                RuntimeError::ActorNotFound("message dropped by interceptor".into())
+                RuntimeError::ActorNotFound(format!("dropped by interceptor '{}'", interceptor_name))
             }
             _ => return,
         };
@@ -291,7 +291,7 @@ where
                 retry_after,
             },
             Disposition::Drop => {
-                RuntimeError::ActorNotFound("message dropped by interceptor".into())
+                RuntimeError::ActorNotFound(format!("dropped by interceptor '{}'", interceptor_name))
             }
             _ => return,
         };

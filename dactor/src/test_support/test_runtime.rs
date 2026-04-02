@@ -306,12 +306,11 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
                 // Batched: handler → batch writer → batch reader → interception → caller
                 let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<M::Reply>>(buffer);
                 let reader = BatchReader::new(batch_rx);
-                let batch_delay = batch_config.max_delay;
                 tokio::spawn(async move {
                     let mut writer = BatchWriter::new(batch_tx, batch_config);
                     loop {
                         if writer.buffered_count() > 0 {
-                            let deadline = tokio::time::Instant::now() + batch_delay;
+                            let delay = writer.max_delay();
                             tokio::select! {
                                 biased;
                                 item = rx.recv() => match item {
@@ -320,7 +319,7 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
                                     }
                                     None => break,
                                 },
-                                _ = tokio::time::sleep_until(deadline) => {
+                                _ = tokio::time::sleep(delay) => {
                                     if writer.check_deadline().await.is_err() { break; }
                                 }
                             }
