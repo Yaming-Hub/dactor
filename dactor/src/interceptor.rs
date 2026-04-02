@@ -6,6 +6,7 @@
 //! notified via `on_complete`.
 
 use std::any::Any;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::actor::ActorError;
@@ -94,19 +95,52 @@ impl InterceptResult {
     pub fn is_continue(&self) -> bool {
         matches!(self.disposition, Disposition::Continue)
     }
+}
 
-    /// Log a warning if the disposition is `Drop`. Call this at every site
-    /// where a Drop disposition is handled so drops are never silent.
-    pub fn log_if_dropped(&self, target_name: &str, message_type: &str, context: &str) {
-        if matches!(self.disposition, Disposition::Drop) {
-            tracing::warn!(
-                target_name = target_name,
-                message_type = message_type,
-                interceptor = self.interceptor_name,
-                context = context,
-                "message/item dropped by interceptor"
-            );
-        }
+/// Information about a dropped message or stream item.
+/// Passed to [`DropObserver::on_drop`] so the runtime never silently
+/// discards items.
+#[derive(Debug)]
+pub struct DropNotice {
+    /// The target actor's name.
+    pub target_name: String,
+    /// The Rust type name of the message or stream item.
+    pub message_type: &'static str,
+    /// The interceptor that returned `Disposition::Drop`.
+    pub interceptor_name: &'static str,
+    /// How the message was sent (Tell, Ask, Stream, Feed).
+    pub send_mode: SendMode,
+    /// Context string describing where the drop happened
+    /// (e.g., "outbound on_send", "stream reply", "feed item").
+    pub context: &'static str,
+    /// For stream/feed items, the zero-based sequence number.
+    /// `None` for message-level drops (tell/ask/stream initial request).
+    pub seq: Option<u64>,
+}
+
+/// Global observer for interceptor-driven drops.
+///
+/// Register on the runtime to observe all messages and stream items
+/// that interceptors drop via `Disposition::Drop`. Without an observer,
+/// drops are silent — the application is responsible for registering
+/// one if it wants visibility.
+///
+/// Use cases: metrics (count dropped items), alerting, dead-letter routing,
+/// audit logging.
+pub trait DropObserver: Send + Sync + 'static {
+    /// Called whenever an interceptor returns `Disposition::Drop`.
+    fn on_drop(&self, notice: DropNotice);
+}
+
+/// Notify the drop observer when an interceptor drops an item.
+/// If no observer is registered, the drop is silent — the application
+/// is responsible for registering an observer if it wants visibility.
+pub fn notify_drop(
+    observer: &Option<Arc<dyn DropObserver>>,
+    notice: DropNotice,
+) {
+    if let Some(obs) = observer {
+        obs.on_drop(notice);
     }
 }
 

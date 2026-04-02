@@ -31,6 +31,7 @@ pub mod interceptor;
 pub mod mailbox;
 pub mod message;
 pub mod persistence;
+pub mod runtime_support;
 pub mod stream;
 pub mod supervision;
 pub mod metrics;
@@ -71,6 +72,7 @@ pub use node::{NodeId, ActorId};
 pub use supervision::ChildTerminated;
 pub use interceptor::{InboundInterceptor, InboundContext, Disposition, Outcome, SendMode, InterceptResult, run_outbound_stream_item};
 pub use interceptor::{OutboundInterceptor, OutboundContext};
+pub use interceptor::{DropObserver, DropNotice, notify_drop};
 pub use dead_letter::{
     DeadLetterHandler, DeadLetterEvent, DeadLetterReason,
     LoggingDeadLetterHandler, CollectingDeadLetterHandler, DeadLetterInfo,

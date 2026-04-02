@@ -3,7 +3,6 @@
 //! Bridges dactor's `Actor`/`Handler<M>`/`ActorRef<A>` API with ractor's
 //! single-message-type `ractor::Actor` trait using type-erased dispatch.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,11 +23,15 @@ use dactor::errors::{ActorSendError, ErrorAction, RuntimeError};
 use dactor::mailbox::MailboxConfig;
 use dactor::supervision::ChildTerminated;
 use dactor::interceptor::{
-    Disposition, InboundContext, InboundInterceptor, OutboundContext, OutboundInterceptor, Outcome,
+    Disposition, DropObserver, InboundContext, InboundInterceptor, OutboundInterceptor, Outcome,
     SendMode,
 };
 use dactor::message::{Headers, Message, RuntimeHeaders};
 use dactor::node::{ActorId, NodeId};
+use dactor::runtime_support::{
+    OutboundPipeline, spawn_feed_batched_drain, spawn_feed_drain,
+    wrap_batched_stream_with_interception, wrap_stream_with_interception,
+};
 use dactor::stream::{BatchConfig, BatchReader, BatchWriter, BoxStream, StreamReceiver, StreamSender};
 
 use crate::cluster::RactorClusterEvents;
@@ -307,6 +310,7 @@ pub struct RactorActorRef<A: Actor> {
     name: String,
     inner: ractor::ActorRef<DactorMsg<A>>,
     outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
+    drop_observer: Option<Arc<dyn DropObserver>>,
 }
 
 impl<A: Actor> Clone for RactorActorRef<A> {
@@ -316,6 +320,7 @@ impl<A: Actor> Clone for RactorActorRef<A> {
             name: self.name.clone(),
             inner: self.inner.clone(),
             outbound_interceptors: self.outbound_interceptors.clone(),
+            drop_observer: self.drop_observer.clone(),
         }
     }
 }
@@ -323,6 +328,17 @@ impl<A: Actor> Clone for RactorActorRef<A> {
 impl<A: Actor> std::fmt::Debug for RactorActorRef<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "RactorActorRef({}, {:?})", self.name, self.id)
+    }
+}
+
+impl<A: Actor + 'static> RactorActorRef<A> {
+    fn outbound_pipeline(&self) -> OutboundPipeline {
+        OutboundPipeline {
+            interceptors: self.outbound_interceptors.clone(),
+            drop_observer: self.drop_observer.clone(),
+            target_id: self.id.clone(),
+            target_name: self.name.clone(),
+        }
     }
 }
 
@@ -353,25 +369,12 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         A: Handler<M>,
         M: Message<Reply = ()>,
     {
-        // Run outbound interceptors
-        let runtime_headers = RuntimeHeaders::new();
-        let mut headers = Headers::new();
-        let octx = OutboundContext {
-            target_id: self.id.clone(),
-            target_name: &self.name,
-            message_type: std::any::type_name::<M>(),
-            send_mode: SendMode::Tell,
-            remote: false,
-        };
-
-        for interceptor in self.outbound_interceptors.iter() {
-            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
-                Disposition::Continue => {}
-                Disposition::Delay(_) => {} // Not supported in sync tell
-                Disposition::Drop => return Ok(()),
-                Disposition::Reject(_) => return Ok(()),
-                Disposition::Retry(_) => return Ok(()),
-            }
+        let pipeline = self.outbound_pipeline();
+        let result = pipeline.run_on_send(SendMode::Tell, &msg);
+        match result.disposition {
+            Disposition::Continue => {}
+            Disposition::Delay(_) => {} // Not supported in sync tell
+            Disposition::Drop | Disposition::Reject(_) | Disposition::Retry(_) => return Ok(()),
         }
 
         let dispatch: Box<dyn Dispatch<A>> = Box::new(TypedDispatch { msg });
@@ -389,46 +392,33 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         A: Handler<M>,
         M: Message,
     {
-        // Run outbound interceptors
-        let runtime_headers = RuntimeHeaders::new();
-        let mut headers = Headers::new();
-        let octx = OutboundContext {
-            target_id: self.id.clone(),
-            target_name: &self.name,
-            message_type: std::any::type_name::<M>(),
-            send_mode: SendMode::Ask,
-            remote: false,
-        };
-
-        for interceptor in self.outbound_interceptors.iter() {
-            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
-                Disposition::Continue => {}
-                Disposition::Delay(_) => {} // Not supported in sync context
-                Disposition::Drop => {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let _ = tx.send(Err(RuntimeError::ActorNotFound(
-                        "message dropped by outbound interceptor".into(),
-                    )));
-                    return Ok(AskReply::new(rx));
-                }
-                Disposition::Reject(reason) => {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let name = interceptor.name().to_string();
-                    let _ = tx.send(Err(RuntimeError::Rejected {
-                        interceptor: name,
-                        reason,
-                    }));
-                    return Ok(AskReply::new(rx));
-                }
-                Disposition::Retry(retry_after) => {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let name = interceptor.name().to_string();
-                    let _ = tx.send(Err(RuntimeError::RetryAfter {
-                        interceptor: name,
-                        retry_after,
-                    }));
-                    return Ok(AskReply::new(rx));
-                }
+        let pipeline = self.outbound_pipeline();
+        let result = pipeline.run_on_send(SendMode::Ask, &msg);
+        match result.disposition {
+            Disposition::Continue => {}
+            Disposition::Delay(_) => {} // Not supported in sync context
+            Disposition::Drop => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Err(RuntimeError::ActorNotFound(
+                    "message dropped by outbound interceptor".into(),
+                )));
+                return Ok(AskReply::new(rx));
+            }
+            Disposition::Reject(reason) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Err(RuntimeError::Rejected {
+                    interceptor: result.interceptor_name.to_string(),
+                    reason,
+                }));
+                return Ok(AskReply::new(rx));
+            }
+            Disposition::Retry(retry_after) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Err(RuntimeError::RetryAfter {
+                    interceptor: result.interceptor_name.to_string(),
+                    retry_after,
+                }));
+                return Ok(AskReply::new(rx));
             }
         }
 
@@ -454,34 +444,23 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         A: StreamHandler<M>,
         M: Message,
     {
-        // Run outbound interceptors
-        let runtime_headers = RuntimeHeaders::new();
-        let mut headers = Headers::new();
-        let octx = OutboundContext {
-            target_id: self.id.clone(),
-            target_name: &self.name,
-            message_type: std::any::type_name::<M>(),
-            send_mode: SendMode::Stream,
-            remote: false,
-        };
-
-        for interceptor in self.outbound_interceptors.iter() {
-            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
-                Disposition::Continue => {}
-                Disposition::Delay(_) => {}
-                Disposition::Drop => {
-                    return Err(ActorSendError(
-                        "stream dropped by outbound interceptor".into(),
-                    ));
-                }
-                Disposition::Reject(reason) => {
-                    return Err(ActorSendError(format!("stream rejected: {}", reason)));
-                }
-                Disposition::Retry(_) => {
-                    return Err(ActorSendError(
-                        "stream retry requested by interceptor".into(),
-                    ));
-                }
+        let pipeline = self.outbound_pipeline();
+        let result = pipeline.run_on_send(SendMode::Stream, &msg);
+        match result.disposition {
+            Disposition::Continue => {}
+            Disposition::Delay(_) => {}
+            Disposition::Drop => {
+                return Err(ActorSendError(
+                    "stream dropped by outbound interceptor".into(),
+                ));
+            }
+            Disposition::Reject(reason) => {
+                return Err(ActorSendError(format!("stream rejected: {}", reason)));
+            }
+            Disposition::Retry(_) => {
+                return Err(ActorSendError(
+                    "stream retry requested by interceptor".into(),
+                ));
             }
         }
 
@@ -493,44 +472,12 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
             .cast(DactorMsg(dispatch))
             .map_err(|e| ActorSendError(e.to_string()))?;
 
-        // Wrap the stream to call on_stream_item for each reply item
-        let interceptors = self.outbound_interceptors.clone();
-        let target_id = self.id.clone();
-        let target_name = self.name.clone();
-        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<M::Reply>(buffer);
-        tokio::spawn(async move {
-            use tokio_stream::StreamExt;
-            let mut stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            let mut seq: u64 = 0;
-            while let Some(item) = stream.next().await {
-                let octx = OutboundContext {
-                    target_id: target_id.clone(),
-                    target_name: &target_name,
-                    message_type: std::any::type_name::<M>(),
-                    send_mode: SendMode::Stream,
-                    remote: false,
-                };
-                let item_headers = Headers::new();
-                let mut disposition = Disposition::Continue;
-                for interceptor in interceptors.iter() {
-                    disposition = interceptor.on_stream_item(&octx, &item_headers, seq, &item as &dyn Any);
-                    if !matches!(disposition, Disposition::Continue) { break; }
-                }
-                seq += 1;
-                match disposition {
-                    Disposition::Continue => {
-                        if out_tx.send(item).await.is_err() { break; }
-                    }
-                    Disposition::Drop => continue,
-                    Disposition::Delay(d) => {
-                        tokio::time::sleep(d).await;
-                        if out_tx.send(item).await.is_err() { break; }
-                    }
-                    Disposition::Reject(_) | Disposition::Retry(_) => break,
-                }
-            }
-        });
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx)))
+        Ok(wrap_stream_with_interception(
+            rx,
+            buffer,
+            pipeline,
+            std::any::type_name::<M>(),
+        ))
     }
 
     fn feed<M>(
@@ -561,63 +508,13 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
             .cast(DactorMsg(dispatch))
             .map_err(|e| ActorSendError(e.to_string()))?;
 
-        // Drain the input stream into the item channel with per-item interception
-        let interceptors = self.outbound_interceptors.clone();
-        let target_id = self.id.clone();
-        let target_name = self.name.clone();
-        tokio::spawn(async move {
-            use futures::StreamExt;
-            let mut input = input;
-            let mut seq: u64 = 0;
-            let item_headers = Headers::new();
-            let result = std::panic::AssertUnwindSafe(async {
-                loop {
-                    let next_item = if let Some(ref token) = cancel {
-                        tokio::select! {
-                            biased;
-                            _ = token.cancelled() => break,
-                            item = input.next() => item,
-                        }
-                    } else {
-                        input.next().await
-                    };
-                    match next_item {
-                        Some(item) => {
-                            let octx = OutboundContext {
-                                target_id: target_id.clone(),
-                                target_name: &target_name,
-                                message_type: std::any::type_name::<M>(),
-                                send_mode: SendMode::Feed,
-                                remote: false,
-                            };
-                            let mut disposition = Disposition::Continue;
-                            for interceptor in interceptors.iter() {
-                                disposition = interceptor.on_stream_item(&octx, &item_headers, seq, &item as &dyn Any);
-                                if !matches!(disposition, Disposition::Continue) { break; }
-                            }
-                            seq += 1;
-                            match disposition {
-                                Disposition::Continue => {
-                                    if item_tx.send(item).await.is_err() { break; }
-                                }
-                                Disposition::Drop => continue,
-                                Disposition::Delay(d) => {
-                                    tokio::time::sleep(d).await;
-                                    if item_tx.send(item).await.is_err() { break; }
-                                }
-                                Disposition::Reject(_) | Disposition::Retry(_) => break,
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            })
-            .catch_unwind()
-            .await;
-            if result.is_err() {
-                tracing::error!("feed drain task panicked");
-            }
-        });
+        spawn_feed_drain(
+            input,
+            item_tx,
+            cancel,
+            self.outbound_pipeline(),
+            std::any::type_name::<M>(),
+        );
 
         Ok(AskReply::new(reply_rx))
     }
@@ -633,34 +530,23 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         A: StreamHandler<M>,
         M: Message,
     {
-        // Run outbound interceptors (same as stream())
-        let runtime_headers = RuntimeHeaders::new();
-        let mut headers = Headers::new();
-        let octx = OutboundContext {
-            target_id: self.id.clone(),
-            target_name: &self.name,
-            message_type: std::any::type_name::<M>(),
-            send_mode: SendMode::Stream,
-            remote: false,
-        };
-
-        for interceptor in self.outbound_interceptors.iter() {
-            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
-                Disposition::Continue => {}
-                Disposition::Delay(_) => {}
-                Disposition::Drop => {
-                    return Err(ActorSendError(
-                        "stream dropped by outbound interceptor".into(),
-                    ));
-                }
-                Disposition::Reject(reason) => {
-                    return Err(ActorSendError(format!("stream rejected: {}", reason)));
-                }
-                Disposition::Retry(_) => {
-                    return Err(ActorSendError(
-                        "stream retry requested by interceptor".into(),
-                    ));
-                }
+        let pipeline = self.outbound_pipeline();
+        let result = pipeline.run_on_send(SendMode::Stream, &msg);
+        match result.disposition {
+            Disposition::Continue => {}
+            Disposition::Delay(_) => {}
+            Disposition::Drop => {
+                return Err(ActorSendError(
+                    "stream dropped by outbound interceptor".into(),
+                ));
+            }
+            Disposition::Reject(reason) => {
+                return Err(ActorSendError(format!("stream rejected: {}", reason)));
+            }
+            Disposition::Retry(_) => {
+                return Err(ActorSendError(
+                    "stream retry requested by interceptor".into(),
+                ));
             }
         }
 
@@ -707,44 +593,12 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
             let _ = writer.flush().await;
         });
 
-        // Wrap the output stream to call on_stream_item for each reply item
-        let interceptors = self.outbound_interceptors.clone();
-        let target_id = self.id.clone();
-        let target_name = self.name.clone();
-        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<M::Reply>(buffer);
-        tokio::spawn(async move {
-            use tokio_stream::StreamExt;
-            let mut stream = reader.into_stream();
-            let mut seq: u64 = 0;
-            while let Some(item) = stream.next().await {
-                let octx = OutboundContext {
-                    target_id: target_id.clone(),
-                    target_name: &target_name,
-                    message_type: std::any::type_name::<M>(),
-                    send_mode: SendMode::Stream,
-                    remote: false,
-                };
-                let item_headers = Headers::new();
-                let mut disposition = Disposition::Continue;
-                for interceptor in interceptors.iter() {
-                    disposition = interceptor.on_stream_item(&octx, &item_headers, seq, &item as &dyn Any);
-                    if !matches!(disposition, Disposition::Continue) { break; }
-                }
-                seq += 1;
-                match disposition {
-                    Disposition::Continue => {
-                        if out_tx.send(item).await.is_err() { break; }
-                    }
-                    Disposition::Drop => continue,
-                    Disposition::Delay(d) => {
-                        tokio::time::sleep(d).await;
-                        if out_tx.send(item).await.is_err() { break; }
-                    }
-                    Disposition::Reject(_) | Disposition::Retry(_) => break,
-                }
-            }
-        });
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx)))
+        Ok(wrap_batched_stream_with_interception(
+            reader,
+            buffer,
+            pipeline,
+            std::any::type_name::<M>(),
+        ))
     }
 
     fn feed_batched<M>(
@@ -776,135 +630,15 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
             .cast(DactorMsg(dispatch))
             .map_err(|e| ActorSendError(e.to_string()))?;
 
-        // Drain task: intercept + batch input items, then unbatch into item_tx
-        let interceptors = self.outbound_interceptors.clone();
-        let target_id = self.id.clone();
-        let target_name = self.name.clone();
-        tokio::spawn(async move {
-            use futures::{FutureExt, StreamExt};
-
-            // Intercept input stream: run on_stream_item per item, handle Disposition
-            let (intercepted_tx, intercepted_rx) = tokio::sync::mpsc::channel::<M::Item>(buffer);
-            let intercept_handle = tokio::spawn({
-                let cancel = cancel.clone();
-                async move {
-                    let mut input = input;
-                    let mut seq: u64 = 0;
-                    let item_headers = Headers::new();
-                    loop {
-                        let next_item = if let Some(ref token) = cancel {
-                            tokio::select! {
-                                biased;
-                                _ = token.cancelled() => break,
-                                item = input.next() => item,
-                            }
-                        } else {
-                            input.next().await
-                        };
-                        match next_item {
-                            Some(item) => {
-                                let octx = OutboundContext {
-                                    target_id: target_id.clone(),
-                                    target_name: &target_name,
-                                    message_type: std::any::type_name::<M>(),
-                                    send_mode: SendMode::Feed,
-                                    remote: false,
-                                };
-                                let mut disposition = Disposition::Continue;
-                                let mut drop_interceptor = "";
-                                for interceptor in interceptors.iter() {
-                                    disposition = interceptor.on_stream_item(&octx, &item_headers, seq, &item as &dyn Any);
-                                    if !matches!(disposition, Disposition::Continue) {
-                                        drop_interceptor = interceptor.name();
-                                        break;
-                                    }
-                                }
-                                seq += 1;
-                                match disposition {
-                                    Disposition::Continue => {
-                                        if intercepted_tx.send(item).await.is_err() { break; }
-                                    }
-                                    Disposition::Drop => {
-                                        tracing::warn!(
-                                            target_name = %target_name,
-                                            message_type = std::any::type_name::<M>(),
-                                            interceptor = drop_interceptor,
-                                            seq = seq - 1,
-                                            "stream item dropped by interceptor"
-                                        );
-                                        continue;
-                                    }
-                                    Disposition::Delay(d) => {
-                                        tokio::time::sleep(d).await;
-                                        if intercepted_tx.send(item).await.is_err() { break; }
-                                    }
-                                    Disposition::Reject(_) | Disposition::Retry(_) => break,
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            });
-
-            // Batched channel
-            let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<M::Item>>(buffer);
-
-            // Writer task: batch intercepted items
-            let writer_handle = tokio::spawn(async move {
-                let mut intercepted_rx = intercepted_rx;
-                let batch_delay = batch_config.max_delay;
-                let mut writer = BatchWriter::new(batch_tx, batch_config);
-                let result = std::panic::AssertUnwindSafe(async {
-                    loop {
-                        if writer.buffered_count() > 0 {
-                            let deadline = tokio::time::Instant::now() + batch_delay;
-                            tokio::select! {
-                                biased;
-                                item = intercepted_rx.recv() => match item {
-                                    Some(item) => {
-                                        if writer.push(item).await.is_err() { break; }
-                                    }
-                                    None => break,
-                                },
-                                _ = tokio::time::sleep_until(deadline) => {
-                                    if writer.check_deadline().await.is_err() { break; }
-                                }
-                            }
-                        } else {
-                            match intercepted_rx.recv().await {
-                                Some(item) => {
-                                    if writer.push(item).await.is_err() { break; }
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                    let _ = writer.flush().await;
-                })
-                .catch_unwind()
-                .await;
-
-                if result.is_err() {
-                    tracing::error!("feed_batched drain task panicked");
-                }
-            });
-
-            // Reader side: unbatch and forward to actor
-            let mut send_failed = false;
-            while let Some(batch) = batch_rx.recv().await {
-                for item in batch {
-                    if item_tx.send(item).await.is_err() {
-                        send_failed = true;
-                        break;
-                    }
-                }
-                if send_failed { break; }
-            }
-
-            let _ = writer_handle.await;
-            let _ = intercept_handle.await;
-        });
+        spawn_feed_batched_drain(
+            input,
+            item_tx,
+            buffer,
+            batch_config,
+            cancel,
+            self.outbound_pipeline(),
+            std::any::type_name::<M>(),
+        );
 
         Ok(AskReply::new(reply_rx))
     }
@@ -950,6 +684,7 @@ pub struct RactorRuntime {
     next_local: AtomicU64,
     cluster_events: RactorClusterEvents,
     outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
+    drop_observer: Option<Arc<dyn DropObserver>>,
     watchers: WatcherMap,
 }
 
@@ -961,6 +696,7 @@ impl RactorRuntime {
             next_local: AtomicU64::new(1),
             cluster_events: RactorClusterEvents::new(),
             outbound_interceptors: Arc::new(Vec::new()),
+            drop_observer: None,
             watchers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -973,6 +709,12 @@ impl RactorRuntime {
         Arc::get_mut(&mut self.outbound_interceptors)
             .expect("cannot add interceptors after actors are spawned")
             .push(interceptor);
+    }
+
+    /// Set a global drop observer that is notified whenever an outbound
+    /// interceptor returns `Disposition::Drop`.
+    pub fn set_drop_observer(&mut self, observer: Arc<dyn DropObserver>) {
+        self.drop_observer = Some(observer);
     }
 
     /// Access the cluster events subsystem.
@@ -1082,6 +824,7 @@ impl RactorRuntime {
             name: actor_name,
             inner: actor_ref,
             outbound_interceptors: self.outbound_interceptors.clone(),
+            drop_observer: self.drop_observer.clone(),
         }
     }
 
