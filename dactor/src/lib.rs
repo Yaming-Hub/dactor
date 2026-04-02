@@ -58,7 +58,7 @@ pub mod prelude {
 pub use async_trait::async_trait;
 pub use actor::{Actor, ActorContext, ActorError, ActorRef, SpawnConfig};
 pub use actor::{AskReply, Handler, StreamHandler};
-pub use actor::{FeedMessage, FeedHandler};
+pub use actor::FeedHandler;
 pub use actor::cancel_after;
 pub use tokio_util::sync::CancellationToken;
 pub use message::Message;

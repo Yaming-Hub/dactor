@@ -3,7 +3,7 @@
 //! Run with: cargo run --example batch_streaming --features test-support
 
 use async_trait::async_trait;
-use dactor::actor::{Actor, ActorContext, ActorRef, FeedHandler, FeedMessage, StreamHandler};
+use dactor::actor::{Actor, ActorContext, ActorRef, FeedHandler, StreamHandler};
 use dactor::message::Message;
 use dactor::stream::{BatchConfig, StreamReceiver, StreamSender};
 use dactor::TestRuntime;
@@ -50,12 +50,6 @@ impl StreamHandler<GetNumbers> for NumberServer {
 // Client-streaming actor (unchanged handler)
 // ===========================================================================
 
-struct SumItems;
-impl FeedMessage for SumItems {
-    type Item = u64;
-    type Reply = u64;
-}
-
 struct Aggregator;
 
 impl Actor for Aggregator {
@@ -67,10 +61,9 @@ impl Actor for Aggregator {
 }
 
 #[async_trait]
-impl FeedHandler<SumItems> for Aggregator {
+impl FeedHandler<u64, u64> for Aggregator {
     async fn handle_feed(
         &mut self,
-        _msg: SumItems,
         mut receiver: StreamReceiver<u64>,
         _ctx: &mut ActorContext,
     ) -> u64 {
@@ -98,7 +91,7 @@ async fn main() {
     let server = runtime.spawn::<NumberServer>("numbers", 10);
 
     let mut stream = server
-        .stream_batched(GetNumbers, 16, batch_config.clone(), None)
+        .stream(GetNumbers, 16, Some(batch_config.clone()), None)
         .unwrap();
 
     let mut items = Vec::new();
@@ -115,7 +108,7 @@ async fn main() {
     let input = futures::stream::iter(vec![10u64, 20, 30, 40, 50]);
     let batch_config = BatchConfig::new(4, std::time::Duration::from_millis(5));
     let total = aggregator
-        .feed_batched(SumItems, Box::pin(input), 8, batch_config, None)
+        .feed::<u64, u64>(Box::pin(input), 8, Some(batch_config), None)
         .unwrap()
         .await
         .unwrap();

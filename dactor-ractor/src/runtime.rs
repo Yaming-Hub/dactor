@@ -13,7 +13,7 @@ use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use dactor::actor::{
-    Actor, ActorContext, ActorError, AskReply, FeedHandler, FeedMessage, Handler, StreamHandler,
+    Actor, ActorContext, ActorError, AskReply, FeedHandler, Handler, StreamHandler,
     ActorRef,
 };
 use dactor::dispatch::{
@@ -438,6 +438,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         &self,
         msg: M,
         buffer: usize,
+        batch_config: Option<BatchConfig>,
         cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, ActorSendError>
     where
@@ -465,163 +466,75 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         }
 
         let buffer = buffer.max(1);
-        let (tx, rx) = tokio::sync::mpsc::channel(buffer);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(buffer);
         let sender = StreamSender::new(tx);
         let dispatch: Box<dyn Dispatch<A>> = Box::new(StreamDispatch { msg, sender, cancel });
         self.inner
             .cast(DactorMsg(dispatch))
             .map_err(|e| ActorSendError(e.to_string()))?;
 
-        Ok(wrap_stream_with_interception(
-            rx,
-            buffer,
-            pipeline,
-            std::any::type_name::<M>(),
-        ))
-    }
-
-    fn feed<M>(
-        &self,
-        msg: M,
-        input: BoxStream<M::Item>,
-        buffer: usize,
-        cancel: Option<CancellationToken>,
-    ) -> Result<AskReply<M::Reply>, ActorSendError>
-    where
-        A: FeedHandler<M>,
-        M: FeedMessage,
-    {
-        // Note: no on_send() for FeedMessage — it's a type tag with no data.
-        // Per-item interception happens via on_stream_item() in the drain task.
-
-        let buffer = buffer.max(1);
-        let (item_tx, item_rx) = tokio::sync::mpsc::channel(buffer);
-        let receiver = StreamReceiver::new(item_rx);
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let dispatch: Box<dyn Dispatch<A>> = Box::new(FeedDispatch {
-            msg,
-            receiver,
-            reply_tx,
-            cancel: cancel.clone(),
-        });
-        self.inner
-            .cast(DactorMsg(dispatch))
-            .map_err(|e| ActorSendError(e.to_string()))?;
-
-        spawn_feed_drain(
-            input,
-            item_tx,
-            cancel,
-            self.outbound_pipeline(),
-            std::any::type_name::<M>(),
-        );
-
-        Ok(AskReply::new(reply_rx))
-    }
-
-    fn stream_batched<M>(
-        &self,
-        msg: M,
-        buffer: usize,
-        batch_config: BatchConfig,
-        cancel: Option<CancellationToken>,
-    ) -> Result<BoxStream<M::Reply>, ActorSendError>
-    where
-        A: StreamHandler<M>,
-        M: Message,
-    {
-        let pipeline = self.outbound_pipeline();
-        let result = pipeline.run_on_send(SendMode::Stream, &msg);
-        match result.disposition {
-            Disposition::Continue => {}
-            Disposition::Delay(_) => {}
-            Disposition::Drop => {
-                return Err(ActorSendError(
-                    "stream dropped by outbound interceptor".into(),
-                ));
-            }
-            Disposition::Reject(reason) => {
-                return Err(ActorSendError(format!("stream rejected: {}", reason)));
-            }
-            Disposition::Retry(_) => {
-                return Err(ActorSendError(
-                    "stream retry requested by interceptor".into(),
-                ));
-            }
-        }
-
-        let buffer = buffer.max(1);
-        // Unbatched channel: handler pushes individual items
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<M::Reply>(buffer);
-        let sender = StreamSender::new(tx);
-        let dispatch: Box<dyn Dispatch<A>> = Box::new(StreamDispatch { msg, sender, cancel });
-        self.inner
-            .cast(DactorMsg(dispatch))
-            .map_err(|e| ActorSendError(e.to_string()))?;
-
-        // Batched channel: drain task batches items for the caller
-        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<M::Reply>>(buffer);
-        let reader = BatchReader::new(batch_rx);
-
-        let batch_delay = batch_config.max_delay;
-        tokio::spawn(async move {
-            let mut writer = BatchWriter::new(batch_tx, batch_config);
-            loop {
-                if writer.buffered_count() > 0 {
-                    let deadline = tokio::time::Instant::now() + batch_delay;
-                    tokio::select! {
-                        biased;
-                        item = rx.recv() => match item {
-                            Some(item) => {
-                                if writer.push(item).await.is_err() { break; }
+        match batch_config {
+            Some(batch_config) => {
+                let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<M::Reply>>(buffer);
+                let reader = BatchReader::new(batch_rx);
+                let batch_delay = batch_config.max_delay;
+                tokio::spawn(async move {
+                    let mut writer = BatchWriter::new(batch_tx, batch_config);
+                    loop {
+                        if writer.buffered_count() > 0 {
+                            let deadline = tokio::time::Instant::now() + batch_delay;
+                            tokio::select! {
+                                biased;
+                                item = rx.recv() => match item {
+                                    Some(item) => {
+                                        if writer.push(item).await.is_err() { break; }
+                                    }
+                                    None => break,
+                                },
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    if writer.check_deadline().await.is_err() { break; }
+                                }
                             }
-                            None => break,
-                        },
-                        _ = tokio::time::sleep_until(deadline) => {
-                            if writer.check_deadline().await.is_err() { break; }
+                        } else {
+                            match rx.recv().await {
+                                Some(item) => {
+                                    if writer.push(item).await.is_err() { break; }
+                                }
+                                None => break,
+                            }
                         }
                     }
-                } else {
-                    match rx.recv().await {
-                        Some(item) => {
-                            if writer.push(item).await.is_err() { break; }
-                        }
-                        None => break,
-                    }
-                }
+                    let _ = writer.flush().await;
+                });
+                Ok(wrap_batched_stream_with_interception(
+                    reader, buffer, pipeline, std::any::type_name::<M>(),
+                ))
             }
-            let _ = writer.flush().await;
-        });
-
-        Ok(wrap_batched_stream_with_interception(
-            reader,
-            buffer,
-            pipeline,
-            std::any::type_name::<M>(),
-        ))
+            None => {
+                Ok(wrap_stream_with_interception(
+                    rx, buffer, pipeline, std::any::type_name::<M>(),
+                ))
+            }
+        }
     }
 
-    fn feed_batched<M>(
+    fn feed<Item, Reply>(
         &self,
-        msg: M,
-        input: BoxStream<M::Item>,
+        input: BoxStream<Item>,
         buffer: usize,
-        batch_config: BatchConfig,
+        batch_config: Option<BatchConfig>,
         cancel: Option<CancellationToken>,
-    ) -> Result<AskReply<M::Reply>, ActorSendError>
+    ) -> Result<AskReply<Reply>, ActorSendError>
     where
-        A: FeedHandler<M>,
-        M: FeedMessage,
+        A: FeedHandler<Item, Reply>,
+        Item: Send + 'static,
+        Reply: Send + 'static,
     {
-        // Note: no on_send() for FeedMessage — it's a type tag with no data.
-        // Per-item interception happens via on_stream_item() in the drain task.
-
         let buffer = buffer.max(1);
         let (item_tx, item_rx) = tokio::sync::mpsc::channel(buffer);
         let receiver = StreamReceiver::new(item_rx);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let dispatch: Box<dyn Dispatch<A>> = Box::new(FeedDispatch {
-            msg,
             receiver,
             reply_tx,
             cancel: cancel.clone(),
@@ -630,15 +543,19 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
             .cast(DactorMsg(dispatch))
             .map_err(|e| ActorSendError(e.to_string()))?;
 
-        spawn_feed_batched_drain(
-            input,
-            item_tx,
-            buffer,
-            batch_config,
-            cancel,
-            self.outbound_pipeline(),
-            std::any::type_name::<M>(),
-        );
+        let pipeline = self.outbound_pipeline();
+        match batch_config {
+            Some(batch_config) => {
+                spawn_feed_batched_drain(
+                    input, item_tx, buffer, batch_config, cancel, pipeline, std::any::type_name::<Item>(),
+                );
+            }
+            None => {
+                spawn_feed_drain(
+                    input, item_tx, cancel, pipeline, std::any::type_name::<Item>(),
+                );
+            }
+        }
 
         Ok(AskReply::new(reply_rx))
     }
