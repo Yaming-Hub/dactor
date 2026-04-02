@@ -495,28 +495,32 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
         let reader = BatchReader::new(batch_rx);
 
         // Drain task: reads individual items, batches them via BatchWriter
+        let batch_delay = batch.max_delay;
         tokio::spawn(async move {
             let mut writer = BatchWriter::new(batch_tx, batch);
             loop {
                 // If we have buffered items, wait for more up to the deadline
                 if writer.buffered_count() > 0 {
-                    let deadline = tokio::time::Instant::now()
-                        + std::time::Duration::from_millis(1);
+                    let deadline = tokio::time::Instant::now() + batch_delay;
                     tokio::select! {
                         biased;
                         item = rx.recv() => {
                             match item {
-                                Some(item) => { let _ = writer.push(item).await; }
+                                Some(item) => {
+                                    if writer.push(item).await.is_err() { break; }
+                                }
                                 None => break,
                             }
                         }
                         _ = tokio::time::sleep_until(deadline) => {
-                            let _ = writer.check_deadline().await;
+                            if writer.check_deadline().await.is_err() { break; }
                         }
                     }
                 } else {
                     match rx.recv().await {
-                        Some(item) => { let _ = writer.push(item).await; }
+                        Some(item) => {
+                            if writer.push(item).await.is_err() { break; }
+                        }
                         None => break,
                     }
                 }
@@ -605,10 +609,49 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
             let cancel_clone = cancel.clone();
             let writer_handle = tokio::spawn(async move {
                 let mut input = input;
+                let batch_delay = batch.max_delay;
                 let mut writer = BatchWriter::new(batch_tx, batch);
                 let result = std::panic::AssertUnwindSafe(async {
                     loop {
-                        if let Some(ref token) = cancel_clone {
+                        if writer.buffered_count() > 0 {
+                            let deadline = tokio::time::Instant::now() + batch_delay;
+                            if let Some(ref token) = cancel_clone {
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => break,
+                                    item = input.next() => {
+                                        match item {
+                                            Some(item) => {
+                                                if writer.push(item).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            None => break,
+                                        }
+                                    }
+                                    _ = tokio::time::sleep_until(deadline) => {
+                                        if writer.check_deadline().await.is_err() { break; }
+                                    }
+                                }
+                            } else {
+                                tokio::select! {
+                                    biased;
+                                    item = input.next() => {
+                                        match item {
+                                            Some(item) => {
+                                                if writer.push(item).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            None => break,
+                                        }
+                                    }
+                                    _ = tokio::time::sleep_until(deadline) => {
+                                        if writer.check_deadline().await.is_err() { break; }
+                                    }
+                                }
+                            }
+                        } else if let Some(ref token) = cancel_clone {
                             tokio::select! {
                                 biased;
                                 _ = token.cancelled() => break,
@@ -645,12 +688,15 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
             });
 
             // Reader side: unbatch and forward to actor
+            let mut send_failed = false;
             while let Some(batch) = batch_rx.recv().await {
                 for item in batch {
                     if item_tx.send(item).await.is_err() {
+                        send_failed = true;
                         break;
                     }
                 }
+                if send_failed { break; }
             }
 
             let _ = writer_handle.await;

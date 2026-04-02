@@ -207,6 +207,11 @@ impl<T: Send + 'static> BatchWriter<T> {
     pub fn buffered_count(&self) -> usize {
         self.buffer.len()
     }
+
+    /// The configured maximum delay between the first buffered item and flush.
+    pub fn max_delay(&self) -> Duration {
+        self.config.max_delay
+    }
 }
 
 /// Batching reader: receives `Vec<T>` batches, yields individual items.
