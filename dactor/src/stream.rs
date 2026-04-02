@@ -111,15 +111,15 @@ impl<T: Send + 'static> StreamReceiver<T> {
 // ---------------------------------------------------------------------------
 
 /// Controls automatic batching for stream and feed channels.
-/// Items are accumulated and flushed as a batch when any of these
-/// conditions is met (whichever comes first):
+/// Items are accumulated and flushed as a batch when either condition
+/// is met (whichever comes first):
 /// - `max_items` items have accumulated
 /// - `max_delay` has elapsed since the first item in the current batch
-/// - `max_bytes` total estimated byte size is exceeded (if set)
 ///
-/// Batching is transparent: senders push individual items and
-/// receivers pull individual items. The batching layer sits between
-/// them, reducing the number of channel sends.
+/// A batched list of items will be wrapped into a single WireEnvelope
+/// at the transport layer, sharing the same MessageId and headers.
+/// Byte-level concerns (frame size limits, throttling) are handled by
+/// the transport layer, not the batch writer.
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
     /// Maximum items per batch. When this many items accumulate,
@@ -129,14 +129,6 @@ pub struct BatchConfig {
     /// If fewer than `max_items` are buffered but this duration
     /// elapses since the first item, the batch is flushed.
     pub max_delay: Duration,
-    /// Optional maximum accumulated byte size per batch.
-    /// When the total estimated size of buffered items exceeds this,
-    /// the batch is flushed. Useful for controlling wire frame sizes
-    /// in remote transport. `None` means no byte limit.
-    ///
-    /// The size estimate is provided by the caller via
-    /// `BatchWriter::push_with_size()`.
-    pub max_bytes: Option<usize>,
 }
 
 impl Default for BatchConfig {
@@ -144,7 +136,6 @@ impl Default for BatchConfig {
         Self {
             max_items: 64,
             max_delay: Duration::from_millis(5),
-            max_bytes: None,
         }
     }
 }
@@ -154,35 +145,19 @@ impl BatchConfig {
         Self {
             max_items: max_items.max(1),
             max_delay,
-            max_bytes: None,
         }
-    }
-
-    /// Set the maximum byte size per batch.
-    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
-        self.max_bytes = Some(max_bytes);
-        self
     }
 }
 
 /// Batching writer: accumulates items and flushes as `Vec<T>` batches.
 ///
 /// Flushes when `max_items` is reached or `max_delay` elapses.
-///
-/// # Local vs Remote
-///
-/// **Local actors:** Batching has minimal benefit. Local adapters should
-/// delegate `stream_batched`/`feed_batched` to unbatched versions.
-///
-/// **Remote actors:** The transport serializes each item to `Vec<u8>` first,
-/// then uses `BatchWriter<Vec<u8>>`. The `max_bytes` limit is automatically
-/// enforced using `bytes.len()` — no separate size tracking needed.
-/// The serialized bytes ARE the batch items: no double serialization.
+/// The flushed batch (a `Vec<T>`) will be wrapped into a single
+/// WireEnvelope by the transport layer for remote delivery.
 pub struct BatchWriter<T: Send + 'static> {
     sender: tokio::sync::mpsc::Sender<Vec<T>>,
     config: BatchConfig,
     buffer: Vec<T>,
-    buffered_bytes: usize,
     flush_deadline: Option<tokio::time::Instant>,
 }
 
@@ -193,14 +168,11 @@ impl<T: Send + 'static> BatchWriter<T> {
             sender,
             config,
             buffer: Vec::with_capacity(cap),
-            buffered_bytes: 0,
             flush_deadline: None,
         }
     }
 
     /// Add an item to the batch. Flushes when `max_items` is reached.
-    /// For byte-aware batching on serialized data, use `BatchWriter<Vec<u8>>`
-    /// which automatically enforces `max_bytes` via `bytes.len()`.
     pub async fn push(&mut self, item: T) -> Result<(), StreamSendError> {
         self.buffer.push(item);
 
@@ -221,7 +193,6 @@ impl<T: Send + 'static> BatchWriter<T> {
         }
         let batch = std::mem::take(&mut self.buffer);
         self.buffer = Vec::with_capacity(self.config.max_items);
-        self.buffered_bytes = 0;
         self.flush_deadline = None;
         self.sender
             .send(batch)
@@ -247,47 +218,6 @@ impl<T: Send + 'static> BatchWriter<T> {
     /// The configured maximum delay between the first buffered item and flush.
     pub fn max_delay(&self) -> Duration {
         self.config.max_delay
-    }
-}
-
-/// Byte-aware batching for serialized data.
-///
-/// When the transport serializes items to `Vec<u8>`, byte size comes free
-/// from `bytes.len()`. This impl enforces `max_bytes` automatically:
-/// - If adding an item would exceed `max_bytes`, the current batch flushes first.
-/// - Oversized single items (> `max_bytes`) are still sent as a batch of one.
-impl BatchWriter<Vec<u8>> {
-    /// Push serialized bytes into the batch. Enforces both `max_items` and
-    /// `max_bytes` (if configured) using `bytes.len()`.
-    pub async fn push_bytes(&mut self, bytes: Vec<u8>) -> Result<(), StreamSendError> {
-        let byte_len = bytes.len();
-
-        // Pre-check: would adding this item overflow the byte budget?
-        if let Some(max_bytes) = self.config.max_bytes {
-            if !self.buffer.is_empty() && self.buffered_bytes + byte_len > max_bytes {
-                self.flush().await?;
-            }
-        }
-
-        self.buffer.push(bytes);
-        self.buffered_bytes += byte_len;
-
-        if self.flush_deadline.is_none() {
-            self.flush_deadline = Some(tokio::time::Instant::now() + self.config.max_delay);
-        }
-
-        // Post-check: count-full or byte-full (handles oversized single items).
-        let count_full = self.buffer.len() >= self.config.max_items;
-        let bytes_full = self.config.max_bytes.map_or(false, |max| self.buffered_bytes >= max);
-        if count_full || bytes_full {
-            self.flush().await?;
-        }
-        Ok(())
-    }
-
-    /// Accumulated byte size of buffered items.
-    pub fn buffered_bytes(&self) -> usize {
-        self.buffered_bytes
     }
 }
 
@@ -454,110 +384,5 @@ mod tests {
         // but the empty batch is consumed as "end"). This is an edge case that callers
         // shouldn't trigger (BatchWriter never sends empty batches).
         assert_eq!(item, None);
-    }
-
-    #[tokio::test]
-    async fn test_batch_max_bytes_pre_flush() {
-        // max_bytes=100: items of 60 bytes each should NOT share a batch.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let config = BatchConfig::new(10, Duration::from_secs(10)).with_max_bytes(100);
-        let mut writer = BatchWriter::new(tx, config);
-
-        writer.push_bytes(vec![0u8; 60]).await.unwrap();
-        assert_eq!(writer.buffered_count(), 1);
-
-        // Second item (60 bytes) — would exceed 100, so current batch flushes first
-        writer.push_bytes(vec![1u8; 60]).await.unwrap();
-
-        let batch1 = rx.try_recv().unwrap();
-        assert_eq!(batch1.len(), 1);
-        assert_eq!(batch1[0].len(), 60);
-
-        // Item 2 is buffered in the new batch
-        assert_eq!(writer.buffered_count(), 1);
-        assert_eq!(writer.buffered_bytes(), 60);
-
-        writer.flush().await.unwrap();
-        let batch2 = rx.try_recv().unwrap();
-        assert_eq!(batch2.len(), 1);
-        assert_eq!(batch2[0].len(), 60);
-    }
-
-    #[tokio::test]
-    async fn test_batch_oversized_single_item() {
-        // max_bytes=50, but a single item is 200 bytes — must still be sent as batch of 1.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let config = BatchConfig::new(10, Duration::from_secs(10)).with_max_bytes(50);
-        let mut writer = BatchWriter::new(tx, config);
-
-        writer.push_bytes(vec![0u8; 200]).await.unwrap();
-
-        assert_eq!(writer.buffered_count(), 0);
-        let batch = rx.try_recv().unwrap();
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].len(), 200);
-    }
-
-    #[tokio::test]
-    async fn test_batch_max_bytes_exact_boundary() {
-        // max_bytes=100: two items of exactly 50 bytes each fill the budget exactly.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let config = BatchConfig::new(10, Duration::from_secs(10)).with_max_bytes(100);
-        let mut writer = BatchWriter::new(tx, config);
-
-        writer.push_bytes(vec![0u8; 50]).await.unwrap();
-        assert_eq!(writer.buffered_count(), 1);
-
-        writer.push_bytes(vec![1u8; 50]).await.unwrap();
-        assert_eq!(writer.buffered_count(), 0);
-
-        let batch = rx.try_recv().unwrap();
-        assert_eq!(batch.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_batch_max_bytes_multiple_small_items() {
-        // max_bytes=100: many small items (10 bytes each) fit in one batch.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let config = BatchConfig::new(100, Duration::from_secs(10)).with_max_bytes(100);
-        let mut writer = BatchWriter::new(tx, config);
-
-        for i in 0u8..9 {
-            writer.push_bytes(vec![i; 10]).await.unwrap();
-        }
-        assert_eq!(writer.buffered_count(), 9);
-        assert_eq!(writer.buffered_bytes(), 90);
-
-        // 10th item brings total to 100 → flush
-        writer.push_bytes(vec![9u8; 10]).await.unwrap();
-        assert_eq!(writer.buffered_count(), 0);
-
-        let batch = rx.try_recv().unwrap();
-        assert_eq!(batch.len(), 10);
-    }
-
-    #[tokio::test]
-    async fn test_batch_oversized_after_buffered_items() {
-        // Buffered items exist, then an oversized item arrives.
-        // Current batch should flush first, then oversized goes alone.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let config = BatchConfig::new(100, Duration::from_secs(10)).with_max_bytes(50);
-        let mut writer = BatchWriter::new(tx, config);
-
-        writer.push_bytes(vec![0u8; 20]).await.unwrap();
-        writer.push_bytes(vec![1u8; 20]).await.unwrap();
-        assert_eq!(writer.buffered_count(), 2);
-
-        // Oversized item (200 bytes) — flush first two, then send oversized alone
-        writer.push_bytes(vec![2u8; 200]).await.unwrap();
-
-        let batch1 = rx.try_recv().unwrap();
-        assert_eq!(batch1.len(), 2);
-
-        let batch2 = rx.try_recv().unwrap();
-        assert_eq!(batch2.len(), 1);
-        assert_eq!(batch2[0].len(), 200);
-
-        assert_eq!(writer.buffered_count(), 0);
     }
 }

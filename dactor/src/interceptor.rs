@@ -311,10 +311,7 @@ pub trait OutboundInterceptor: Send + Sync + 'static {
     /// - **Stream (server-streaming):** called when each reply item arrives
     ///   back at the caller.
     /// - **Feed (client-streaming):** called when each input item is about
-    ///   to be sent to the target actor. This is where throttling
-    ///   interceptors can observe per-item byte sizes via the
-    ///   `ContentLength` header (stamped by the transport layer for
-    ///   remote actors).
+    ///   to be sent to the target actor.
     ///
     /// `seq` is a zero-based sequence number within this stream/feed.
     /// The item is type-erased; downcast if you know the concrete type.
