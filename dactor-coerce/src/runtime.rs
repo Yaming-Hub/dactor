@@ -202,4 +202,33 @@ impl<A: Actor + 'static> ActorRef<A> for CoerceActorRef<A> {
     {
         self.inner.feed(msg, input, buffer, cancel)
     }
+
+    fn stream_batched<M>(
+        &self,
+        msg: M,
+        buffer: usize,
+        batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<BoxStream<M::Reply>, ActorSendError>
+    where
+        A: StreamHandler<M>,
+        M: Message,
+    {
+        self.inner.stream_batched(msg, buffer, batch, cancel)
+    }
+
+    fn feed_batched<M>(
+        &self,
+        msg: M,
+        input: BoxStream<M::Item>,
+        buffer: usize,
+        batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<AskReply<M::Reply>, ActorSendError>
+    where
+        A: FeedHandler<M>,
+        M: FeedMessage,
+    {
+        self.inner.feed_batched(msg, input, buffer, batch, cancel)
+    }
 }

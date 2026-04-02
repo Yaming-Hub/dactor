@@ -13,7 +13,7 @@ use crate::interceptor::SendMode;
 use crate::mailbox::MailboxConfig;
 use crate::message::{Headers, Message};
 use crate::node::ActorId;
-use crate::stream::{BoxStream, StreamReceiver, StreamSender};
+use crate::stream::{BatchConfig, BoxStream, StreamReceiver, StreamSender};
 
 /// An error originating from within an actor's handler or lifecycle hook.
 ///
@@ -314,6 +314,32 @@ pub trait ActorRef<A: Actor>: Clone + Send + Sync + 'static {
         msg: M,
         input: BoxStream<M::Item>,
         buffer: usize,
+        cancel: Option<CancellationToken>,
+    ) -> Result<AskReply<M::Reply>, ActorSendError>
+    where
+        A: FeedHandler<M>,
+        M: FeedMessage;
+
+    /// Request-stream with batching. Items are accumulated and sent as batches,
+    /// reducing per-item overhead. The returned stream yields individual items.
+    fn stream_batched<M>(
+        &self,
+        msg: M,
+        buffer: usize,
+        batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<BoxStream<M::Reply>, ActorSendError>
+    where
+        A: StreamHandler<M>,
+        M: Message;
+
+    /// Client-streaming with batching. Input items are batched before delivery.
+    fn feed_batched<M>(
+        &self,
+        msg: M,
+        input: BoxStream<M::Item>,
+        buffer: usize,
+        batch: BatchConfig,
         cancel: Option<CancellationToken>,
     ) -> Result<AskReply<M::Reply>, ActorSendError>
     where

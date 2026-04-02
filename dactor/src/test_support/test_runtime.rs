@@ -27,7 +27,7 @@ use crate::interceptor::{
 use crate::mailbox::{MailboxConfig, OverflowStrategy};
 use crate::message::{Headers, Message, RuntimeHeaders};
 use crate::node::{ActorId, NodeId};
-use crate::stream::{BoxStream, StreamReceiver, StreamSender};
+use crate::stream::{BatchConfig, BatchReader, BatchWriter, BoxStream, StreamReceiver, StreamSender};
 use crate::supervision::ChildTerminated;
 use tokio_util::sync::CancellationToken;
 
@@ -439,6 +439,222 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
                 tracing::error!("feed drain task panicked — input stream dropped");
             }
             // item_tx drops here, closing the channel → actor's recv() returns None
+        });
+
+        Ok(AskReply::new(reply_rx))
+    }
+
+    fn stream_batched<M>(
+        &self,
+        msg: M,
+        buffer: usize,
+        batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<BoxStream<M::Reply>, ActorSendError>
+    where
+        A: StreamHandler<M>,
+        M: Message,
+    {
+        let buffer = buffer.max(1);
+
+        // Run outbound interceptors (same as stream)
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let octx = OutboundContext {
+            target_id: self.id.clone(),
+            target_name: &self.name,
+            message_type: std::any::type_name::<M>(),
+            send_mode: SendMode::Stream,
+            remote: false,
+        };
+
+        for interceptor in self.outbound_interceptors.iter() {
+            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
+                Disposition::Continue => {}
+                Disposition::Delay(_) => {}
+                Disposition::Drop => {
+                    return Err(ActorSendError("stream dropped by outbound interceptor".into()));
+                }
+                Disposition::Reject(reason) => {
+                    return Err(ActorSendError(format!("stream rejected: {}", reason)));
+                }
+                Disposition::Retry(_) => {
+                    return Err(ActorSendError("stream retry requested by interceptor".into()));
+                }
+            }
+        }
+
+        // Unbatched channel: handler → drain task
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<M::Reply>(buffer);
+        let sender = StreamSender::new(tx);
+        let dispatch: BoxedDispatch<A> = Box::new(StreamDispatch { msg, sender, cancel });
+        self.sender.send(Some(dispatch))?;
+
+        // Batched channel: drain task → caller
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<M::Reply>>(buffer);
+        let reader = BatchReader::new(batch_rx);
+
+        // Drain task: reads individual items, batches them via BatchWriter
+        tokio::spawn(async move {
+            let mut writer = BatchWriter::new(batch_tx, batch);
+            loop {
+                // If we have buffered items, wait for more up to the deadline
+                if writer.buffered_count() > 0 {
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(1);
+                    tokio::select! {
+                        biased;
+                        item = rx.recv() => {
+                            match item {
+                                Some(item) => { let _ = writer.push(item).await; }
+                                None => break,
+                            }
+                        }
+                        _ = tokio::time::sleep_until(deadline) => {
+                            let _ = writer.check_deadline().await;
+                        }
+                    }
+                } else {
+                    match rx.recv().await {
+                        Some(item) => { let _ = writer.push(item).await; }
+                        None => break,
+                    }
+                }
+            }
+            let _ = writer.flush().await;
+        });
+
+        Ok(reader.into_stream())
+    }
+
+    fn feed_batched<M>(
+        &self,
+        msg: M,
+        input: BoxStream<M::Item>,
+        buffer: usize,
+        batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<AskReply<M::Reply>, ActorSendError>
+    where
+        A: FeedHandler<M>,
+        M: FeedMessage,
+    {
+        let buffer = buffer.max(1);
+
+        // Run outbound interceptors (same as feed)
+        let runtime_headers = RuntimeHeaders::new();
+        let mut headers = Headers::new();
+        let octx = OutboundContext {
+            target_id: self.id.clone(),
+            target_name: &self.name,
+            message_type: std::any::type_name::<M>(),
+            send_mode: SendMode::Feed,
+            remote: false,
+        };
+
+        for interceptor in self.outbound_interceptors.iter() {
+            match interceptor.on_send(&octx, &runtime_headers, &mut headers, &msg as &dyn Any) {
+                Disposition::Continue => {}
+                Disposition::Delay(_) => {}
+                Disposition::Drop => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(Err(RuntimeError::ActorNotFound(
+                        "message dropped by outbound interceptor".into(),
+                    )));
+                    return Ok(AskReply::new(rx));
+                }
+                Disposition::Reject(reason) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let name = interceptor.name().to_string();
+                    let _ = tx.send(Err(RuntimeError::Rejected { interceptor: name, reason }));
+                    return Ok(AskReply::new(rx));
+                }
+                Disposition::Retry(retry_after) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let name = interceptor.name().to_string();
+                    let _ = tx.send(Err(RuntimeError::RetryAfter { interceptor: name, retry_after }));
+                    return Ok(AskReply::new(rx));
+                }
+            }
+        }
+
+        // Create item channel for the feed
+        let (item_tx, item_rx) = tokio::sync::mpsc::channel(buffer);
+        let receiver = StreamReceiver::new(item_rx);
+
+        // Create reply oneshot
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        // Send the FeedDispatch to the actor
+        let dispatch: BoxedDispatch<A> = Box::new(FeedDispatch {
+            msg,
+            receiver,
+            reply_tx,
+            cancel: cancel.clone(),
+        });
+        self.sender.send(Some(dispatch))?;
+
+        // Spawn a batching drain task: batch input items, then unbatch into item_tx
+        tokio::spawn(async move {
+            use futures::{FutureExt, StreamExt};
+
+            // Batched channel
+            let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<M::Item>>(buffer);
+
+            // Writer task: batch items from input stream
+            let cancel_clone = cancel.clone();
+            let writer_handle = tokio::spawn(async move {
+                let mut input = input;
+                let mut writer = BatchWriter::new(batch_tx, batch);
+                let result = std::panic::AssertUnwindSafe(async {
+                    loop {
+                        if let Some(ref token) = cancel_clone {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => break,
+                                item = input.next() => {
+                                    match item {
+                                        Some(item) => {
+                                            if writer.push(item).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        } else {
+                            match input.next().await {
+                                Some(item) => {
+                                    if writer.push(item).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    let _ = writer.flush().await;
+                })
+                .catch_unwind()
+                .await;
+
+                if result.is_err() {
+                    tracing::error!("feed_batched drain task panicked — input stream dropped");
+                }
+            });
+
+            // Reader side: unbatch and forward to actor
+            while let Some(batch) = batch_rx.recv().await {
+                for item in batch {
+                    if item_tx.send(item).await.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            let _ = writer_handle.await;
+            // item_tx drops here, closing the channel
         });
 
         Ok(AskReply::new(reply_rx))
@@ -3250,6 +3466,77 @@ mod tests {
                 runtime.spawn::<conformance::ConformanceResumeActor>(name, init)
             })
             .await;
+        }
+
+        // ── Batched stream/feed integration tests ─────────────────────────
+
+        #[tokio::test]
+        async fn test_stream_batched_returns_items_in_order() {
+            use crate::stream::BatchConfig;
+            use tokio_stream::StreamExt;
+
+            let runtime = TestRuntime::new();
+            let server = runtime.spawn::<LogServer>(
+                "logs-batched",
+                vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
+            );
+
+            let batch = BatchConfig::new(2, Duration::from_secs(10));
+            let mut stream = server.stream_batched(GetLogs, 16, batch, None).unwrap();
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                items.push(item);
+            }
+
+            assert_eq!(items, vec!["a", "b", "c", "d", "e"]);
+        }
+
+        #[tokio::test]
+        async fn test_feed_batched_sum() {
+            use crate::actor::FeedMessage;
+            use crate::stream::BatchConfig;
+
+            struct Summer;
+            impl Actor for Summer {
+                type Args = ();
+                type Deps = ();
+                fn create(_: (), _: ()) -> Self { Summer }
+            }
+
+            struct SumItems;
+            impl FeedMessage for SumItems {
+                type Item = u64;
+                type Reply = u64;
+            }
+
+            #[async_trait]
+            impl FeedHandler<SumItems> for Summer {
+                async fn handle_feed(
+                    &mut self,
+                    _msg: SumItems,
+                    mut receiver: StreamReceiver<u64>,
+                    _ctx: &mut ActorContext,
+                ) -> u64 {
+                    let mut total = 0u64;
+                    while let Some(n) = receiver.recv().await {
+                        total += n;
+                    }
+                    total
+                }
+            }
+
+            let runtime = TestRuntime::new();
+            let actor = runtime.spawn::<Summer>("sum-batched", ());
+
+            let input = futures::stream::iter(vec![10u64, 20, 30, 40, 50]);
+            let batch = BatchConfig::new(3, Duration::from_secs(10));
+            let total = actor
+                .feed_batched(SumItems, Box::pin(input), 8, batch, None)
+                .unwrap()
+                .await
+                .unwrap();
+
+            assert_eq!(total, 150);
         }
     }
 }

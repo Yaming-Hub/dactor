@@ -29,7 +29,7 @@ use dactor::interceptor::{
 };
 use dactor::message::{Headers, Message, RuntimeHeaders};
 use dactor::node::{ActorId, NodeId};
-use dactor::stream::{BoxStream, StreamReceiver, StreamSender};
+use dactor::stream::{BatchConfig, BoxStream, StreamReceiver, StreamSender};
 
 use crate::cluster::RactorClusterEvents;
 
@@ -599,6 +599,37 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         });
 
         Ok(AskReply::new(reply_rx))
+    }
+
+    fn stream_batched<M>(
+        &self,
+        msg: M,
+        buffer: usize,
+        _batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<BoxStream<M::Reply>, ActorSendError>
+    where
+        A: StreamHandler<M>,
+        M: Message,
+    {
+        // Local adapter: skip batching, delegate to unbatched stream
+        self.stream(msg, buffer, cancel)
+    }
+
+    fn feed_batched<M>(
+        &self,
+        msg: M,
+        input: BoxStream<M::Item>,
+        buffer: usize,
+        _batch: BatchConfig,
+        cancel: Option<CancellationToken>,
+    ) -> Result<AskReply<M::Reply>, ActorSendError>
+    where
+        A: FeedHandler<M>,
+        M: FeedMessage,
+    {
+        // Local adapter: skip batching, delegate to unbatched feed
+        self.feed(msg, input, buffer, cancel)
     }
 }
 
