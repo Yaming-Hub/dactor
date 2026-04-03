@@ -94,9 +94,16 @@ pub struct ActorMetricsSnapshot {
 // ActorMetricsHandle
 // ---------------------------------------------------------------------------
 
-/// Per-actor metrics handle. Uses atomics for counters — no global lock per
-/// message. The internal bucket state uses a per-actor `Mutex` that has
-/// minimal contention because the actor task is the only writer.
+/// Per-actor metrics handle. Uses atomics for all-time counters and a
+/// per-actor `Mutex` for windowed bucket data.
+///
+/// **Single actor:** The actor task is the only writer, so the Mutex has
+/// zero contention on the write path. Readers (metrics queries) briefly
+/// contend but are infrequent.
+///
+/// **Actor pool:** Multiple workers share one handle, so the Mutex is
+/// contended proportionally to pool throughput. For very high-throughput
+/// pools, consider per-worker handles merged at query time.
 pub struct ActorMetricsHandle {
     // All-time counters (lock-free recording path)
     message_count: AtomicU64,
