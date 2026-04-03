@@ -201,6 +201,7 @@ impl InboundInterceptor for CircuitBreakerInterceptor {
                     entry.state = CircuitState::Open;
                     entry.opened_at = Some(now);
                     entry.error_timestamps.push_back(now);
+                    entry.prune_errors(self.error_window, now);
                 } else {
                     // Probe succeeded — close and reset errors.
                     entry.state = CircuitState::Closed;
