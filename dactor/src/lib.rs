@@ -63,7 +63,7 @@ pub use actor::FeedHandler;
 pub use actor::cancel_after;
 pub use tokio_util::sync::CancellationToken;
 pub use message::Message;
-pub use message::{Headers, HeaderValue, RuntimeHeaders, MessageId, Envelope, Priority};
+pub use message::{Headers, HeaderValue, RuntimeHeaders, MessageId, Priority};
 pub use errors::{ActorSendError, ClusterError, GroupError, RuntimeError};
 pub use errors::{ErrorAction, ErrorCode, NotSupportedError};
 pub use cluster::{ClusterEvent, ClusterEvents, SubscriptionId};

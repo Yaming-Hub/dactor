@@ -131,38 +131,6 @@ impl Default for RuntimeHeaders {
     }
 }
 
-/// An envelope wrapping a message body with headers.
-/// Used for LOCAL sends — the message is passed by move (no serialization).
-#[derive(Debug)]
-pub struct Envelope<M> {
-    /// Runtime-managed, read-only headers (MessageId, timestamp).
-    pub runtime_headers: RuntimeHeaders,
-    /// User/interceptor-managed headers (trace context, priority, custom).
-    pub headers: Headers,
-    /// The message body.
-    pub body: M,
-}
-
-impl<M> Envelope<M> {
-    /// Create a new envelope with default runtime headers.
-    pub fn new(body: M) -> Self {
-        Self {
-            runtime_headers: RuntimeHeaders::new(),
-            headers: Headers::new(),
-            body,
-        }
-    }
-
-    /// Create a new envelope with custom headers.
-    pub fn with_headers(body: M, headers: Headers) -> Self {
-        Self {
-            runtime_headers: RuntimeHeaders::new(),
-            headers,
-            body,
-        }
-    }
-}
-
 /// Built-in priority header. Used by priority mailboxes and interceptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Priority(pub u8);
@@ -307,23 +275,6 @@ mod tests {
         let rh1 = RuntimeHeaders::new();
         let rh2 = RuntimeHeaders::new();
         assert_ne!(rh1.message_id, rh2.message_id);
-    }
-
-    #[test]
-    fn test_envelope_construction() {
-        let envelope = Envelope::new("hello");
-        assert_eq!(envelope.body, "hello");
-        assert!(envelope.headers.is_empty());
-    }
-
-    #[test]
-    fn test_envelope_with_headers() {
-        let mut headers = Headers::new();
-        headers.insert(Priority::CRITICAL);
-
-        let envelope = Envelope::with_headers(42u64, headers);
-        assert_eq!(envelope.body, 42);
-        assert_eq!(envelope.headers.get::<Priority>().unwrap().0, 0);
     }
 
     #[test]

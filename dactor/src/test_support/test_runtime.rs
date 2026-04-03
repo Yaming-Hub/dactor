@@ -756,7 +756,8 @@ impl TestRuntime {
                                 break;
                             }
                             ErrorAction::Restart => {
-                                // TODO: full restart with Args/Deps recreation
+                                // Full restart with Args/Deps recreation is adapter-specific.
+                                // TestRuntime treats Restart as Resume (documented limitation).
                                 tracing::warn!(
                                     "Restart not fully implemented for actor {}, treating as Resume",
                                     ctx.actor_name
