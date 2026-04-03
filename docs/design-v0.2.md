@@ -130,6 +130,8 @@ A unified error enum encompasses all runtime errors:
 
 ### 2.4 Capability Introspection
 
+> **Design only — not yet implemented.**
+
 Callers can pre-flight requirements at startup via `ActorRuntime::is_supported()`:
 
 ```rust
@@ -846,6 +848,8 @@ impl<A: Actor> Sync for ActorRef<A> {}
 ```
 
 ### 4.5 ActorRuntime Trait
+
+> **Design only — not yet implemented.**
 
 ```rust
 pub trait ActorRuntime: Send + Sync + 'static {
@@ -2073,22 +2077,22 @@ impl<A: Actor> PoolRef<A> {
     pub fn tell<M>(&self, msg: M) -> Result<(), ActorSendError>
     where A: Handler<M>, M: Message<Reply = ()> { ... }
 
-    /// Fire-and-forget with explicit routing key (for `KeyBased` routing).
+    /// Fire-and-forget a keyed message, routing by `Keyed::routing_key`.
     /// All messages with the same key are routed to the same worker.
-    pub fn tell_keyed<M>(&self, key: &str, msg: M) -> Result<(), ActorSendError>
-    where A: Handler<M>, M: Message<Reply = ()> { ... }
+    pub fn tell_keyed<M>(&self, msg: M) -> Result<(), ActorSendError>
+    where A: Handler<M>, M: Message<Reply = ()> + Keyed { ... }
 
     /// Request-reply: route a message to a pool worker and await the reply.
-    pub async fn ask<M>(
+    pub fn ask<M>(
         &self, msg: M, cancel: Option<CancellationToken>,
-    ) -> Result<M::Reply, RuntimeError>
+    ) -> Result<AskReply<M::Reply>, ActorSendError>
     where A: Handler<M>, M: Message { ... }
 
-    /// Request-reply with explicit routing key (for `KeyBased` routing).
-    pub async fn ask_keyed<M>(
-        &self, key: &str, msg: M, cancel: Option<CancellationToken>,
-    ) -> Result<M::Reply, RuntimeError>
-    where A: Handler<M>, M: Message { ... }
+    /// Request-reply with a keyed message, routing by `Keyed::routing_key`.
+    pub fn ask_keyed<M>(
+        &self, msg: M, cancel: Option<CancellationToken>,
+    ) -> Result<AskReply<M::Reply>, ActorSendError>
+    where A: Handler<M>, M: Message + Keyed { ... }
 
     /// Request-stream: route a message to a pool worker and receive a stream.
     pub fn stream<M>(
@@ -2556,8 +2560,8 @@ sequenceDiagram
     participant I2 as Inbound Interceptor 2
     participant A as Actor Handler
     
-    S->>I1: on_receive(ctx, headers)
-    I1->>I2: Continue → on_receive(ctx, headers)
+    S->>I1: on_receive(ctx, runtime_headers, headers, msg)
+    I1->>I2: Continue → on_receive(ctx, runtime_headers, headers, msg)
     I2->>A: Continue → deliver message
     A->>A: handle(msg, ctx)
     A->>I2: on_complete(ctx, outcome)
@@ -2625,7 +2629,7 @@ pub enum Disposition {
 // Inside the runtime's interceptor pipeline execution:
 let mut total_delay = Duration::ZERO;
 for interceptor in &interceptors {
-    match interceptor.on_receive(&ctx, &mut headers, &*msg) {
+    match interceptor.on_receive(&ctx, &runtime_headers, &mut headers, &*msg) {
         Disposition::Continue => continue,
         Disposition::Delay(duration) => {
             total_delay += duration;  // cumulative
@@ -2754,10 +2758,11 @@ pub trait InboundInterceptor: Send + Sync + 'static {
     fn on_receive(
         &self,
         ctx: &InboundContext<'_>,
+        runtime_headers: &RuntimeHeaders,
         headers: &mut Headers,
         message: &dyn Any,
     ) -> Disposition {
-        let _ = (ctx, message);
+        let _ = (ctx, runtime_headers, message);
         Disposition::Continue
     }
 
@@ -2847,7 +2852,7 @@ impl InboundInterceptor for RequestReplyLogger {
     fn name(&self) -> &'static str { "request-reply-logger" }
 
     fn on_receive(
-        &self, ctx: &InboundContext<'_>, headers: &mut Headers, _msg: &dyn Any,
+        &self, ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, headers: &mut Headers, _msg: &dyn Any,
     ) -> Disposition {
         // Stash request info in headers for on_complete to read
         headers.insert(RequestInfo {
@@ -2891,7 +2896,7 @@ impl InboundInterceptor for RequestReplyLogger {
 
 | Callback | Sees request message? | Sees reply/items? | When called |
 |---|---|---|---|
-| `on_receive(msg)` | ✅ `message: &dyn Any` | ❌ | Before handler runs |
+| `on_receive(ctx, runtime_headers, headers, msg)` | ✅ `message: &dyn Any` | ❌ | Before handler runs |
 | `on_complete(outcome)` | ❌ (stash in headers) | ✅ `AskSuccess { reply: &dyn Any }` | After handler finishes |
 | `on_stream_item(item)` | ❌ (stash in headers) | ✅ `item: &dyn Any` | Per stream item |
 
@@ -2908,7 +2913,7 @@ struct LoggingInterceptor;
 impl InboundInterceptor for LoggingInterceptor {
     fn name(&self) -> &'static str { "logging" }
     fn on_receive(
-        &self, ctx: &InboundContext<'_>, headers: &mut Headers, _message: &dyn Any,
+        &self, ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, headers: &mut Headers, _message: &dyn Any,
     ) -> Disposition {
         let cid = headers.get::<CorrelationId>().map(|c| c.0.as_str()).unwrap_or("-");
         tracing::info!(
@@ -2942,6 +2947,7 @@ impl InboundInterceptor for TransferAuditInterceptor {
     fn on_receive(
         &self,
         ctx: &InboundContext<'_>,
+        _runtime_headers: &RuntimeHeaders,
         _headers: &mut Headers,
         message: &dyn Any,
     ) -> Disposition {
@@ -3045,7 +3051,7 @@ impl InboundInterceptor for RateLimiter {
     fn name(&self) -> &'static str { "rate-limiter" }
 
     fn on_receive(
-        &self, ctx: &InboundContext<'_>, _headers: &mut Headers, _msg: &dyn Any,
+        &self, ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, _headers: &mut Headers, _msg: &dyn Any,
     ) -> Disposition {
         let count = self.counts
             .entry(ctx.actor_id.clone())
@@ -3099,10 +3105,10 @@ impl InboundInterceptor for ToggleableInterceptor {
     fn name(&self) -> &'static str { self.inner.name() }
 
     fn on_receive(
-        &self, ctx: &InboundContext<'_>, headers: &mut Headers, msg: &dyn Any,
+        &self, ctx: &InboundContext<'_>, runtime_headers: &RuntimeHeaders, headers: &mut Headers, msg: &dyn Any,
     ) -> Disposition {
         if self.enabled.load(Ordering::Relaxed) {
-            self.inner.on_receive(ctx, headers, msg)
+            self.inner.on_receive(ctx, runtime_headers, headers, msg)
         } else {
             Disposition::Continue
         }
@@ -4732,6 +4738,8 @@ pub struct ErrorDetail {
 
 **`ErrorCodec` — bidirectional error translation:**
 
+> **Design only — not yet implemented.**
+
 The runtime provides an `ErrorCodec` trait that applications implement to
 translate between their custom error types and `ActorError`. The codec works
 in both directions:
@@ -4784,16 +4792,13 @@ impl ErrorCodec for ValidationErrorCodec {
     fn try_encode(&self, error: &dyn Any) -> Option<ActorError> {
         let ve = error.downcast_ref::<ValidationErrors>()?;
         Some(ActorError::new(ErrorCode::InvalidArgument, "validation failed")
-            .with_payload(
-                self.type_name(),
-                bincode::serialize(ve).unwrap(),
-            ))
+            .with_details(format!("{:?}", ve)))
     }
 
     fn try_decode(&self, error: &ActorError) -> Option<Box<dyn Any + Send>> {
-        let payload = error.payload.as_ref()?;
-        if payload.type_name != self.type_name() { return None; }
-        let ve: ValidationErrors = bincode::deserialize(&payload.data).ok()?;
+        let details = error.details.as_ref()?;
+        // In a real codec you'd parse the details string back into the error type.
+        // This is a simplified example.
         Some(Box::new(ve))
     }
 }
@@ -4882,15 +4887,12 @@ sequenceDiagram
   consistent error creation, but the payload doesn't need to be
   serialized/deserialized within the same process
 
-**How `ActorError` builds with payload:**
+**How `ActorError` builds with details:**
 
 ```rust
 impl ActorError {
-    pub fn with_payload(mut self, type_name: &str, data: Vec<u8>) -> Self {
-        self.payload = Some(ErrorPayload {
-            type_name: type_name.to_string(),
-            data,
-        });
+    pub fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
         self
     }
 }
@@ -6574,7 +6576,7 @@ impl MetricsInterceptor {
 
 impl InboundInterceptor for MetricsInterceptor {
     fn name(&self) -> &'static str { "metrics" }
-    fn on_receive(&self, ctx: &InboundContext<'_>, headers: &mut Headers, _message: &dyn Any) -> Disposition {
+    fn on_receive(&self, ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, headers: &mut Headers, _message: &dyn Any) -> Disposition {
         self.inner.record_receive(ctx);
         Disposition::Continue
     }
@@ -6677,7 +6679,7 @@ struct MessageSizeInterceptor {
 
 impl InboundInterceptor for MessageSizeInterceptor {
     fn name(&self) -> &'static str { "message-size" }
-    fn on_receive(&self, ctx: &InboundContext<'_>, _headers: &mut Headers, _message: &dyn Any) -> Disposition {
+    fn on_receive(&self, ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, _headers: &mut Headers, _message: &dyn Any) -> Disposition {
         // std::mem::size_of gives the stack size of the message type.
         // For heap-allocated content, use a custom SizeOf header set by the sender.
         let mut sizes = self.sizes.lock().unwrap();
@@ -6706,7 +6708,7 @@ struct SlowHandlerInterceptor {
 
 impl InboundInterceptor for SlowHandlerInterceptor {
     fn name(&self) -> &'static str { "slow-handler" }
-    fn on_receive(&self, _ctx: &InboundContext<'_>, headers: &mut Headers, _message: &dyn Any) -> Disposition {
+    fn on_receive(&self, _ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, headers: &mut Headers, _message: &dyn Any) -> Disposition {
         // Stash the start time in a header for on_complete to read.
         headers.insert(HandlerStartTime(Instant::now()));
         Disposition::Continue
@@ -6742,7 +6744,7 @@ struct CircuitBreakerInterceptor {
 impl InboundInterceptor for CircuitBreakerInterceptor {
     fn name(&self) -> &'static str { "circuit-breaker" }
 
-    fn on_receive(&self, ctx: &InboundContext<'_>, _headers: &mut Headers, _message: &dyn Any) -> Disposition {
+    fn on_receive(&self, ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, _headers: &mut Headers, _message: &dyn Any) -> Disposition {
         let count = self.error_counts
             .entry(ctx.actor_id)
             .or_insert(AtomicU64::new(0));
@@ -6784,7 +6786,7 @@ struct OtelInterceptor;
 
 impl InboundInterceptor for OtelInterceptor {
     fn name(&self) -> &'static str { "opentelemetry" }
-    fn on_receive(&self, ctx: &InboundContext<'_>, headers: &mut Headers, _message: &dyn Any) -> Disposition {
+    fn on_receive(&self, ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, headers: &mut Headers, _message: &dyn Any) -> Disposition {
         // Extract trace context from headers (injected by sender)
         let parent = headers.get::<TraceContext>();
 
