@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::actor::ActorError;
 use crate::message::Message;
-use crate::node::ActorId;
+use crate::node::{ActorId, NodeId};
 
 /// Notification delivered when a watched actor terminates.
 ///
@@ -81,8 +81,8 @@ impl RestartTracker {
         }
     }
 
-    /// Record a restart attempt. Returns `true` if the restart is allowed,
-    /// `false` if the max restart rate has been exceeded.
+    /// Record a restart attempt for a specific child. Returns `true` if
+    /// allowed, `false` if max rate exceeded. Used by OneForOne.
     fn record(&self, child_id: &ActorId) -> bool {
         let now = Instant::now();
         let mut map = self.timestamps.lock().unwrap();
@@ -97,6 +97,18 @@ impl RestartTracker {
             entries.push(now);
             true
         }
+    }
+
+    /// Record a restart attempt against a global group counter. Returns
+    /// `true` if allowed, `false` if max rate exceeded.
+    /// Used by AllForOne and RestForOne where the restart budget applies
+    /// to the entire supervision group, not individual children.
+    fn record_global(&self) -> bool {
+        let sentinel = ActorId {
+            node: NodeId("__supervision_group__".into()),
+            local: 0,
+        };
+        self.record(&sentinel)
     }
 }
 
@@ -156,11 +168,11 @@ impl AllForOne {
 impl SupervisionStrategy for AllForOne {
     fn on_child_failed(
         &self,
-        child_id: &ActorId,
+        _child_id: &ActorId,
         _child_name: &str,
         _error: &ActorError,
     ) -> SupervisionAction {
-        if self.tracker.record(child_id) {
+        if self.tracker.record_global() {
             SupervisionAction::Restart
         } else {
             SupervisionAction::Stop
@@ -212,11 +224,11 @@ impl RestForOne {
 impl SupervisionStrategy for RestForOne {
     fn on_child_failed(
         &self,
-        child_id: &ActorId,
+        _child_id: &ActorId,
         _child_name: &str,
         _error: &ActorError,
     ) -> SupervisionAction {
-        if self.tracker.record(child_id) {
+        if self.tracker.record_global() {
             SupervisionAction::Restart
         } else {
             SupervisionAction::Stop
