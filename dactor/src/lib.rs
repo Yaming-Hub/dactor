@@ -28,6 +28,7 @@ pub mod errors;
 pub mod cluster;
 pub mod dead_letter;
 pub mod interceptor;
+pub mod circuit_breaker;
 pub mod mailbox;
 pub mod message;
 pub mod persistence;
@@ -82,6 +83,7 @@ pub use dead_letter::{
     LoggingDeadLetterHandler, CollectingDeadLetterHandler, DeadLetterInfo,
 };
 pub use throttle::ActorRateLimiter;
+pub use circuit_breaker::{CircuitBreakerInterceptor, CircuitState};
 pub use pool::{PoolRouting, PoolConfig, PoolRef, Keyed};
 #[cfg(feature = "metrics")]
 pub use metrics::{MetricsInterceptor, MetricsRegistry, ActorMetricsHandle, ActorMetricsSnapshot, RuntimeMetrics};
