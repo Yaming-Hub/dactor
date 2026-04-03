@@ -479,9 +479,10 @@ pub struct TestRuntime {
     dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
     /// Watch registry — maps watched actor ID to list of watcher entries.
     watchers: Arc<Mutex<HashMap<ActorId, Vec<WatchEntry>>>>,
-    /// Optional shared metrics store. When set, a [`MetricsInterceptor`] is
+    /// Optional shared metrics registry. When set, a [`MetricsInterceptor`] is
     /// automatically prepended to every spawned actor's inbound interceptor list.
-    metrics_store: Option<crate::metrics::MetricsStore>,
+    #[cfg(feature = "metrics")]
+    metrics_registry: Option<crate::metrics::MetricsRegistry>,
 }
 
 impl TestRuntime {
@@ -493,7 +494,8 @@ impl TestRuntime {
             drop_observer: Arc::new(None),
             dead_letter_handler: Arc::new(None),
             watchers: Arc::new(Mutex::new(HashMap::new())),
-            metrics_store: None,
+            #[cfg(feature = "metrics")]
+            metrics_registry: None,
         }
     }
 
@@ -506,25 +508,30 @@ impl TestRuntime {
             drop_observer: Arc::new(None),
             dead_letter_handler: Arc::new(None),
             watchers: Arc::new(Mutex::new(HashMap::new())),
-            metrics_store: None,
+            #[cfg(feature = "metrics")]
+            metrics_registry: None,
         }
     }
 
     /// Enable built-in metrics collection.
     ///
-    /// Creates a shared [`MetricsStore`](crate::metrics::MetricsStore) and
+    /// Creates a shared [`MetricsRegistry`](crate::metrics::MetricsRegistry) and
     /// automatically prepends a [`MetricsInterceptor`](crate::metrics::MetricsInterceptor)
     /// to every subsequently spawned actor's inbound interceptor pipeline.
     ///
     /// **Must be called before any actors are spawned.**
+    /// Requires the `metrics` feature.
+    #[cfg(feature = "metrics")]
     pub fn enable_metrics(&mut self) {
-        self.metrics_store = Some(crate::metrics::MetricsStore::default());
+        self.metrics_registry = Some(crate::metrics::MetricsRegistry::default());
     }
 
-    /// Return a reference to the shared [`MetricsStore`](crate::metrics::MetricsStore),
+    /// Return a reference to the shared [`MetricsRegistry`](crate::metrics::MetricsRegistry),
     /// or `None` if metrics have not been enabled.
-    pub fn metrics(&self) -> Option<&crate::metrics::MetricsStore> {
-        self.metrics_store.as_ref()
+    /// Requires the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    pub fn metrics(&self) -> Option<&crate::metrics::MetricsRegistry> {
+        self.metrics_registry.as_ref()
     }
 
     /// Add a global outbound interceptor.
@@ -618,7 +625,7 @@ impl TestRuntime {
         }
     }
 
-    fn spawn_internal<A>(
+    pub(crate) fn spawn_internal<A>(
         &self,
         name: &str,
         args: A::Args,
@@ -629,22 +636,26 @@ impl TestRuntime {
     where
         A: Actor + 'static,
     {
+        // Generate actor ID first so we can register with the metrics registry.
+        let local = self.next_local.fetch_add(1, Ordering::SeqCst);
+        let actor_id = ActorId {
+            node: self.node_id.clone(),
+            local,
+        };
+
         // Prepend a MetricsInterceptor when metrics are enabled so it sees
         // every message regardless of what the caller passes in SpawnOptions.
-        let interceptors = if let Some(ref store) = self.metrics_store {
+        #[cfg(feature = "metrics")]
+        let interceptors = if let Some(ref registry) = self.metrics_registry {
+            let handle = registry.register(actor_id.clone());
             let mut combined = Vec::with_capacity(1 + interceptors.len());
-            combined.push(Box::new(crate::metrics::MetricsInterceptor::new(store.clone())) as Box<dyn InboundInterceptor>);
+            combined.push(Box::new(crate::metrics::MetricsInterceptor::new(handle)) as Box<dyn InboundInterceptor>);
             combined.extend(interceptors);
             combined
         } else {
             interceptors
         };
 
-        let local = self.next_local.fetch_add(1, Ordering::SeqCst);
-        let actor_id = ActorId {
-            node: self.node_id.clone(),
-            local,
-        };
         let actor_name = name.to_string();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_task = alive.clone();
@@ -3525,6 +3536,7 @@ mod tests {
 
     // -- Built-in metrics integration tests --------------------------------
 
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_metrics_enabled_tracks_messages() {
         let mut runtime = TestRuntime::new();
@@ -3541,6 +3553,7 @@ mod tests {
         assert_eq!(store.actor_count(), 1);
     }
 
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_metrics_shared_across_actors() {
         let mut runtime = TestRuntime::new();
@@ -3563,6 +3576,7 @@ mod tests {
         assert_eq!(store.actor_count(), 2);
     }
 
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_runtime_metrics_snapshot() {
         let mut runtime = TestRuntime::new();
@@ -3581,6 +3595,7 @@ mod tests {
         assert_eq!(snapshot.window, std::time::Duration::from_secs(60));
     }
 
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_metrics_not_tracked_when_disabled() {
         let runtime = TestRuntime::new();

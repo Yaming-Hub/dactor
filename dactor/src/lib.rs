@@ -34,6 +34,7 @@ pub mod persistence;
 pub mod runtime_support;
 pub mod stream;
 pub mod supervision;
+#[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod pool;
 pub mod throttle;
@@ -82,7 +83,8 @@ pub use dead_letter::{
 };
 pub use throttle::ActorRateLimiter;
 pub use pool::{PoolRouting, PoolConfig, PoolRef, Keyed};
-pub use metrics::{MetricsInterceptor, MetricsStore, ActorMetrics, RuntimeMetrics};
+#[cfg(feature = "metrics")]
+pub use metrics::{MetricsInterceptor, MetricsRegistry, ActorMetricsHandle, ActorMetricsSnapshot, RuntimeMetrics};
 pub use mailbox::{MailboxConfig, OverflowStrategy, MessageComparer, StrictPriorityComparer};
 pub use stream::{BoxStream, StreamSendError, StreamSender};
 pub use stream::{StreamReceiver, BatchConfig, BatchWriter, BatchReader};

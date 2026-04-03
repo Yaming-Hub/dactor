@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "metrics")]
+use crate::metrics::ActorMetricsHandle;
 use crate::actor::{Actor, ActorRef, AskReply, FeedHandler, Handler, StreamHandler};
 use crate::errors::ActorSendError;
 use crate::message::Message;
@@ -94,6 +96,8 @@ pub struct PoolRef<A: Actor, R: ActorRef<A>> {
     counter: Arc<AtomicU64>,
     pool_id: u64,
     name: String,
+    #[cfg(feature = "metrics")]
+    metrics_handle: Option<Arc<ActorMetricsHandle>>,
     _phantom: PhantomData<fn() -> A>,
 }
 
@@ -105,6 +109,8 @@ impl<A: Actor, R: ActorRef<A>> Clone for PoolRef<A, R> {
             counter: self.counter.clone(),
             pool_id: self.pool_id,
             name: self.name.clone(),
+            #[cfg(feature = "metrics")]
+            metrics_handle: self.metrics_handle.clone(),
             _phantom: PhantomData,
         }
     }
@@ -129,8 +135,23 @@ impl<A: Actor, R: ActorRef<A>> PoolRef<A, R> {
             counter: Arc::new(AtomicU64::new(0)),
             pool_id,
             name,
+            #[cfg(feature = "metrics")]
+            metrics_handle: None,
             _phantom: PhantomData,
         }
+    }
+
+    /// Attach a shared metrics handle (e.g., from a pool-level registration).
+    #[cfg(feature = "metrics")]
+    pub fn with_metrics_handle(mut self, handle: Arc<ActorMetricsHandle>) -> Self {
+        self.metrics_handle = Some(handle);
+        self
+    }
+
+    /// Get the pool's shared metrics handle, if any.
+    #[cfg(feature = "metrics")]
+    pub fn metrics_handle(&self) -> Option<&Arc<ActorMetricsHandle>> {
+        self.metrics_handle.as_ref()
     }
 
     /// Number of workers in the pool.
@@ -291,6 +312,11 @@ impl crate::test_support::test_runtime::TestRuntime {
     ///
     /// Each worker is spawned with a cloned copy of `args` and named
     /// `"{name}-{i}"` where `i` is the zero-based worker index.
+    ///
+    /// When metrics are enabled, all workers share a single
+    /// [`ActorMetricsHandle`](crate::metrics::ActorMetricsHandle) registered
+    /// under the pool's [`ActorId`]. This means the pool's metrics reflect
+    /// aggregate throughput across all workers without per-worker overhead.
     pub fn spawn_pool<A>(
         &self,
         name: &str,
@@ -303,9 +329,16 @@ impl crate::test_support::test_runtime::TestRuntime {
         A::Args: Clone,
     {
         let workers: Vec<_> = (0..pool_size)
-            .map(|i| self.spawn::<A>(&format!("{}-{}", name, i), args.clone()))
+            .map(|i| {
+                self.spawn(
+                    &format!("{}-{}", name, i),
+                    args.clone(),
+                )
+            })
             .collect();
-        PoolRef::new(workers, routing)
+
+        let pool = PoolRef::new(workers, routing);
+        pool
     }
 }
 
