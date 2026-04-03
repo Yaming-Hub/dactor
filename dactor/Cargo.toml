@@ -27,7 +27,7 @@ features = ["derive"]
 optional = true
 
 [features]
-default = []
+default = ["metrics"]
 serde = ["dep:serde", "uuid/serde"]
 metrics = []
 test-support = ["tokio/test-util"]
@@ -73,7 +73,7 @@ required-features = ["test-support"]
 
 [[example]]
 name = "metrics"
-required-features = ["test-support", "metrics"]
+required-features = ["test-support"]
 
 [[example]]
 name = "dead_letters"
