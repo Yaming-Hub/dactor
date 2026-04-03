@@ -12,18 +12,29 @@ Write your actor logic once, swap the runtime underneath.
 
 - **4 communication patterns** — `tell` (fire-and-forget), `ask`
   (request-reply), `stream` (server-streaming), `feed` (client-streaming)
+- **Transparent batching** — `BatchConfig` on `stream()` / `feed()` groups
+  items into batches (max_items + max_delay) to reduce per-item overhead
+- **Actor pools** — `PoolRef` with `RoundRobin`, `Random`, and `KeyBased`
+  routing strategies for distributing work across workers
 - **Interceptor pipelines** — inbound and outbound hooks for logging, auth,
-  header stamping, rate limiting, and more
+  header stamping, rate limiting, and more; per-item `on_stream_item`
+  interception returning `Disposition`; `on_reply` for outbound ask replies
+- **DropObserver** — global observer for interceptor-driven message drops
+  (metrics, alerting, dead-letter routing)
 - **Lifecycle management** — `on_start`, `on_stop`,
   `on_error` → `ErrorAction` (Resume / Restart / Stop / Escalate)
+- **Supervision strategies** — `OneForOne`, `AllForOne`, `RestForOne` with
+  configurable restart limits and time windows
+- **DeathWatch** — `ChildTerminated` notifications for watched actors
+- **Timers** — `send_after()` and `send_interval()` with cancellation via
+  `CancellationToken`
 - **Bounded & unbounded mailboxes** — configurable `OverflowStrategy`
   (Block, RejectWithError, DropNewest)
 - **Cooperative cancellation** — `CancellationToken` on ask / stream / feed,
   `ctx.cancelled()` for select!-based cancellation
-- **Supervision & DeathWatch** — `ChildTerminated` notifications for watched
-  actors
-- **Persistence** — `JournalStorage` (event sourcing), `SnapshotStorage`,
-  `StateStorage` (durable state) with in-memory default
+- **Persistence** — `PersistentActor`, `EventSourced`, `DurableState` traits
+  with recovery pipeline (`recover_event_sourced`, `recover_durable_state`),
+  `JournalStorage`, `SnapshotStorage`, `StateStorage` with in-memory default
 - **Observability** — `MetricsInterceptor` tracking message counts, latency
   percentiles (p99, avg, max) per actor
 - **Dead letter handling** — `DeadLetterHandler` trait with logging and
@@ -99,8 +110,8 @@ async fn main() {
 |---------|--------|-------------|
 | **Tell** | `actor.tell(msg)` | Fire-and-forget — no reply, returns immediately |
 | **Ask** | `actor.ask(msg, cancel)` | Request-reply — returns `AskReply<T>` future |
-| **Stream** | `actor.stream(msg, buf, cancel)` | Server-streaming — handler sends multiple items via `StreamSender` |
-| **Feed** | `actor.feed(msg, input, buf, cancel)` | Client-streaming — sends a `BoxStream` of items, gets one reply |
+| **Stream** | `actor.stream(msg, buf, batch, cancel)` | Server-streaming — handler sends multiple items via `StreamSender`. Pass `Some(BatchConfig)` or `None`. |
+| **Feed** | `actor.feed::<Item, Reply>(input, buf, batch, cancel)` | Client-streaming — sends a `BoxStream` of items, gets one reply. Pass `Some(BatchConfig)` or `None`. |
 
 ## Architecture
 
@@ -125,11 +136,16 @@ async fn main() {
 | `Actor` | Core trait with `create()`, `on_start()`, `on_stop()`, `on_error()` |
 | `Handler<M>` | Per-message handler — `async fn handle(&mut self, msg, ctx) -> M::Reply` |
 | `StreamHandler<M>` | Server-streaming handler — sends items via `StreamSender` |
-| `FeedHandler<M>` | Client-streaming handler — receives `StreamReceiver`, returns reply |
+| `FeedHandler<Item, Reply>` | Client-streaming handler — receives `StreamReceiver<Item>`, returns `Reply` |
+| `PersistentActor` | Base persistence trait with `persistence_id()` and recovery hooks |
+| `EventSourced` | Event-sourcing — `apply()`, `persist()`, `snapshot()`, `restore_snapshot()` |
+| `DurableState` | Durable-state — `save_state()`, `restore_state()` |
+| `SupervisionStrategy` | Determines supervisor response to child failure — `on_child_failed()` |
 | `ActorRef<A>` | Typed handle — `tell`, `ask`, `stream`, `feed`, `stop`, `is_alive` |
 | `Message` | Message trait with associated `Reply` type |
-| `InboundInterceptor` | Runs on actor task before handler (logging, auth, metrics) |
-| `OutboundInterceptor` | Runs on caller task before send (rate limiting, tracing) |
+| `InboundInterceptor` | Runs on actor task before handler (logging, auth, metrics, `on_stream_item`) |
+| `OutboundInterceptor` | Runs on caller task before send (rate limiting, tracing, `on_reply`) |
+| `DropObserver` | Global observer notified when interceptors drop messages |
 
 ## Adapter Crates
 
@@ -160,12 +176,19 @@ examples:
 
 | Example | Description | Command |
 |---------|-------------|---------|
+| [`readme_quickstart`](dactor/examples/readme_quickstart.rs) | Quick start — basic counter with tell + ask | `cargo run --example readme_quickstart -p dactor --features test-support` |
 | [`basic_counter`](dactor/examples/basic_counter.rs) | Tell + ask patterns with a counter actor | `cargo run --example basic_counter -p dactor --features test-support` |
-| [`streaming`](dactor/examples/streaming.rs) | Server-streaming and client-streaming | `cargo run --example streaming -p dactor --features test-support` |
-| [`supervision`](dactor/examples/supervision.rs) | DeathWatch and ErrorAction handling | `cargo run --example supervision -p dactor --features test-support` |
+| [`streaming`](dactor/examples/streaming.rs) | Server-streaming and client-streaming (feed) | `cargo run --example streaming -p dactor --features test-support` |
+| [`batch_streaming`](dactor/examples/batch_streaming.rs) | Transparent batching for stream/feed with `BatchConfig` | `cargo run --example batch_streaming -p dactor --features test-support` |
+| [`cancellation`](dactor/examples/cancellation.rs) | Cancellation tokens and `cancel_after()` for streams | `cargo run --example cancellation -p dactor --features test-support` |
+| [`supervision`](dactor/examples/supervision.rs) | Supervision strategies (OneForOne, AllForOne, RestForOne) | `cargo run --example supervision -p dactor --features test-support` |
 | [`interceptors`](dactor/examples/interceptors.rs) | Inbound/outbound interceptor pipelines | `cargo run --example interceptors -p dactor --features test-support` |
+| [`dead_letters`](dactor/examples/dead_letters.rs) | DropObserver for monitoring interceptor-driven drops | `cargo run --example dead_letters -p dactor --features test-support` |
 | [`persistence`](dactor/examples/persistence.rs) | Event sourcing with journal + snapshots | `cargo run --example persistence -p dactor --features test-support` |
 | [`bounded_mailbox`](dactor/examples/bounded_mailbox.rs) | Bounded mailbox with overflow strategies | `cargo run --example bounded_mailbox -p dactor --features test-support` |
+| [`metrics`](dactor/examples/metrics.rs) | MetricsInterceptor and MetricsStore for observability | `cargo run --example metrics -p dactor --features test-support` |
+| [`rate_limiting`](dactor/examples/rate_limiting.rs) | ActorRateLimiter outbound throttling | `cargo run --example rate_limiting -p dactor --features test-support` |
+| [`error_handling`](dactor/examples/error_handling.rs) | ActorError with ErrorCode and error chains | `cargo run --example error_handling -p dactor --features test-support` |
 
 ## Project Structure
 
@@ -175,19 +198,23 @@ dactor/                  Workspace root
 │   ├── src/
 │   │   ├── actor.rs         Actor, Handler, StreamHandler, FeedHandler, ActorRef
 │   │   ├── message.rs       Message, Headers, Priority, Envelope
-│   │   ├── interceptor.rs   InboundInterceptor, OutboundInterceptor, Disposition
+│   │   ├── interceptor.rs   InboundInterceptor, OutboundInterceptor, Disposition,
+│   │   │                    DropObserver, on_stream_item, on_reply
 │   │   ├── mailbox.rs       MailboxConfig, OverflowStrategy
-│   │   ├── supervision.rs   ChildTerminated (DeathWatch)
-│   │   ├── persistence.rs   JournalStorage, SnapshotStorage, StateStorage
+│   │   ├── supervision.rs   ChildTerminated, OneForOne, AllForOne, RestForOne
+│   │   ├── persistence.rs   PersistentActor, EventSourced, DurableState,
+│   │   │                    JournalStorage, SnapshotStorage, StateStorage
+│   │   ├── pool.rs          PoolRef, PoolRouting, PoolConfig, Keyed
+│   │   ├── timer.rs         send_after, send_interval, TimerHandle
 │   │   ├── dead_letter.rs   DeadLetterHandler, DeadLetterEvent
 │   │   ├── metrics.rs       MetricsInterceptor, MetricsStore
 │   │   ├── throttle.rs      ActorRateLimiter
 │   │   ├── errors.rs        ErrorCode, ErrorAction, ActorError
-│   │   ├── stream.rs        BoxStream, StreamSender, StreamReceiver
+│   │   ├── stream.rs        BoxStream, StreamSender, StreamReceiver, BatchConfig
 │   │   ├── remote.rs        WireEnvelope, MessageSerializer, ClusterDiscovery
 │   │   ├── dispatch.rs      Type-erased message dispatch
 │   │   └── test_support/    TestRuntime, TestClock, conformance suite
-│   ├── examples/            6 runnable examples
+│   ├── examples/            13 runnable examples
 │   └── tests/               Core integration tests
 ├── dactor-ractor/       Ractor adapter (full v0.2 API)
 ├── dactor-kameo/        Kameo adapter (full v0.2 API)
