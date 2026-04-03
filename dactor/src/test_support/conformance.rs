@@ -572,7 +572,11 @@ where
 {
     let actor = spawn("conf-tell-after-stop", 0);
     actor.stop();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Poll until actor is stopped (with timeout)
+    for _ in 0..50 {
+        if !actor.is_alive() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(!actor.is_alive(), "actor should be stopped");
 
     let result: Result<(), ActorSendError> = actor.tell(Increment(1));
@@ -590,7 +594,11 @@ where
 {
     let actor = spawn("conf-ask-after-stop", 0);
     actor.stop();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Poll until actor is stopped (with timeout)
+    for _ in 0..50 {
+        if !actor.is_alive() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(!actor.is_alive(), "actor should be stopped");
 
     let result = actor.ask(GetCount, None);
