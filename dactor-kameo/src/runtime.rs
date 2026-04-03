@@ -21,6 +21,7 @@ use dactor::dispatch::{
 use dactor::errors::{ActorSendError, ErrorAction, RuntimeError};
 use dactor::mailbox::MailboxConfig;
 use dactor::supervision::ChildTerminated;
+use dactor::dead_letter::{DeadLetterEvent, DeadLetterHandler, DeadLetterReason};
 use dactor::interceptor::{
     Disposition, DropObserver, InboundContext, InboundInterceptor,
     OutboundInterceptor, Outcome, SendMode,
@@ -319,6 +320,7 @@ pub struct KameoActorRef<A: Actor> {
     inner: kameo::actor::ActorRef<KameoDactorActor<A>>,
     outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
     drop_observer: Option<Arc<dyn DropObserver>>,
+    dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
 }
 
 impl<A: Actor> Clone for KameoActorRef<A> {
@@ -329,6 +331,7 @@ impl<A: Actor> Clone for KameoActorRef<A> {
             inner: self.inner.clone(),
             outbound_interceptors: self.outbound_interceptors.clone(),
             drop_observer: self.drop_observer.clone(),
+            dead_letter_handler: self.dead_letter_handler.clone(),
         }
     }
 }
@@ -346,6 +349,19 @@ impl<A: Actor> KameoActorRef<A> {
             drop_observer: self.drop_observer.clone(),
             target_id: self.id.clone(),
             target_name: self.name.clone(),
+        }
+    }
+
+    fn notify_dead_letter(&self, message_type: &'static str, send_mode: SendMode, reason: DeadLetterReason) {
+        if let Some(ref handler) = *self.dead_letter_handler {
+            handler.on_dead_letter(DeadLetterEvent {
+                target_id: self.id.clone(),
+                target_name: Some(self.name.clone()),
+                message_type,
+                send_mode,
+                reason,
+                message: None,
+            });
         }
     }
 }
@@ -384,7 +400,10 @@ impl<A: Actor + 'static> ActorRef<A> for KameoActorRef<A> {
         self.inner
             .tell(DactorMsg(dispatch))
             .try_send()
-            .map_err(|e| ActorSendError(e.to_string()))
+            .map_err(|e| {
+                self.notify_dead_letter(std::any::type_name::<M>(), SendMode::Tell, DeadLetterReason::ActorStopped);
+                ActorSendError(e.to_string())
+            })
     }
 
     fn ask<M>(
@@ -435,7 +454,10 @@ impl<A: Actor + 'static> ActorRef<A> for KameoActorRef<A> {
         self.inner
             .tell(DactorMsg(dispatch))
             .try_send()
-            .map_err(|e| ActorSendError(e.to_string()))?;
+            .map_err(|e| {
+                self.notify_dead_letter(std::any::type_name::<M>(), SendMode::Ask, DeadLetterReason::ActorStopped);
+                ActorSendError(e.to_string())
+            })?;
         Ok(AskReply::new(rx))
     }
 
@@ -611,6 +633,7 @@ pub struct KameoRuntime {
     cluster_events: KameoClusterEvents,
     outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
     drop_observer: Option<Arc<dyn DropObserver>>,
+    dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
     watchers: WatcherMap,
 }
 
@@ -623,6 +646,7 @@ impl KameoRuntime {
             cluster_events: KameoClusterEvents::new(),
             outbound_interceptors: Arc::new(Vec::new()),
             drop_observer: None,
+            dead_letter_handler: Arc::new(None),
             watchers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -642,6 +666,12 @@ impl KameoRuntime {
     /// **Must be called before any actors are spawned.**
     pub fn set_drop_observer(&mut self, observer: Arc<dyn DropObserver>) {
         self.drop_observer = Some(observer);
+    }
+
+    /// Set a global dead letter handler. Called whenever a message cannot be
+    /// delivered (actor stopped, mailbox full, dropped by inbound interceptor).
+    pub fn set_dead_letter_handler(&mut self, handler: Arc<dyn DeadLetterHandler>) {
+        self.dead_letter_handler = Arc::new(Some(handler));
     }
 
     /// Access the cluster events subsystem.
@@ -731,6 +761,7 @@ impl KameoRuntime {
             inner: actor_ref,
             outbound_interceptors: self.outbound_interceptors.clone(),
             drop_observer: self.drop_observer.clone(),
+            dead_letter_handler: self.dead_letter_handler.clone(),
         }
     }
     /// Register actor `watcher` to be notified when `target_id` terminates.

@@ -24,6 +24,7 @@ use crate::dispatch::{
 #[allow(unused_imports)]
 use crate::dispatch::DispatchResult;
 use crate::errors::{ActorSendError, ErrorAction, RuntimeError};
+use crate::dead_letter::{DeadLetterEvent, DeadLetterHandler, DeadLetterReason};
 use crate::interceptor::{
     Disposition, InboundContext, InboundInterceptor, OutboundInterceptor,
     Outcome, SendMode, DropObserver,
@@ -171,6 +172,7 @@ pub struct TestActorRef<A: Actor> {
     alive: Arc<AtomicBool>,
     outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
     drop_observer: Option<Arc<dyn DropObserver>>,
+    dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
 }
 
 impl<A: Actor> Clone for TestActorRef<A> {
@@ -182,6 +184,7 @@ impl<A: Actor> Clone for TestActorRef<A> {
             alive: self.alive.clone(),
             outbound_interceptors: self.outbound_interceptors.clone(),
             drop_observer: self.drop_observer.clone(),
+            dead_letter_handler: self.dead_letter_handler.clone(),
         }
     }
 }
@@ -193,6 +196,19 @@ impl<A: Actor> TestActorRef<A> {
             drop_observer: self.drop_observer.clone(),
             target_id: self.id.clone(),
             target_name: self.name.clone(),
+        }
+    }
+
+    fn notify_dead_letter(&self, message_type: &'static str, send_mode: SendMode, reason: DeadLetterReason) {
+        if let Some(ref handler) = *self.dead_letter_handler {
+            handler.on_dead_letter(DeadLetterEvent {
+                target_id: self.id.clone(),
+                target_name: Some(self.name.clone()),
+                message_type,
+                send_mode,
+                reason,
+                message: None,
+            });
         }
     }
 }
@@ -231,7 +247,15 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
         }
 
         let dispatch: BoxedDispatch<A> = Box::new(TypedDispatch { msg });
-        self.sender.send(Some(dispatch))
+        self.sender.send(Some(dispatch)).map_err(|e| {
+            let reason = if e.0.contains("mailbox full") {
+                DeadLetterReason::MailboxFull
+            } else {
+                DeadLetterReason::ActorStopped
+            };
+            self.notify_dead_letter(std::any::type_name::<M>(), SendMode::Tell, reason);
+            e
+        })
     }
 
     fn ask<M>(&self, msg: M, cancel: Option<CancellationToken>) -> Result<AskReply<M::Reply>, ActorSendError>
@@ -269,7 +293,15 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
             reply_tx: tx,
             cancel,
         });
-        self.sender.send(Some(dispatch))?;
+        self.sender.send(Some(dispatch)).map_err(|e| {
+            let reason = if e.0.contains("mailbox full") {
+                DeadLetterReason::MailboxFull
+            } else {
+                DeadLetterReason::ActorStopped
+            };
+            self.notify_dead_letter(std::any::type_name::<M>(), SendMode::Ask, reason);
+            e
+        })?;
 
         // Wrap the reply channel so that outbound interceptors' on_reply()
         // is called when the reply arrives on the sender side.
@@ -441,6 +473,7 @@ pub struct TestRuntime {
     next_local: AtomicU64,
     outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
     drop_observer: Arc<Option<Arc<dyn DropObserver>>>,
+    dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
     /// Watch registry — maps watched actor ID to list of watcher entries.
     watchers: Arc<Mutex<HashMap<ActorId, Vec<WatchEntry>>>>,
 }
@@ -452,6 +485,7 @@ impl TestRuntime {
             next_local: AtomicU64::new(1),
             outbound_interceptors: Arc::new(Vec::new()),
             drop_observer: Arc::new(None),
+            dead_letter_handler: Arc::new(None),
             watchers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -463,6 +497,7 @@ impl TestRuntime {
             next_local: AtomicU64::new(1),
             outbound_interceptors: Arc::new(Vec::new()),
             drop_observer: Arc::new(None),
+            dead_letter_handler: Arc::new(None),
             watchers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -484,6 +519,14 @@ impl TestRuntime {
     /// **Must be called before any actors are spawned.**
     pub fn set_drop_observer(&mut self, observer: Arc<dyn DropObserver>) {
         self.drop_observer = Arc::new(Some(observer));
+    }
+
+    /// Set a global dead letter handler. Called whenever a message cannot be
+    /// delivered (actor stopped, mailbox full, dropped by inbound interceptor).
+    ///
+    /// **Must be called before any actors are spawned.**
+    pub fn set_dead_letter_handler(&mut self, handler: Arc<dyn DeadLetterHandler>) {
+        self.dead_letter_handler = Arc::new(Some(handler));
     }
 
     /// Spawn a v0.2 actor whose `Deps` type is `()`. Returns a `TestActorRef<A>`.
@@ -593,6 +636,7 @@ impl TestRuntime {
         let id_task = actor_id.clone();
         let name_task = actor_name.clone();
         let watchers_ref = self.watchers.clone();
+        let dead_letter_handler_task = self.dead_letter_handler.clone();
 
         tokio::spawn(async move {
             let mut actor = A::create(args, deps);
@@ -659,6 +703,20 @@ impl TestRuntime {
 
                 // If rejected/dropped/retry, propagate proper error to caller
                 if let Some((interceptor_name, disposition)) = rejection {
+                    if matches!(disposition, Disposition::Drop) {
+                        if let Some(ref handler) = *dead_letter_handler_task {
+                            handler.on_dead_letter(DeadLetterEvent {
+                                target_id: ctx.actor_id.clone(),
+                                target_name: Some(ctx.actor_name.clone()),
+                                message_type,
+                                send_mode,
+                                reason: DeadLetterReason::DroppedByInterceptor {
+                                    interceptor: interceptor_name.clone(),
+                                },
+                                message: None,
+                            });
+                        }
+                    }
                     dispatch.reject(disposition, &interceptor_name);
                     continue;
                 }
@@ -804,6 +862,7 @@ impl TestRuntime {
             alive,
             outbound_interceptors: self.outbound_interceptors.clone(),
             drop_observer: (*self.drop_observer).clone(),
+            dead_letter_handler: self.dead_letter_handler.clone(),
         }
     }
 }
@@ -3306,5 +3365,122 @@ mod tests {
         assert_eq!(count2, 42);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    // -- Dead letter handler tests ------------------------------------------
+
+    #[tokio::test]
+    async fn test_dead_letter_handler_on_stopped_actor_tell() {
+        use crate::dead_letter::{CollectingDeadLetterHandler, DeadLetterReason};
+
+        let collector = Arc::new(CollectingDeadLetterHandler::new());
+        let mut runtime = TestRuntime::new();
+        runtime.set_dead_letter_handler(collector.clone());
+
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+        counter.stop();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let result = counter.tell(Increment(1));
+        assert!(result.is_err());
+
+        assert_eq!(collector.count(), 1);
+        let events = collector.events();
+        assert!(matches!(events[0].reason, DeadLetterReason::ActorStopped));
+        assert_eq!(events[0].send_mode, SendMode::Tell);
+        assert!(events[0].message_type.contains("Increment"));
+    }
+
+    #[tokio::test]
+    async fn test_dead_letter_handler_on_stopped_actor_ask() {
+        use crate::dead_letter::{CollectingDeadLetterHandler, DeadLetterReason};
+
+        let collector = Arc::new(CollectingDeadLetterHandler::new());
+        let mut runtime = TestRuntime::new();
+        runtime.set_dead_letter_handler(collector.clone());
+
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+        counter.stop();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let result = counter.ask(GetCount, None);
+        assert!(result.is_err());
+
+        assert_eq!(collector.count(), 1);
+        let events = collector.events();
+        assert!(matches!(events[0].reason, DeadLetterReason::ActorStopped));
+        assert_eq!(events[0].send_mode, SendMode::Ask);
+        assert!(events[0].message_type.contains("GetCount"));
+    }
+
+    #[tokio::test]
+    async fn test_dead_letter_handler_on_inbound_interceptor_drop() {
+        use crate::dead_letter::{CollectingDeadLetterHandler, DeadLetterReason};
+
+        struct DropAllInterceptor;
+        impl InboundInterceptor for DropAllInterceptor {
+            fn name(&self) -> &'static str { "drop-all" }
+            fn on_receive(
+                &self, _ctx: &InboundContext<'_>, _rh: &RuntimeHeaders,
+                _h: &mut Headers, _msg: &dyn Any,
+            ) -> Disposition {
+                Disposition::Drop
+            }
+            fn on_complete(
+                &self, _ctx: &InboundContext<'_>, _rh: &RuntimeHeaders,
+                _h: &Headers, _outcome: &Outcome<'_>,
+            ) {}
+        }
+
+        let collector = Arc::new(CollectingDeadLetterHandler::new());
+        let mut runtime = TestRuntime::new();
+        runtime.set_dead_letter_handler(collector.clone());
+
+        let counter = runtime.spawn_with_options::<Counter>(
+            "counter",
+            Counter { count: 0 },
+            SpawnOptions {
+                interceptors: vec![Box::new(DropAllInterceptor)],
+                ..Default::default()
+            },
+        );
+
+        counter.tell(Increment(1)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(collector.count(), 1);
+        let events = collector.events();
+        match &events[0].reason {
+            DeadLetterReason::DroppedByInterceptor { interceptor } => {
+                assert_eq!(interceptor, "drop-all");
+            }
+            other => panic!("expected DroppedByInterceptor, got {:?}", other),
+        }
+        assert_eq!(events[0].send_mode, SendMode::Tell);
+        assert!(events[0].message_type.contains("Increment"));
+    }
+
+    #[tokio::test]
+    async fn test_dead_letter_collecting_handler_multiple_events() {
+        use crate::dead_letter::{CollectingDeadLetterHandler, DeadLetterReason};
+
+        let collector = Arc::new(CollectingDeadLetterHandler::new());
+        let mut runtime = TestRuntime::new();
+        runtime.set_dead_letter_handler(collector.clone());
+
+        let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 });
+        counter.stop();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let _ = counter.tell(Increment(1));
+        let _ = counter.tell(Increment(2));
+        let _ = counter.ask(GetCount, None);
+
+        assert_eq!(collector.count(), 3);
+        let events = collector.events();
+        assert!(events.iter().all(|e| matches!(e.reason, DeadLetterReason::ActorStopped)));
+
+        collector.clear();
+        assert_eq!(collector.count(), 0);
     }
 }
