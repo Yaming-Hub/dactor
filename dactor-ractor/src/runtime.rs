@@ -22,6 +22,7 @@ use dactor::dispatch::{
 use dactor::errors::{ActorSendError, ErrorAction, RuntimeError};
 use dactor::mailbox::MailboxConfig;
 use dactor::supervision::ChildTerminated;
+use dactor::dead_letter::{DeadLetterEvent, DeadLetterHandler, DeadLetterReason};
 use dactor::interceptor::{
     Disposition, DropObserver, InboundContext, InboundInterceptor, OutboundInterceptor, Outcome,
     SendMode,
@@ -69,6 +70,7 @@ struct RactorActorState<A: Actor> {
     interceptors: Vec<Box<dyn InboundInterceptor>>,
     watchers: WatcherMap,
     stop_reason: Option<String>,
+    dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
 }
 
 /// Arguments passed to the ractor actor at spawn time.
@@ -79,6 +81,7 @@ struct RactorSpawnArgs<A: Actor> {
     actor_name: String,
     interceptors: Vec<Box<dyn InboundInterceptor>>,
     watchers: WatcherMap,
+    dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
 }
 
 impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
@@ -100,6 +103,7 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
             interceptors: args.interceptors,
             watchers: args.watchers,
             stop_reason: None,
+            dead_letter_handler: args.dead_letter_handler,
         })
     }
 
@@ -155,6 +159,23 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
 
         // If rejected/dropped/retry, propagate proper error to caller
         if let Some((interceptor_name, disposition)) = rejection {
+            if matches!(disposition, Disposition::Drop) {
+                if let Some(ref handler) = *state.dead_letter_handler {
+                    let event = DeadLetterEvent {
+                        target_id: state.ctx.actor_id.clone(),
+                        target_name: Some(state.ctx.actor_name.clone()),
+                        message_type,
+                        send_mode,
+                        reason: DeadLetterReason::DroppedByInterceptor {
+                            interceptor: interceptor_name.clone(),
+                        },
+                        message: None,
+                    };
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handler.on_dead_letter(event);
+                    }));
+                }
+            }
             dispatch.reject(disposition, &interceptor_name);
             return Ok(());
         }
@@ -311,6 +332,7 @@ pub struct RactorActorRef<A: Actor> {
     inner: ractor::ActorRef<DactorMsg<A>>,
     outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
     drop_observer: Option<Arc<dyn DropObserver>>,
+    dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
 }
 
 impl<A: Actor> Clone for RactorActorRef<A> {
@@ -321,6 +343,7 @@ impl<A: Actor> Clone for RactorActorRef<A> {
             inner: self.inner.clone(),
             outbound_interceptors: self.outbound_interceptors.clone(),
             drop_observer: self.drop_observer.clone(),
+            dead_letter_handler: self.dead_letter_handler.clone(),
         }
     }
 }
@@ -338,6 +361,22 @@ impl<A: Actor + 'static> RactorActorRef<A> {
             drop_observer: self.drop_observer.clone(),
             target_id: self.id.clone(),
             target_name: self.name.clone(),
+        }
+    }
+
+    fn notify_dead_letter(&self, message_type: &'static str, send_mode: SendMode, reason: DeadLetterReason) {
+        if let Some(ref handler) = *self.dead_letter_handler {
+            let event = DeadLetterEvent {
+                target_id: self.id.clone(),
+                target_name: Some(self.name.clone()),
+                message_type,
+                send_mode,
+                reason,
+                message: None,
+            };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler.on_dead_letter(event);
+            }));
         }
     }
 }
@@ -380,7 +419,10 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         let dispatch: Box<dyn Dispatch<A>> = Box::new(TypedDispatch { msg });
         self.inner
             .cast(DactorMsg(dispatch))
-            .map_err(|e| ActorSendError(e.to_string()))
+            .map_err(|e| {
+                self.notify_dead_letter(std::any::type_name::<M>(), SendMode::Tell, DeadLetterReason::ActorStopped);
+                ActorSendError(e.to_string())
+            })
     }
 
     fn ask<M>(
@@ -430,7 +472,10 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         });
         self.inner
             .cast(DactorMsg(dispatch))
-            .map_err(|e| ActorSendError(e.to_string()))?;
+            .map_err(|e| {
+                self.notify_dead_letter(std::any::type_name::<M>(), SendMode::Ask, DeadLetterReason::ActorStopped);
+                ActorSendError(e.to_string())
+            })?;
         Ok(AskReply::new(rx))
     }
 
@@ -602,6 +647,7 @@ pub struct RactorRuntime {
     cluster_events: RactorClusterEvents,
     outbound_interceptors: Arc<Vec<Box<dyn OutboundInterceptor>>>,
     drop_observer: Option<Arc<dyn DropObserver>>,
+    dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
     watchers: WatcherMap,
 }
 
@@ -614,6 +660,7 @@ impl RactorRuntime {
             cluster_events: RactorClusterEvents::new(),
             outbound_interceptors: Arc::new(Vec::new()),
             drop_observer: None,
+            dead_letter_handler: Arc::new(None),
             watchers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -632,6 +679,12 @@ impl RactorRuntime {
     /// interceptor returns `Disposition::Drop`.
     pub fn set_drop_observer(&mut self, observer: Arc<dyn DropObserver>) {
         self.drop_observer = Some(observer);
+    }
+
+    /// Set a global dead letter handler. Called whenever a message cannot be
+    /// delivered (actor stopped, mailbox full, dropped by inbound interceptor).
+    pub fn set_dead_letter_handler(&mut self, handler: Arc<dyn DeadLetterHandler>) {
+        self.dead_letter_handler = Arc::new(Some(handler));
     }
 
     /// Access the cluster events subsystem.
@@ -708,6 +761,7 @@ impl RactorRuntime {
             actor_name: actor_name.clone(),
             interceptors,
             watchers: self.watchers.clone(),
+            dead_letter_handler: self.dead_letter_handler.clone(),
         };
 
         // Bridge sync → async: use a std thread to avoid blocking the
@@ -742,6 +796,7 @@ impl RactorRuntime {
             inner: actor_ref,
             outbound_interceptors: self.outbound_interceptors.clone(),
             drop_observer: self.drop_observer.clone(),
+            dead_letter_handler: self.dead_letter_handler.clone(),
         }
     }
 
