@@ -36,8 +36,8 @@ pub struct Headers {
 
 // Compile-time assertion that Headers is Send + Sync.
 const _: () = {
-    fn assert_send_sync<T: Send + Sync>() {}
-    fn check() { assert_send_sync::<Headers>(); }
+    fn _assert<T: Send + Sync>() {}
+    fn _check() { _assert::<Headers>(); }
 };
 
 impl Headers {
