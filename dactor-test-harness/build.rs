@@ -1,12 +1,20 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Ensure protoc is found via PATH if PROTOC is not set
+    // Ensure protoc is found. prost-build can auto-detect protoc but sometimes
+    // finds a directory instead of the binary. We check known locations first.
     if std::env::var("PROTOC").is_err() {
-        if let Ok(output) = std::process::Command::new("where.exe")
-            .arg("protoc.exe")
-            .output()
-        {
-            if let Some(line) = String::from_utf8_lossy(&output.stdout).lines().next() {
-                std::env::set_var("PROTOC", line.trim());
+        let candidates = [
+            // Chocolatey (Windows)
+            "C:\\ProgramData\\chocolatey\\lib\\protoc\\tools\\bin\\protoc.exe",
+            // Homebrew (macOS)
+            "/opt/homebrew/bin/protoc",
+            "/usr/local/bin/protoc",
+            // Linux
+            "/usr/bin/protoc",
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                std::env::set_var("PROTOC", path);
+                break;
             }
         }
     }

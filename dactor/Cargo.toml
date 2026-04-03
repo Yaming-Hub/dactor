@@ -27,8 +27,9 @@ features = ["derive"]
 optional = true
 
 [features]
-default = []
+default = ["metrics"]
 serde = ["dep:serde", "uuid/serde"]
+metrics = []
 test-support = ["tokio/test-util"]
 
 [dev-dependencies]

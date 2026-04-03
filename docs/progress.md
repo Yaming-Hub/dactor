@@ -301,6 +301,81 @@ Wire persistence traits into actor lifecycle (recovery, snapshots, durable state
 | AP5 | TestRuntime::spawn_pool() | §4.14 | Spawn N local workers | ✅ PR #45 |
 | AP6 | LeastLoaded routing | §4.14 | Route to worker with fewest queued messages | 🔲 Needs per-worker load tracking |
 | AP7 | Distributed pool | §4.14 | Workers across nodes via remote ActorRef (Phase 4) | 🔲 Depends on R3 |
+| AP8 | Virtual actor pool (v2) | §4.14 | Redesign pool as virtual router actor (see below) | 🔲 Design proposed |
+
+#### AP8: Virtual Actor Pool (Proposed Redesign)
+
+The current `PoolRef` is a passive data structure (Vec of refs + atomic counter)
+that routes from the caller's thread. This has several limitations:
+
+1. **Metrics contention** — pool workers share one `ActorMetricsHandle`; multiple
+   worker tasks contend on its Mutex.
+2. **Feed scatter** — items from a single feed stream can be routed to different
+   workers since each `tell()` is an independent routing decision.
+3. **No single-threaded guarantee** — multiple callers route concurrently.
+
+**Proposed v2 design: Virtual Router Actor**
+
+```
+Caller-1 ──┐
+Caller-2 ──┼──→ [Router mailbox] ──→ Router Actor (single-threaded)
+Caller-3 ──┘                              ├──→ Worker-0
+                                          ├──→ Worker-1 ──→ reply direct to caller
+                                          └──→ Worker-2
+```
+
+The router is a **real actor** with its own mailbox:
+
+- **Single-threaded routing** — all routing decisions happen sequentially in the
+  router's task. Zero contention on routing state, metrics, and counters.
+- **Feed affinity** — when a feed stream starts, the router picks one worker and
+  pins all items from that stream to the same worker (sticky by stream).
+- **Direct reply** — the router forwards the `reply_tx` (oneshot sender) to the
+  worker along with the dispatch envelope. The worker replies directly to the
+  caller without going back through the router. No proxy overhead on the reply
+  path.
+- **Zero-copy routing** — the router doesn't inspect or clone message contents.
+  It immediately forwards the type-erased `BoxedDispatch<A>` to the selected
+  worker and moves on to the next message.
+- **Metrics** — the router actor has its own single-threaded `ActorMetricsHandle`
+  for pool-level metrics (zero contention). Workers optionally have their own
+  handles for per-worker breakdown.
+
+**Implementation sketch:**
+
+```rust
+struct RouterActor<A: Actor> {
+    workers: Vec<Box<dyn ActorRef<A>>>,
+    routing: PoolRouting,
+    counter: u64,
+}
+
+// Router receives BoxedDispatch<A> and forwards to a worker.
+// For tell: forward dispatch, no reply.
+// For ask: forward dispatch + reply_tx, worker replies directly.
+// For feed: pick one worker, forward the entire StreamReceiver.
+
+struct PoolActorRef<A: Actor> {
+    router: ActorRef<RouterActor<A>>,  // send routing requests to router
+}
+
+impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
+    fn tell<M>(&self, msg: M) -> Result<(), ActorSendError> {
+        // Wrap msg into BoxedDispatch, send to router's mailbox
+        self.router.tell(RouteMessage(Box::new(TypedDispatch { msg })))
+    }
+}
+```
+
+**Challenges:**
+- `ActorRef<A>` has generic methods (`tell<M>`, `ask<M>`) which can't be
+  forwarded through a single-typed router mailbox without type erasure.
+  The router must accept `BoxedDispatch<A>` (already used by all adapters).
+- The router could become a bottleneck if routing is slower than the message
+  rate. Since routing is "pick worker index + forward" (no processing), this
+  is unlikely for most workloads.
+- The current `PoolRef` should be kept as a simpler alternative for use cases
+  that don't need feed affinity or single-threaded routing.
 
 ### 6.2 Supervision Strategies
 

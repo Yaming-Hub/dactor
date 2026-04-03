@@ -3073,7 +3073,7 @@ impl InboundInterceptor for RateLimiter {
 | Per-actor maps | `DashMap<ActorId, V>` | Circuit breaker state per actor |
 | Shared config | `Arc<Config>` (immutable) | Policy configuration |
 | Mutable config | `ArcSwap<Config>` | Hot-reloadable config |
-| Metrics sinks | `Arc<MetricsStore>` | Aggregated metrics |
+| Metrics sinks | `Arc<MetricsRegistry>` | Aggregated metrics |
 | Time tracking | `AtomicI64` (epoch ms) | Sliding window rate limits |
 
 **Lifecycle hooks:** Interceptors do **not** have lifecycle callbacks
@@ -6532,10 +6532,10 @@ let connected_count = state.peers.iter()
 The `MetricsInterceptor` can expose cluster metrics automatically:
 
 ```rust
-// Cluster metrics available via MetricsStore:
-metrics_store.cluster_peer_count()          // total known peers
-metrics_store.cluster_connected_count()     // currently connected
-metrics_store.cluster_unreachable_count()   // currently unreachable
+// Cluster metrics available via MetricsRegistry:
+metrics_registry.cluster_peer_count()          // total known peers
+metrics_registry.cluster_connected_count()     // currently connected
+metrics_registry.cluster_unreachable_count()   // currently unreachable
 ```
 
 ---
@@ -6558,96 +6558,84 @@ API for common operational needs.
 ### 11.2 Built-in `MetricsInterceptor`
 
 A ready-to-use interceptor that tracks per-actor and per-message-type
-statistics. Users register it once; it collects everything automatically.
+statistics. Each actor gets its own `ActorMetricsHandle` at spawn time;
+the interceptor holds a direct `Arc<ActorMetricsHandle>` — no global
+map lookup on the message path.
 
 ```rust
-/// Built-in interceptor that collects runtime-level metrics.
-/// Register via `runtime.add_inbound_interceptor(Box::new(MetricsInterceptor::new()))`.
+/// Per-actor metrics handle. Uses atomics for counters — no global lock
+/// per message. The internal bucket state uses a per-actor Mutex with
+/// minimal contention (single writer: the actor's own task).
+pub struct ActorMetricsHandle {
+    message_count: AtomicU64,
+    error_count: AtomicU64,
+    inner: Mutex<HandleInner>,  // windowed buckets
+    window: Duration,
+    bucket_duration: Duration,
+}
+
+/// Built-in interceptor that holds a direct Arc<ActorMetricsHandle>.
+/// No global map lookup per message — counters use atomics.
 pub struct MetricsInterceptor {
-    inner: Arc<MetricsStore>,
+    handle: Arc<ActorMetricsHandle>,
 }
 
 impl MetricsInterceptor {
-    pub fn new() -> Self { ... }
-
-    /// Access the collected metrics for querying.
-    pub fn metrics(&self) -> &MetricsStore { ... }
+    pub fn new(handle: Arc<ActorMetricsHandle>) -> Self { ... }
+    pub fn handle(&self) -> &Arc<ActorMetricsHandle> { ... }
 }
 
 impl InboundInterceptor for MetricsInterceptor {
     fn name(&self) -> &'static str { "metrics" }
     fn on_receive(&self, ctx: &InboundContext<'_>, _runtime_headers: &RuntimeHeaders, headers: &mut Headers, _message: &dyn Any) -> Disposition {
-        self.inner.record_receive(ctx);
+        self.handle.record_message(ctx.message_type);
         Disposition::Continue
     }
 
-    fn on_complete(&self, ctx: &InboundContext<'_>, _headers: &Headers, outcome: &Outcome) {
-        self.inner.record_complete(ctx, outcome);
-    }
-
-    fn on_stream_item(&self, ctx: &InboundContext<'_>, _headers: &Headers, seq: u64, _item: &dyn Any) {
-        self.inner.record_stream_item(ctx, seq);
+    fn on_complete(&self, _ctx: &InboundContext<'_>, runtime_headers: &RuntimeHeaders, _headers: &Headers, outcome: &Outcome) {
+        self.handle.record_latency(runtime_headers.timestamp.elapsed());
+        if matches!(outcome, Outcome::HandlerError { .. }) {
+            self.handle.record_error();
+        }
     }
 }
 ```
 
-### 11.3 `MetricsStore` Query API
+### 11.3 `MetricsRegistry` Query API
 
 ```rust
-/// Queryable metrics collected by `MetricsInterceptor`.
-pub struct MetricsStore { /* internal concurrent maps */ }
+/// Central registry of per-actor metrics handles.
+/// Lock only taken when actors are registered/unregistered — not per message.
+pub struct MetricsRegistry { /* Arc<Mutex<HashMap<ActorId, Arc<ActorMetricsHandle>>>> */ }
 
-impl MetricsStore {
-    // ── Per-actor metrics ───────────────────────────────
+impl MetricsRegistry {
+    // ── Registration ────────────────────────────────────
+    pub fn register(&self, actor_id: ActorId) -> Arc<ActorMetricsHandle>;
+    pub fn unregister(&self, actor_id: &ActorId);
+    pub fn get(&self, actor_id: &ActorId) -> Option<Arc<ActorMetricsHandle>>;
 
-    /// Total messages received by each actor (sorted descending = busiest first).
-    pub fn busiest_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
+    // ── Snapshots ───────────────────────────────────────
+    pub fn all(&self) -> Vec<(ActorId, ActorMetricsSnapshot)>;
+    pub fn runtime_metrics(&self) -> RuntimeMetrics;
 
-    /// Actors with the most handler errors (sorted descending = most failed first).
-    pub fn most_failed_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
-
-    /// Actors with the highest average handler latency.
-    pub fn slowest_actors(&self, top_n: usize) -> Vec<ActorMetrics>;
-
-    /// Metrics for a specific actor.
-    pub fn actor(&self, id: ActorId) -> Option<ActorMetrics>;
-
-    // ── Per-message-type metrics ────────────────────────
-
-    /// Message types with the highest volume.
-    pub fn busiest_message_types(&self, top_n: usize) -> Vec<MessageTypeMetrics>;
-
-    // ── Global metrics ──────────────────────────────────
-
-    /// Total messages processed across all actors.
+    // ── Convenience totals (from atomics) ───────────────
     pub fn total_messages(&self) -> u64;
-
-    /// Total errors across all actors.
     pub fn total_errors(&self) -> u64;
-
-    /// Reset all counters.
-    pub fn reset(&self);
+    pub fn actor_count(&self) -> usize;
 }
 
-/// Per-actor statistics.
+/// Immutable point-in-time snapshot of an actor's metrics.
 #[derive(Debug, Clone)]
-pub struct ActorMetrics {
-    pub actor_id: ActorId,
-    pub actor_name: String,
-    /// Total messages received (tell + ask + stream requests).
-    pub messages_received: u64,
-    /// Total handler errors.
-    pub errors: u64,
-    /// Total handler invocations that succeeded.
-    pub successes: u64,
-    /// Average handler latency.
-    pub avg_latency: Duration,
-    /// Maximum handler latency observed.
-    pub max_latency: Duration,
-    /// Total stream items emitted (if actor handles streams).
-    pub stream_items_emitted: u64,
-    /// Count of messages received per priority level.
-    pub by_priority: HashMap<Priority, u64>,
+pub struct ActorMetricsSnapshot {
+    pub message_count: u64,
+    pub error_count: u64,
+    pub message_rate: f64,
+    pub error_rate: f64,
+    pub message_counts_by_type: HashMap<String, u64>,
+    pub avg_latency: Option<Duration>,
+    pub max_latency: Option<Duration>,
+    pub p99_latency: Option<Duration>,
+}
     /// Count of remote vs local messages.
     pub remote_messages: u64,
     pub local_messages: u64,
@@ -6825,17 +6813,16 @@ impl InboundInterceptor for OtelInterceptor {
 Interceptors are composable. A typical production setup:
 
 ```rust
-let metrics = MetricsInterceptor::new();
-let metrics_store = metrics.metrics().clone();  // for querying later
+let mut runtime = TestRuntime::new();
+runtime.enable_metrics();
 
-runtime.add_inbound_interceptor(Box::new(OtelInterceptor))?;
-runtime.add_inbound_interceptor(Box::new(metrics))?;
-runtime.add_inbound_interceptor(Box::new(SlowHandlerInterceptor { threshold: Duration::from_secs(1) }))?;
-runtime.add_inbound_interceptor(Box::new(CircuitBreakerInterceptor::new(10)))?;
+// Spawn actors — MetricsInterceptor is automatically attached
+// with per-actor handles (atomics, no global lock per message).
 
-// Later: query metrics
-let top_5_busiest = metrics_store.busiest_actors(5);
-let top_5_failing = metrics_store.most_failed_actors(5);
+// Later: query metrics via the registry
+let registry = runtime.metrics().unwrap();
+let all_snapshots = registry.all();
+let runtime_snapshot = registry.runtime_metrics();
 ```
 
 Interceptors execute in registration order. The pipeline is:
@@ -8629,7 +8616,7 @@ dactor/src/
 ├── mailbox.rs           ← MailboxConfig, OverflowStrategy
 ├── errors.rs            ← ActorSendError, GroupError, ClusterError, RuntimeError, ActorError
 ├── dead_letter.rs       ← DeadLetterHandler, DeadLetterEvent, DeadLetterReason
-├── metrics.rs           ← MetricsInterceptor, MetricsStore, ActorMetrics
+├── metrics.rs           ← MetricsInterceptor, MetricsRegistry, ActorMetricsHandle, ActorMetricsSnapshot
 ├── remote.rs            ← RemoteMessage marker trait, serialization contract
 └── test_support/        ← #[cfg(feature = "test-support")]
     ├── mod.rs
