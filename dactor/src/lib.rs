@@ -38,6 +38,7 @@ pub mod supervision;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod pool;
+pub mod registry;
 pub mod throttle;
 pub mod timer;
 pub mod clock;
@@ -85,6 +86,7 @@ pub use dead_letter::{
 pub use throttle::ActorRateLimiter;
 pub use circuit_breaker::{CircuitBreakerInterceptor, CircuitState};
 pub use pool::{PoolRouting, PoolConfig, PoolRef, Keyed};
+pub use registry::ActorRegistry;
 #[cfg(feature = "metrics")]
 pub use metrics::{MetricsInterceptor, MetricsRegistry, ActorMetricsHandle, ActorMetricsSnapshot, RuntimeMetrics};
 pub use mailbox::{MailboxConfig, OverflowStrategy, MessageComparer, StrictPriorityComparer};
