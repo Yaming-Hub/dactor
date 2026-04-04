@@ -694,6 +694,7 @@ impl TestRuntime {
         let name_task = actor_name.clone();
         let watchers_ref = self.watchers.clone();
         let dead_letter_handler_task = self.dead_letter_handler.clone();
+        let registry_task = self.registry.clone();
 
         tokio::spawn(async move {
             let mut actor = A::create(args, deps);
@@ -906,13 +907,16 @@ impl TestRuntime {
             if !entries.is_empty() {
                 let notification = ChildTerminated {
                     child_id: actor_id,
-                    child_name: actor_name,
+                    child_name: actor_name.clone(),
                     reason: stop_reason,
                 };
                 for entry in &entries {
                     (entry.notify)(notification.clone());
                 }
             }
+
+            // Auto-unregister from the name registry on stop.
+            registry_task.unregister(&actor_name);
         });
 
         let actor_ref = TestActorRef {

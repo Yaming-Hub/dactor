@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex};
 /// Actors are registered at spawn time and can be looked up by name
 /// from any task. The registry stores type-erased refs; callers must
 /// know the actor type to downcast.
+///
+/// **Lifecycle:** Actors are auto-registered on spawn but NOT auto-unregistered
+/// on stop. Call [`unregister`](Self::unregister) explicitly when actors
+/// terminate, or accept that stopped actors remain in the registry (their
+/// refs will report `is_alive() == false`).
 pub struct ActorRegistry {
     entries: Mutex<HashMap<String, Arc<dyn Any + Send + Sync>>>,
 }
@@ -19,15 +24,17 @@ impl ActorRegistry {
     }
 
     /// Register an actor ref under a name. Overwrites if name exists.
-    pub fn register<R: Send + Sync + 'static>(&self, name: &str, actor_ref: R) {
+    /// The ref must be `Clone` so it can be retrieved via [`lookup`](Self::lookup).
+    pub fn register<R: Clone + Send + Sync + 'static>(&self, name: &str, actor_ref: R) {
         let boxed: Arc<dyn Any + Send + Sync> = Arc::new(actor_ref);
-        self.entries.lock().unwrap().insert(name.to_string(), boxed);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.insert(name.to_string(), boxed);
     }
 
     /// Look up an actor by name, returning a clone of its ref.
     /// Returns `None` if not found or if the type doesn't match.
     pub fn lookup<R: Clone + 'static>(&self, name: &str) -> Option<R> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries
             .get(name)
             .and_then(|entry| entry.downcast_ref::<R>())
@@ -36,27 +43,27 @@ impl ActorRegistry {
 
     /// Remove an actor from the registry.
     pub fn unregister(&self, name: &str) -> bool {
-        self.entries.lock().unwrap().remove(name).is_some()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).remove(name).is_some()
     }
 
     /// Check if a name is registered.
     pub fn contains(&self, name: &str) -> bool {
-        self.entries.lock().unwrap().contains_key(name)
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).contains_key(name)
     }
 
     /// Number of registered actors.
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().unwrap().is_empty()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// List all registered names.
     pub fn names(&self) -> Vec<String> {
-        self.entries.lock().unwrap().keys().cloned().collect()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
     }
 }
 
