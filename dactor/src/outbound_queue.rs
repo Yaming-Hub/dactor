@@ -3,6 +3,17 @@
 //! [`OutboundPriorityQueue`] sorts outbound [`WireEnvelope`]s by priority,
 //! ensuring high-priority messages are transmitted first.
 //!
+//! ## Stream ordering guarantee (AM7)
+//!
+//! Stream and feed items (`SendMode::Stream` / `SendMode::Feed`) bypass
+//! the priority queue entirely and are always sent in exact enqueue order
+//! (FIFO). Only independent tell/ask messages are subject to priority
+//! scheduling.
+//!
+//! Stream and priority messages are **interleaved** during dequeue to
+//! prevent either from starving the other. Within the stream FIFO,
+//! ordering is strictly preserved.
+//!
 //! ## Modes
 //!
 //! - **Lane mode** (default): 5 fixed lanes (Critical/High/Normal/Low/Background).
@@ -18,6 +29,7 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crate::interceptor::SendMode;
 use crate::message::Priority;
 use crate::remote::WireEnvelope;
 
@@ -134,6 +146,8 @@ pub struct OutboundPriorityQueue {
     // Comparer mode
     comparer: Option<Box<dyn WireEnvelopeComparer>>,
     sorted: Vec<QueuedEnvelope>,
+    // Stream FIFO (AM7) — stream/feed items bypass priority scheduling
+    stream_fifo: VecDeque<WireEnvelope>,
     // Shared
     total: usize,
     capacity: usize,
@@ -149,6 +163,7 @@ impl OutboundPriorityQueue {
             current_lane: 0,
             comparer: None,
             sorted: Vec::new(),
+            stream_fifo: VecDeque::new(),
             total: 0,
             capacity: 0,
         }
@@ -177,12 +192,18 @@ impl OutboundPriorityQueue {
     }
 
     /// Enqueue an envelope. Returns `Err(envelope)` if at capacity.
+    ///
+    /// Stream/Feed envelopes go into a dedicated FIFO queue (AM7).
+    /// Tell/Ask envelopes go into priority lanes or comparer sorted vec.
     #[allow(clippy::result_large_err)]
     pub fn push(&mut self, envelope: WireEnvelope) -> Result<(), WireEnvelope> {
         if self.capacity > 0 && self.total >= self.capacity {
             return Err(envelope);
         }
-        if self.is_comparer_mode() {
+        // Stream/Feed items bypass priority — strict FIFO ordering
+        if matches!(envelope.send_mode, SendMode::Stream | SendMode::Feed) {
+            self.stream_fifo.push_back(envelope);
+        } else if self.is_comparer_mode() {
             let metadata = EnvelopeMetadata {
                 priority: extract_priority(&envelope),
                 enqueued_at: Instant::now(),
@@ -196,11 +217,49 @@ impl OutboundPriorityQueue {
         Ok(())
     }
 
-    /// Dequeue the highest-priority envelope.
+    /// Dequeue the next envelope.
+    ///
+    /// Interleaves stream FIFO and priority queue: if both have items,
+    /// stream items are popped first but only up to one at a time —
+    /// then a priority item gets a turn. This prevents stream traffic
+    /// from starving tell/ask messages.
     pub fn pop(&mut self) -> Option<WireEnvelope> {
         if self.total == 0 {
             return None;
         }
+
+        let has_stream = !self.stream_fifo.is_empty();
+        let has_priority = if self.is_comparer_mode() {
+            !self.sorted.is_empty()
+        } else {
+            self.lanes.iter().any(|l| !l.is_empty())
+        };
+
+        // If only one source has items, drain it
+        if has_stream && !has_priority {
+            return self.pop_stream();
+        }
+        if !has_stream && has_priority {
+            return self.pop_priority();
+        }
+
+        // Both have items: alternate (stream gets slight preference
+        // by going first, but we don't drain it exclusively)
+        // Use total parity for simple round-robin
+        if self.total % 2 == 0 {
+            self.pop_stream().or_else(|| self.pop_priority())
+        } else {
+            self.pop_priority().or_else(|| self.pop_stream())
+        }
+    }
+
+    fn pop_stream(&mut self) -> Option<WireEnvelope> {
+        let envelope = self.stream_fifo.pop_front()?;
+        self.total -= 1;
+        Some(envelope)
+    }
+
+    fn pop_priority(&mut self) -> Option<WireEnvelope> {
         if self.comparer.is_some() {
             self.pop_comparer()
         } else if self.max_consecutive == 0 {
@@ -265,6 +324,10 @@ impl OutboundPriorityQueue {
 
     /// Peek at the highest-priority envelope without removing it.
     pub fn peek(&self) -> Option<&WireEnvelope> {
+        // Stream FIFO takes precedence
+        if let Some(envelope) = self.stream_fifo.front() {
+            return Some(envelope);
+        }
         if self.is_comparer_mode() {
             if self.sorted.is_empty() {
                 return None;
@@ -289,8 +352,12 @@ impl OutboundPriorityQueue {
     }
 
     /// Drain all envelopes in priority order.
+    /// Stream/Feed items come first (FIFO), then priority-ordered tell/ask.
     pub fn drain_ordered(&mut self) -> Vec<WireEnvelope> {
         let mut result = Vec::with_capacity(self.total);
+        // Stream items first
+        result.extend(self.stream_fifo.drain(..));
+        // Then priority-ordered
         if self.is_comparer_mode() {
             // Sort by priority then enqueue time for stable ordering
             self.sorted
@@ -338,8 +405,14 @@ impl OutboundPriorityQueue {
             lane.clear();
         }
         self.sorted.clear();
+        self.stream_fifo.clear();
         self.total = 0;
         self.consecutive_from_lane = 0;
+    }
+
+    /// Number of stream/feed items in the FIFO queue.
+    pub fn fifo_count(&self) -> usize {
+        self.stream_fifo.len()
     }
 }
 
@@ -587,5 +660,189 @@ mod tests {
         q.push(envelope_with_priority(Priority::HIGH)).unwrap();
         assert_eq!(q.lane_counts(), [0, 0, 0, 0, 0]);
         assert_eq!(q.comparer_count(), 1);
+    }
+
+    // -- Stream ordering tests (AM7) --
+
+    fn stream_envelope(seq: u8) -> WireEnvelope {
+        WireEnvelope {
+            target: ActorId {
+                node: NodeId("n1".into()),
+                local: 1,
+            },
+            target_name: "test".into(),
+            message_type: "test::StreamItem".into(),
+            send_mode: SendMode::Stream,
+            headers: WireHeaders::new(),
+            body: vec![seq],
+            request_id: None,
+            version: None,
+        }
+    }
+
+    fn feed_envelope(seq: u8) -> WireEnvelope {
+        WireEnvelope {
+            target: ActorId {
+                node: NodeId("n1".into()),
+                local: 1,
+            },
+            target_name: "test".into(),
+            message_type: "test::FeedItem".into(),
+            send_mode: SendMode::Feed,
+            headers: WireHeaders::new(),
+            body: vec![seq],
+            request_id: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn stream_items_interleave_with_priority() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(envelope_with_priority(Priority::LOW)).unwrap();
+        q.push(stream_envelope(1)).unwrap();
+        q.push(stream_envelope(2)).unwrap();
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+
+        // All 4 items should be dequeued
+        let mut stream_items = vec![];
+        let mut tell_items = vec![];
+        while let Some(e) = q.pop() {
+            if matches!(e.send_mode, SendMode::Stream) {
+                stream_items.push(e.body[0]);
+            } else {
+                tell_items.push(e.body[0]);
+            }
+        }
+        // Stream items maintain FIFO order among themselves
+        assert_eq!(stream_items, vec![1, 2]);
+        // Tell items maintain priority order among themselves
+        assert_eq!(tell_items, vec![Priority::CRITICAL.0, Priority::LOW.0]);
+    }
+
+    #[test]
+    fn stream_items_preserve_fifo_order() {
+        let mut q = OutboundPriorityQueue::new();
+        for i in 0..10 {
+            q.push(stream_envelope(i)).unwrap();
+        }
+        for i in 0..10 {
+            assert_eq!(q.pop().unwrap().body, vec![i]);
+        }
+    }
+
+    #[test]
+    fn feed_items_also_use_fifo() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(feed_envelope(1)).unwrap();
+        q.push(feed_envelope(2)).unwrap();
+        q.push(feed_envelope(3)).unwrap();
+
+        // Feed items maintain FIFO ordering among themselves
+        assert_eq!(q.pop().unwrap().body, vec![1]);
+        assert_eq!(q.pop().unwrap().body, vec![2]);
+        assert_eq!(q.pop().unwrap().body, vec![3]);
+    }
+
+    #[test]
+    fn stream_count_tracks_fifo() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(stream_envelope(1)).unwrap();
+        q.push(stream_envelope(2)).unwrap();
+        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
+
+        assert_eq!(q.fifo_count(), 2);
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn stream_items_in_drain_come_first() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(envelope_with_priority(Priority::HIGH)).unwrap();
+        q.push(stream_envelope(10)).unwrap();
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+        q.push(stream_envelope(20)).unwrap();
+
+        let drained = q.drain_ordered();
+        assert_eq!(drained.len(), 4);
+        // Stream items first (FIFO)
+        assert_eq!(drained[0].body, vec![10]);
+        assert_eq!(drained[1].body, vec![20]);
+        // Then priority-ordered tells
+        assert_eq!(drained[2].body, vec![Priority::CRITICAL.0]);
+        assert_eq!(drained[3].body, vec![Priority::HIGH.0]);
+    }
+
+    #[test]
+    fn peek_returns_stream_item_first() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+        q.push(stream_envelope(99)).unwrap();
+
+        // peek should see stream item (has priority)
+        // Actually stream was pushed second, but stream_fifo is checked first
+        // The critical was pushed first to lanes, stream second to fifo
+        // But we need to re-check: critical goes to lane, stream to fifo
+        // peek checks fifo first → should return stream
+        let peeked = q.peek().unwrap();
+        assert_eq!(peeked.body, vec![99]);
+    }
+
+    #[test]
+    fn clear_also_clears_stream_fifo() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(stream_envelope(1)).unwrap();
+        q.push(envelope_with_priority(Priority::HIGH)).unwrap();
+        q.clear();
+        assert!(q.is_empty());
+        assert_eq!(q.fifo_count(), 0);
+    }
+
+    #[test]
+    fn stream_items_bypass_comparer_mode() {
+        let mut q = OutboundPriorityQueue::with_comparer(StrictPriorityWireComparer, 0);
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+        q.push(stream_envelope(1)).unwrap();
+        q.push(stream_envelope(2)).unwrap();
+
+        assert_eq!(q.fifo_count(), 2);
+        assert_eq!(q.comparer_count(), 1);
+
+        // Stream items interleave with priority — both are accessible
+        let mut got_stream = false;
+        let mut got_priority = false;
+        while let Some(e) = q.pop() {
+            if e.send_mode == SendMode::Stream {
+                got_stream = true;
+            } else {
+                got_priority = true;
+            }
+        }
+        assert!(got_stream);
+        assert!(got_priority);
+    }
+
+    #[test]
+    fn interleaving_prevents_starvation() {
+        let mut q = OutboundPriorityQueue::new();
+        // Push 10 stream items and 1 critical tell
+        for i in 0..10 {
+            q.push(stream_envelope(i)).unwrap();
+        }
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+
+        // The critical tell should appear within first 11 pops,
+        // not only after all 10 stream items
+        let mut critical_seen_at = None;
+        for i in 0..11 {
+            let e = q.pop().unwrap();
+            if e.send_mode == SendMode::Tell {
+                critical_seen_at = Some(i);
+                break;
+            }
+        }
+        // With interleaving, critical should appear well before position 10
+        assert!(critical_seen_at.is_some());
+        assert!(critical_seen_at.unwrap() < 10);
     }
 }

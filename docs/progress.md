@@ -460,7 +460,7 @@ impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
 | AM4 | on_reply wiring | §5.3 | OutboundInterceptor sees ask replies | ✅ PR #46 |
 | AM5 | Outbound priority queue | §5.8 | Per-destination priority lanes | ✅ PR #74 |
 | AM6 | Pluggable outbound comparer | §5.6, §5.8 | WireEnvelopeComparer trait + StrictPriorityWireComparer + AgingWireComparer, integrated into OutboundPriorityQueue via with_comparer() | ✅ PR #76 |
-| AM7 | Stream item ordering guarantee | §4.11 | Ensure stream/feed items within a single stream are always sent in exact enqueue order, bypassing the priority queue. Stream items must not be reordered by priority — only independent tell/ask messages are subject to priority scheduling. | 🔲 Not started |
+| AM7 | Stream item ordering guarantee | §4.11 | Stream/feed items bypass priority queue, always FIFO. Only tell/ask subject to priority. | ✅ PR #77 |
 
 ---
 
