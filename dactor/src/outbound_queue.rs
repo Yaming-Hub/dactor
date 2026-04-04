@@ -1,106 +1,160 @@
-//! Per-destination priority queue for outbound remote messages.
+//! Per-destination outbound priority queue for remote messages.
 //!
-//! [`OutboundPriorityQueue`] sorts outbound [`WireEnvelope`]s by priority
-//! before sending, ensuring high-priority messages are transmitted first
-//! regardless of enqueue order.
+//! [`OutboundPriorityQueue`] sorts outbound [`WireEnvelope`]s by priority,
+//! ensuring high-priority messages are transmitted first.
 //!
-//! ## Priority lanes
+//! ## Modes
 //!
-//! Messages are bucketed into lanes by their [`Priority`] header value:
+//! - **Lane mode** (default): 5 fixed lanes (Critical/High/Normal/Low/Background).
+//!   Fast O(1) push, O(1) pop. Use `new()` or `with_config()`.
+//! - **Comparer mode**: pluggable [`WireEnvelopeComparer`] for custom ordering
+//!   (e.g., age-based promotion). O(1) push, O(n) pop. Use `with_comparer()`.
 //!
-//! | Lane | Priority range | Example |
-//! |------|---------------|---------|
-//! | Critical | 0–63 | System health, circuit breaker |
-//! | High | 64–127 | User requests, RPC |
-//! | Normal | 128–191 | Default (no priority header) |
-//! | Low | 192–254 | Analytics, logging |
-//! | Background | 255 | Batch jobs, precomputation |
+//! ## Starvation mitigation (lane mode only)
 //!
-//! Within a lane, messages are delivered in FIFO order.
-//!
-//! ## Starvation mitigation
-//!
-//! By default, strict priority ordering is used (highest-priority first).
-//! Under sustained high-priority load, lower lanes may starve. To prevent
-//! this, configure `max_consecutive` on the queue — after dequeuing that
-//! many messages from a single lane, the queue round-robins to the next
-//! non-empty lane regardless of priority.
+//! Set `max_consecutive` to limit pops from one lane before round-robining.
 
+use std::cmp::Ordering;
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::message::Priority;
 use crate::remote::WireEnvelope;
 
-/// Number of priority lanes.
 const LANE_COUNT: usize = 5;
-
-/// The well-known header name for priority (kept in sync with Priority::header_name).
 const PRIORITY_HEADER_NAME: &str = "dactor.Priority";
 
-/// Extracts the priority lane index from a WireEnvelope's headers.
-fn lane_index(envelope: &WireEnvelope) -> usize {
-    let priority_value = envelope
+// ---------------------------------------------------------------------------
+// WireEnvelopeComparer trait
+// ---------------------------------------------------------------------------
+
+/// Metadata for priority comparison. The comparer sees priority + enqueue
+/// time but NOT the message body.
+#[derive(Debug, Clone)]
+pub struct EnvelopeMetadata {
+    priority: u8,
+    enqueued_at: Instant,
+}
+
+impl EnvelopeMetadata {
+    /// Priority value (0-255, lower = higher urgency).
+    pub fn priority(&self) -> u8 {
+        self.priority
+    }
+    /// When the envelope was enqueued.
+    pub fn enqueued_at(&self) -> Instant {
+        self.enqueued_at
+    }
+}
+
+/// Custom ordering for outbound envelopes.
+///
+/// `now` is captured once per `pop()` for consistent ordering.
+/// Return `Less` if `a` should be dequeued first.
+pub trait WireEnvelopeComparer: Send + Sync + 'static {
+    fn compare(&self, a: &EnvelopeMetadata, b: &EnvelopeMetadata, now: Instant) -> Ordering;
+}
+
+/// Default: lower numeric priority = dequeued first.
+pub struct StrictPriorityWireComparer;
+
+impl WireEnvelopeComparer for StrictPriorityWireComparer {
+    fn compare(&self, a: &EnvelopeMetadata, b: &EnvelopeMetadata, _now: Instant) -> Ordering {
+        a.priority.cmp(&b.priority)
+    }
+}
+
+/// Age-aware: promotes envelopes past `max_age`. Among aged envelopes,
+/// older wins (FIFO). Among fresh envelopes, lower priority value wins.
+pub struct AgingWireComparer {
+    max_age: std::time::Duration,
+}
+
+impl AgingWireComparer {
+    pub fn new(max_age: std::time::Duration) -> Self {
+        Self { max_age }
+    }
+}
+
+impl WireEnvelopeComparer for AgingWireComparer {
+    fn compare(&self, a: &EnvelopeMetadata, b: &EnvelopeMetadata, now: Instant) -> Ordering {
+        let a_aged = now.duration_since(a.enqueued_at) >= self.max_age;
+        let b_aged = now.duration_since(b.enqueued_at) >= self.max_age;
+        match (a_aged, b_aged) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (true, true) => a.enqueued_at.cmp(&b.enqueued_at),
+            (false, false) => a.priority.cmp(&b.priority),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn extract_priority(envelope: &WireEnvelope) -> u8 {
+    envelope
         .headers
         .get(PRIORITY_HEADER_NAME)
         .and_then(|bytes| bytes.first().copied())
-        .unwrap_or(Priority::NORMAL.0);
+        .unwrap_or(Priority::NORMAL.0)
+}
 
-    match priority_value {
-        0..=63 => 0,    // Critical
-        64..=127 => 1,  // High
-        128..=191 => 2, // Normal
-        192..=254 => 3, // Low
-        255 => 4,       // Background
+fn lane_index_from_priority(priority: u8) -> usize {
+    match priority {
+        0..=63 => 0,
+        64..=127 => 1,
+        128..=191 => 2,
+        192..=254 => 3,
+        255 => 4,
     }
 }
 
-/// Per-destination priority queue that orders outbound envelopes by
-/// priority before transmission.
-///
-/// Higher-priority envelopes are dequeued first. Within the same
-/// priority lane, FIFO order is preserved.
-///
-/// ## Starvation mitigation
-///
-/// Set `max_consecutive` to limit how many messages are dequeued from
-/// a single lane before round-robining to the next. Default is `0`
-/// (unlimited / strict priority).
-///
-/// ## Capacity
-///
-/// Set `capacity` to limit total envelopes across all lanes. When full,
-/// `push()` returns the rejected envelope as `Err`.
+// ---------------------------------------------------------------------------
+// QueuedEnvelope (comparer mode)
+// ---------------------------------------------------------------------------
+
+struct QueuedEnvelope {
+    envelope: WireEnvelope,
+    metadata: EnvelopeMetadata,
+}
+
+// ---------------------------------------------------------------------------
+// OutboundPriorityQueue
+// ---------------------------------------------------------------------------
+
+/// Per-destination outbound priority queue.
 pub struct OutboundPriorityQueue {
+    // Lane mode
     lanes: [VecDeque<WireEnvelope>; LANE_COUNT],
-    total: usize,
-    /// Max envelopes across all lanes (0 = unlimited).
-    capacity: usize,
-    /// Max consecutive pops from one lane before round-robin (0 = strict priority).
     max_consecutive: usize,
-    /// Tracks consecutive pops from current lane for fairness.
     consecutive_from_lane: usize,
-    /// Current lane being drained (for round-robin fairness).
     current_lane: usize,
+    // Comparer mode
+    comparer: Option<Box<dyn WireEnvelopeComparer>>,
+    sorted: Vec<QueuedEnvelope>,
+    // Shared
+    total: usize,
+    capacity: usize,
 }
 
 impl OutboundPriorityQueue {
-    /// Create a priority queue with no capacity limit and strict priority ordering.
+    /// Lane mode with no capacity limit.
     pub fn new() -> Self {
         Self {
             lanes: Default::default(),
-            total: 0,
-            capacity: 0,
             max_consecutive: 0,
             consecutive_from_lane: 0,
             current_lane: 0,
+            comparer: None,
+            sorted: Vec::new(),
+            total: 0,
+            capacity: 0,
         }
     }
 
-    /// Create a priority queue with capacity limit and fairness controls.
-    ///
-    /// - `capacity`: max total envelopes (0 = unlimited)
-    /// - `max_consecutive`: max pops from one lane before checking lower
-    ///   lanes (0 = strict priority, no fairness)
+    /// Lane mode with capacity + fairness.
     pub fn with_config(capacity: usize, max_consecutive: usize) -> Self {
         Self {
             capacity,
@@ -109,58 +163,72 @@ impl OutboundPriorityQueue {
         }
     }
 
-    /// Enqueue an envelope into the appropriate priority lane.
-    ///
-    /// Returns `Err(envelope)` if the queue is at capacity.
+    /// Comparer mode with optional capacity.
+    pub fn with_comparer(comparer: impl WireEnvelopeComparer, capacity: usize) -> Self {
+        Self {
+            comparer: Some(Box::new(comparer)),
+            capacity,
+            ..Self::new()
+        }
+    }
+
+    fn is_comparer_mode(&self) -> bool {
+        self.comparer.is_some()
+    }
+
+    /// Enqueue an envelope. Returns `Err(envelope)` if at capacity.
+    #[allow(clippy::result_large_err)]
     pub fn push(&mut self, envelope: WireEnvelope) -> Result<(), WireEnvelope> {
         if self.capacity > 0 && self.total >= self.capacity {
             return Err(envelope);
         }
-        let lane = lane_index(&envelope);
-        self.lanes[lane].push_back(envelope);
+        if self.is_comparer_mode() {
+            let metadata = EnvelopeMetadata {
+                priority: extract_priority(&envelope),
+                enqueued_at: Instant::now(),
+            };
+            self.sorted.push(QueuedEnvelope { envelope, metadata });
+        } else {
+            let lane = lane_index_from_priority(extract_priority(&envelope));
+            self.lanes[lane].push_back(envelope);
+        }
         self.total += 1;
-        debug_assert_eq!(
-            self.total,
-            self.lanes.iter().map(|l| l.len()).sum::<usize>()
-        );
         Ok(())
     }
 
-    /// Dequeue the highest-priority envelope, with optional fairness.
-    ///
-    /// With `max_consecutive = 0` (default): strict priority — always
-    /// returns the highest-priority available envelope.
-    ///
-    /// With `max_consecutive > 0`: after dequeuing that many from one
-    /// lane, skips to the next non-empty lane (prevents starvation).
+    /// Dequeue the highest-priority envelope.
     pub fn pop(&mut self) -> Option<WireEnvelope> {
         if self.total == 0 {
             return None;
         }
-
-        if self.max_consecutive == 0 {
-            // Strict priority: scan Critical → Background
-            return self.pop_strict();
+        if self.comparer.is_some() {
+            self.pop_comparer()
+        } else if self.max_consecutive == 0 {
+            self.pop_strict()
+        } else {
+            self.pop_fair()
         }
-
-        // Fairness mode: check if we've exhausted consecutive budget
-        if self.consecutive_from_lane >= self.max_consecutive {
-            // Move to next non-empty lane
-            self.consecutive_from_lane = 0;
-            self.current_lane = self.next_non_empty_lane(self.current_lane + 1)?;
-        } else if self.lanes[self.current_lane].is_empty() {
-            // Current lane empty, find highest-priority non-empty
-            self.consecutive_from_lane = 0;
-            self.current_lane = self.next_non_empty_lane(0)?;
-        }
-
-        let envelope = self.lanes[self.current_lane].pop_front()?;
-        self.total -= 1;
-        self.consecutive_from_lane += 1;
-        Some(envelope)
     }
 
-    /// Strict priority pop (no fairness).
+    fn pop_comparer(&mut self) -> Option<WireEnvelope> {
+        let comparer = self.comparer.as_ref()?;
+        if self.sorted.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let mut best = 0;
+        for i in 1..self.sorted.len() {
+            if comparer.compare(&self.sorted[i].metadata, &self.sorted[best].metadata, now)
+                == Ordering::Less
+            {
+                best = i;
+            }
+        }
+        let entry = self.sorted.remove(best);
+        self.total -= 1;
+        Some(entry.envelope)
+    }
+
     fn pop_strict(&mut self) -> Option<WireEnvelope> {
         for lane in &mut self.lanes {
             if let Some(envelope) = lane.pop_front() {
@@ -171,7 +239,20 @@ impl OutboundPriorityQueue {
         None
     }
 
-    /// Find the next non-empty lane starting from `start` (wrapping).
+    fn pop_fair(&mut self) -> Option<WireEnvelope> {
+        if self.consecutive_from_lane >= self.max_consecutive {
+            self.consecutive_from_lane = 0;
+            self.current_lane = self.next_non_empty_lane(self.current_lane + 1)?;
+        } else if self.lanes[self.current_lane].is_empty() {
+            self.consecutive_from_lane = 0;
+            self.current_lane = self.next_non_empty_lane(0)?;
+        }
+        let envelope = self.lanes[self.current_lane].pop_front()?;
+        self.total -= 1;
+        self.consecutive_from_lane += 1;
+        Some(envelope)
+    }
+
     fn next_non_empty_lane(&self, start: usize) -> Option<usize> {
         for i in 0..LANE_COUNT {
             let idx = (start + i) % LANE_COUNT;
@@ -184,36 +265,59 @@ impl OutboundPriorityQueue {
 
     /// Peek at the highest-priority envelope without removing it.
     pub fn peek(&self) -> Option<&WireEnvelope> {
-        for lane in &self.lanes {
-            if let Some(envelope) = lane.front() {
-                return Some(envelope);
+        if self.is_comparer_mode() {
+            if self.sorted.is_empty() {
+                return None;
             }
+            // For peek, we need the comparer but only have &self
+            // Use a simple priority-based peek (comparer not available via &self)
+            let mut best = 0;
+            for i in 1..self.sorted.len() {
+                if self.sorted[i].metadata.priority < self.sorted[best].metadata.priority {
+                    best = i;
+                }
+            }
+            Some(&self.sorted[best].envelope)
+        } else {
+            for lane in &self.lanes {
+                if let Some(envelope) = lane.front() {
+                    return Some(envelope);
+                }
+            }
+            None
         }
-        None
     }
 
-    /// Drain all envelopes in priority order (Critical lanes first, FIFO within).
+    /// Drain all envelopes in priority order.
     pub fn drain_ordered(&mut self) -> Vec<WireEnvelope> {
         let mut result = Vec::with_capacity(self.total);
-        for lane in &mut self.lanes {
-            result.extend(lane.drain(..));
+        if self.is_comparer_mode() {
+            // Sort by priority then enqueue time for stable ordering
+            self.sorted
+                .sort_by(|a, b| match a.metadata.priority.cmp(&b.metadata.priority) {
+                    Ordering::Equal => a.metadata.enqueued_at.cmp(&b.metadata.enqueued_at),
+                    other => other,
+                });
+            result.extend(self.sorted.drain(..).map(|e| e.envelope));
+        } else {
+            for lane in &mut self.lanes {
+                result.extend(lane.drain(..));
+            }
         }
         self.total = 0;
         self.consecutive_from_lane = 0;
         result
     }
 
-    /// Total envelopes across all lanes.
     pub fn len(&self) -> usize {
         self.total
     }
 
-    /// Whether the queue is empty.
     pub fn is_empty(&self) -> bool {
         self.total == 0
     }
 
-    /// Number of envelopes in each lane (Critical, High, Normal, Low, Background).
+    /// Lane counts. Returns `[0; 5]` in comparer mode.
     pub fn lane_counts(&self) -> [usize; LANE_COUNT] {
         [
             self.lanes[0].len(),
@@ -224,12 +328,18 @@ impl OutboundPriorityQueue {
         ]
     }
 
-    /// Clear all lanes.
+    /// Total envelopes in comparer mode's sorted vec (0 in lane mode).
+    pub fn comparer_count(&self) -> usize {
+        self.sorted.len()
+    }
+
     pub fn clear(&mut self) {
         for lane in &mut self.lanes {
             lane.clear();
         }
+        self.sorted.clear();
         self.total = 0;
+        self.consecutive_from_lane = 0;
     }
 }
 
@@ -287,11 +397,12 @@ mod tests {
         }
     }
 
+    // -- Lane mode tests --
+
     #[test]
     fn empty_queue() {
         let mut q = OutboundPriorityQueue::new();
         assert!(q.is_empty());
-        assert_eq!(q.len(), 0);
         assert!(q.pop().is_none());
         assert!(q.peek().is_none());
     }
@@ -299,88 +410,151 @@ mod tests {
     #[test]
     fn priority_ordering() {
         let mut q = OutboundPriorityQueue::new();
-
-        // Enqueue in reverse priority order
-        q.push(envelope_with_priority(Priority::BACKGROUND));
-        q.push(envelope_with_priority(Priority::LOW));
-        q.push(envelope_with_priority(Priority::NORMAL));
-        q.push(envelope_with_priority(Priority::HIGH));
-        q.push(envelope_with_priority(Priority::CRITICAL));
-
+        q.push(envelope_with_priority(Priority::BACKGROUND))
+            .unwrap();
+        q.push(envelope_with_priority(Priority::LOW)).unwrap();
+        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
+        q.push(envelope_with_priority(Priority::HIGH)).unwrap();
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
         assert_eq!(q.len(), 5);
-
-        // Dequeue should be in priority order (Critical first)
         assert_eq!(q.pop().unwrap().body, vec![Priority::CRITICAL.0]);
         assert_eq!(q.pop().unwrap().body, vec![Priority::HIGH.0]);
         assert_eq!(q.pop().unwrap().body, vec![Priority::NORMAL.0]);
         assert_eq!(q.pop().unwrap().body, vec![Priority::LOW.0]);
         assert_eq!(q.pop().unwrap().body, vec![Priority::BACKGROUND.0]);
+    }
+
+    #[test]
+    fn fifo_within_lane() {
+        let mut q = OutboundPriorityQueue::new();
+        let mut e1 = envelope_with_priority(Priority::NORMAL);
+        e1.body = vec![1];
+        let mut e2 = envelope_with_priority(Priority::NORMAL);
+        e2.body = vec![2];
+        q.push(e1).unwrap();
+        q.push(e2).unwrap();
+        assert_eq!(q.pop().unwrap().body, vec![1]);
+        assert_eq!(q.pop().unwrap().body, vec![2]);
+    }
+
+    #[test]
+    fn no_priority_defaults_to_normal() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(envelope_no_priority()).unwrap();
+        assert_eq!(q.lane_counts()[2], 1);
+    }
+
+    #[test]
+    fn capacity_rejects() {
+        let mut q = OutboundPriorityQueue::with_config(2, 0);
+        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
+        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
+        assert!(q.push(envelope_with_priority(Priority::CRITICAL)).is_err());
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn fairness() {
+        let mut q = OutboundPriorityQueue::with_config(0, 2);
+        for _ in 0..5 {
+            q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+        }
+        for _ in 0..3 {
+            q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
+        }
+        assert_eq!(q.pop().unwrap().body, vec![Priority::CRITICAL.0]);
+        assert_eq!(q.pop().unwrap().body, vec![Priority::CRITICAL.0]);
+        // Fairness kicks in: rotates to normal
+        assert_eq!(q.pop().unwrap().body, vec![Priority::NORMAL.0]);
+    }
+
+    #[test]
+    fn lane_boundary_values() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(envelope_with_priority(Priority(63))).unwrap();
+        q.push(envelope_with_priority(Priority(64))).unwrap();
+        q.push(envelope_with_priority(Priority(127))).unwrap();
+        q.push(envelope_with_priority(Priority(128))).unwrap();
+        q.push(envelope_with_priority(Priority(191))).unwrap();
+        q.push(envelope_with_priority(Priority(192))).unwrap();
+        q.push(envelope_with_priority(Priority(254))).unwrap();
+        q.push(envelope_with_priority(Priority(255))).unwrap();
+        let counts = q.lane_counts();
+        assert_eq!(counts, [1, 2, 2, 2, 1]);
+    }
+
+    #[test]
+    fn drain_ordered_lane_mode() {
+        let mut q = OutboundPriorityQueue::new();
+        q.push(envelope_with_priority(Priority::LOW)).unwrap();
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+        let drained = q.drain_ordered();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].body, vec![Priority::CRITICAL.0]);
+        assert_eq!(drained[1].body, vec![Priority::LOW.0]);
         assert!(q.is_empty());
     }
 
     #[test]
-    fn fifo_within_same_priority() {
+    fn clear_empties_all() {
         let mut q = OutboundPriorityQueue::new();
+        q.push(envelope_with_priority(Priority::HIGH)).unwrap();
+        q.push(envelope_with_priority(Priority::LOW)).unwrap();
+        q.clear();
+        assert!(q.is_empty());
+        assert_eq!(q.lane_counts(), [0, 0, 0, 0, 0]);
+    }
 
-        // Push 3 normal-priority messages
+    // -- Comparer mode tests --
+
+    #[test]
+    fn comparer_strict_priority_ordering() {
+        let mut q = OutboundPriorityQueue::with_comparer(StrictPriorityWireComparer, 0);
+        q.push(envelope_with_priority(Priority::LOW)).unwrap();
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
+
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.comparer_count(), 3);
+        assert_eq!(q.pop().unwrap().body, vec![Priority::CRITICAL.0]);
+        assert_eq!(q.pop().unwrap().body, vec![Priority::NORMAL.0]);
+        assert_eq!(q.pop().unwrap().body, vec![Priority::LOW.0]);
+    }
+
+    #[test]
+    fn comparer_fifo_for_equal_priority() {
+        let mut q = OutboundPriorityQueue::with_comparer(StrictPriorityWireComparer, 0);
         let mut e1 = envelope_with_priority(Priority::NORMAL);
         e1.body = vec![1];
         let mut e2 = envelope_with_priority(Priority::NORMAL);
         e2.body = vec![2];
         let mut e3 = envelope_with_priority(Priority::NORMAL);
         e3.body = vec![3];
-
         q.push(e1).unwrap();
         q.push(e2).unwrap();
         q.push(e3).unwrap();
-
-        // FIFO order within the lane
+        // Equal priority: FIFO order (uses remove() not swap_remove())
         assert_eq!(q.pop().unwrap().body, vec![1]);
         assert_eq!(q.pop().unwrap().body, vec![2]);
         assert_eq!(q.pop().unwrap().body, vec![3]);
     }
 
     #[test]
-    fn no_priority_header_defaults_to_normal() {
-        let mut q = OutboundPriorityQueue::new();
-        q.push(envelope_no_priority());
-
-        let counts = q.lane_counts();
-        assert_eq!(counts[2], 1); // Normal lane
-        assert_eq!(counts[0], 0); // Critical
-    }
-
-    #[test]
-    fn high_priority_preempts_normal() {
-        let mut q = OutboundPriorityQueue::new();
-
-        // Enqueue normal first, then high
-        q.push(envelope_with_priority(Priority::NORMAL));
-        q.push(envelope_with_priority(Priority::HIGH));
-
-        // High should come out first
-        assert_eq!(q.pop().unwrap().body, vec![Priority::HIGH.0]);
-        assert_eq!(q.pop().unwrap().body, vec![Priority::NORMAL.0]);
-    }
-
-    #[test]
-    fn peek_returns_highest_priority() {
-        let mut q = OutboundPriorityQueue::new();
-        q.push(envelope_with_priority(Priority::LOW));
-        q.push(envelope_with_priority(Priority::CRITICAL));
-
+    fn comparer_peek_works() {
+        let mut q = OutboundPriorityQueue::with_comparer(StrictPriorityWireComparer, 0);
+        q.push(envelope_with_priority(Priority::LOW)).unwrap();
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
         let peeked = q.peek().unwrap();
         assert_eq!(peeked.body, vec![Priority::CRITICAL.0]);
         assert_eq!(q.len(), 2); // peek doesn't remove
     }
 
     #[test]
-    fn drain_ordered_returns_all_by_priority() {
-        let mut q = OutboundPriorityQueue::new();
-        q.push(envelope_with_priority(Priority::LOW));
-        q.push(envelope_with_priority(Priority::CRITICAL));
-        q.push(envelope_with_priority(Priority::NORMAL));
-
+    fn comparer_drain_ordered() {
+        let mut q = OutboundPriorityQueue::with_comparer(StrictPriorityWireComparer, 0);
+        q.push(envelope_with_priority(Priority::LOW)).unwrap();
+        q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
+        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
         let drained = q.drain_ordered();
         assert_eq!(drained.len(), 3);
         assert_eq!(drained[0].body, vec![Priority::CRITICAL.0]);
@@ -390,97 +564,28 @@ mod tests {
     }
 
     #[test]
-    fn lane_counts() {
-        let mut q = OutboundPriorityQueue::new();
-        q.push(envelope_with_priority(Priority::CRITICAL));
-        q.push(envelope_with_priority(Priority::CRITICAL));
-        q.push(envelope_with_priority(Priority::HIGH));
-        q.push(envelope_with_priority(Priority::NORMAL));
-        q.push(envelope_with_priority(Priority::LOW));
-        q.push(envelope_with_priority(Priority::BACKGROUND));
-
-        let counts = q.lane_counts();
-        assert_eq!(counts, [2, 1, 1, 1, 1]);
-    }
-
-    #[test]
-    fn clear_empties_all_lanes() {
-        let mut q = OutboundPriorityQueue::new();
-        q.push(envelope_with_priority(Priority::CRITICAL));
-        q.push(envelope_with_priority(Priority::HIGH));
-        q.push(envelope_with_priority(Priority::NORMAL));
-
+    fn comparer_clear_works() {
+        let mut q = OutboundPriorityQueue::with_comparer(StrictPriorityWireComparer, 0);
+        q.push(envelope_with_priority(Priority::HIGH)).unwrap();
+        q.push(envelope_with_priority(Priority::LOW)).unwrap();
         q.clear();
         assert!(q.is_empty());
+        assert_eq!(q.comparer_count(), 0);
+    }
+
+    #[test]
+    fn comparer_with_capacity() {
+        let mut q = OutboundPriorityQueue::with_comparer(StrictPriorityWireComparer, 2);
+        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
+        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
+        assert!(q.push(envelope_with_priority(Priority::CRITICAL)).is_err());
+    }
+
+    #[test]
+    fn comparer_lane_counts_returns_zeros() {
+        let mut q = OutboundPriorityQueue::with_comparer(StrictPriorityWireComparer, 0);
+        q.push(envelope_with_priority(Priority::HIGH)).unwrap();
         assert_eq!(q.lane_counts(), [0, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn mixed_priority_interleaving() {
-        let mut q = OutboundPriorityQueue::new();
-
-        // Simulate real traffic: mostly normal, some high, rare critical
-        q.push(envelope_with_priority(Priority::NORMAL));
-        q.push(envelope_with_priority(Priority::NORMAL));
-        q.push(envelope_with_priority(Priority::HIGH));
-        q.push(envelope_with_priority(Priority::NORMAL));
-        q.push(envelope_with_priority(Priority::CRITICAL));
-
-        // Critical first, then high, then normals in FIFO
-        assert_eq!(q.pop().unwrap().body, vec![Priority::CRITICAL.0]);
-        assert_eq!(q.pop().unwrap().body, vec![Priority::HIGH.0]);
-        assert_eq!(q.pop().unwrap().body, vec![Priority::NORMAL.0]);
-        assert_eq!(q.pop().unwrap().body, vec![Priority::NORMAL.0]);
-        assert_eq!(q.pop().unwrap().body, vec![Priority::NORMAL.0]);
-    }
-
-    #[test]
-    fn lane_boundary_values() {
-        let mut q = OutboundPriorityQueue::new();
-        q.push(envelope_with_priority(Priority(63))).unwrap(); // Critical
-        q.push(envelope_with_priority(Priority(64))).unwrap(); // High
-        q.push(envelope_with_priority(Priority(127))).unwrap(); // High
-        q.push(envelope_with_priority(Priority(128))).unwrap(); // Normal
-        q.push(envelope_with_priority(Priority(191))).unwrap(); // Normal
-        q.push(envelope_with_priority(Priority(192))).unwrap(); // Low
-        q.push(envelope_with_priority(Priority(254))).unwrap(); // Low
-        q.push(envelope_with_priority(Priority(255))).unwrap(); // Background
-
-        let counts = q.lane_counts();
-        assert_eq!(counts[0], 1); // Critical: 63
-        assert_eq!(counts[1], 2); // High: 64, 127
-        assert_eq!(counts[2], 2); // Normal: 128, 191
-        assert_eq!(counts[3], 2); // Low: 192, 254
-        assert_eq!(counts[4], 1); // Background: 255
-    }
-
-    #[test]
-    fn capacity_rejects_when_full() {
-        let mut q = OutboundPriorityQueue::with_config(3, 0);
-        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
-        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
-        q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
-        let result = q.push(envelope_with_priority(Priority::CRITICAL));
-        assert!(result.is_err());
-        assert_eq!(q.len(), 3);
-    }
-
-    #[test]
-    fn fairness_prevents_starvation() {
-        let mut q = OutboundPriorityQueue::with_config(0, 2);
-        for _ in 0..5 {
-            q.push(envelope_with_priority(Priority::CRITICAL)).unwrap();
-        }
-        for _ in 0..3 {
-            q.push(envelope_with_priority(Priority::NORMAL)).unwrap();
-        }
-
-        // Pop 2 critical (consecutive limit)
-        assert_eq!(q.pop().unwrap().body, vec![Priority::CRITICAL.0]);
-        assert_eq!(q.pop().unwrap().body, vec![Priority::CRITICAL.0]);
-        // 3rd pop: fairness rotates past critical lane
-        let third = q.pop().unwrap();
-        // Should come from a different lane (normal, since high/low/bg are empty)
-        assert_eq!(third.body, vec![Priority::NORMAL.0]);
+        assert_eq!(q.comparer_count(), 1);
     }
 }

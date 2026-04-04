@@ -459,7 +459,7 @@ impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
 | AM3 | Timer methods (send_after, send_interval) | §4.5 | Scheduled message delivery | ✅ PR #46 |
 | AM4 | on_reply wiring | §5.3 | OutboundInterceptor sees ask replies | ✅ PR #46 |
 | AM5 | Outbound priority queue | §5.8 | Per-destination priority lanes | ✅ PR #74 |
-| AM6 | Pluggable outbound comparer | §5.6, §5.8 | Replace hardcoded 5-lane bucketing in OutboundPriorityQueue with pluggable MessageComparer (same trait used by inbound mailbox). Comparer receives priority + enqueue timestamp, enabling age-based promotion and custom ordering (e.g., ask-first, deadline-aware). | 🔲 Not started |
+| AM6 | Pluggable outbound comparer | §5.6, §5.8 | WireEnvelopeComparer trait + StrictPriorityWireComparer + AgingWireComparer, integrated into OutboundPriorityQueue via with_comparer() | ✅ PR #76 |
 | AM7 | Stream item ordering guarantee | §4.11 | Ensure stream/feed items within a single stream are always sent in exact enqueue order, bypassing the priority queue. Stream items must not be reordered by priority — only independent tell/ask messages are subject to priority scheduling. | 🔲 Not started |
 
 ---
@@ -473,7 +473,7 @@ impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
 | O1 | MetricsInterceptor wiring | §11.2 | Wire built-in metrics into runtimes | ✅ PR #55 (per-actor ActorMetricsHandle, windowed buckets) |
 | O2 | MetricsStore query API | §11.3 | Query per-actor and per-message-type metrics | ✅ PR #55 (MetricsRegistry with register/snapshot) |
 | O3 | RuntimeMetrics | §11.6 | System-level: actor count, mailbox depth, uptime | ✅ PR #55 (message_rate, error_rate, windowed) |
-| O4 | OtelInterceptor | §11.4 | OpenTelemetry tracing integration | 🔲 Not started (needs opentelemetry crate) |
+| O4 | OtelInterceptor | §11.4 | ❌ Not planned — tracing should be added by application code, not framework (perf risk) |
 | O5 | CircuitBreakerInterceptor | §11.4 | Error-rate circuit breaker | ✅ PR #56 |
 
 ### 7.2 Dead Letter Routing
