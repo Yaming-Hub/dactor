@@ -132,6 +132,9 @@ impl Default for RuntimeHeaders {
 }
 
 /// Built-in priority header. Used by priority mailboxes and interceptors.
+///
+/// Lower numeric value = higher urgency (like Unix nice values).
+/// `CRITICAL(0) < HIGH(64) < NORMAL(128) < LOW(192) < BACKGROUND(255)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Priority(pub u8);
 
