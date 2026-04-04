@@ -301,7 +301,7 @@ Each adapter runtime must wire the core system actors into its remote message ha
 | SA7 | dactor-kameo | CancelManager wiring | KameoRuntime registers tokens with CancelManager, handles remote cancel | ✅ PR #81 |
 | SA8 | dactor-kameo | NodeDirectory wiring | KameoRuntime populates NodeDirectory from kameo/libp2p peer discovery | ✅ PR #81 |
 | SA9 | dactor-mock | System actor wiring | MockCluster wires SpawnManager + WatchManager + CancelManager + NodeDirectory, auto-connects peers | ✅ PR #78 |
-| SA10 | dactor-coerce | System actor wiring | CoerceRuntime wires system actors (stub — depends on coerce sharding integration) | 🔲 Not started |
+| SA10 | dactor-coerce | System actor wiring | CoerceRuntime wires system actors (stub — depends on coerce sharding integration) | ✅ PR #82 |
 
 ### 4.3 Serialization & Schema
 
@@ -511,7 +511,64 @@ impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
 
 ---
 
-## Phase 9: Actor Lifecycle Handles (JoinHandle / Await-Stop)
+## Phase 9: Native System Actors
+
+### Background
+
+SA1-SA10 wired the four system actors (SpawnManager, WatchManager, CancelManager,
+NodeDirectory) into all adapter runtimes as **plain Rust structs** with direct
+method calls. This was the right first step — it locked down the API surface and
+enabled unit testing.
+
+The design spec (§8.2) calls for system actors to be **real provider-native
+actors** with mailboxes and message-based communication. This is necessary for:
+
+1. **Transport integration** — remote nodes send `CancelRequest` etc. as wire
+   messages; they need to land in a mailbox, not a direct method call.
+2. **Concurrency safety** — native actors process messages single-threaded via
+   their mailbox, eliminating `&mut self` contention.
+3. **Backpressure** — mailbox depth limits prevent system actor overload.
+4. **Supervision** — system actors can be supervised and restarted on failure.
+
+### Plan
+
+Each system actor becomes a native provider actor (ractor `Actor`, kameo `Actor`,
+etc.) that wraps the existing struct and handles the corresponding request
+messages.
+
+| # | Feature | Description | Status |
+|---|---------|-------------|--------|
+| NA1 | Ractor native SpawnManager | `ractor::Actor` impl wrapping `SpawnManager`, handles `SpawnRequest` messages via mailbox | 🔲 Not started |
+| NA2 | Ractor native WatchManager | `ractor::Actor` impl wrapping `WatchManager`, handles `WatchRequest`/`UnwatchRequest` messages | 🔲 Not started |
+| NA3 | Ractor native CancelManager | `ractor::Actor` impl wrapping `CancelManager`, handles `CancelRequest` messages | 🔲 Not started |
+| NA4 | Ractor native NodeDirectory | `ractor::Actor` impl wrapping `NodeDirectory`, handles membership change messages | 🔲 Not started |
+| NA5 | Kameo native SpawnManager | `kameo::Actor` impl wrapping `SpawnManager` | 🔲 Not started |
+| NA6 | Kameo native WatchManager | `kameo::Actor` impl wrapping `WatchManager` | 🔲 Not started |
+| NA7 | Kameo native CancelManager | `kameo::Actor` impl wrapping `CancelManager` | 🔲 Not started |
+| NA8 | Kameo native NodeDirectory | `kameo::Actor` impl wrapping `NodeDirectory` | 🔲 Not started |
+| NA9 | Runtime auto-start | Each adapter runtime spawns its system actors during `new()` and holds refs | 🔲 Not started |
+| NA10 | Transport routing | Incoming `WireEnvelope` with system message types routed to the correct system actor mailbox | 🔲 Not started |
+
+### Design Notes
+
+- **Struct stays as-is.** The existing `SpawnManager`, `WatchManager`, etc.
+  become the **state** inside the native actor. The methods become handler
+  bodies. No rewrite needed — just wrapping.
+- **One actor per system role.** Each system actor is spawned independently
+  (not a single "system actor" muxing all roles). This keeps handlers simple
+  and enables per-role supervision.
+- **Request/Response pattern.** System actor messages use ask semantics
+  (e.g., `SpawnRequest` → `SpawnResponse`). The transport layer awaits the
+  reply and sends it back over the wire.
+- **Coerce/mock.** Coerce is a stub — native actors can be added when
+  coerce-rt integrates. MockCluster can optionally wrap in test actors or
+  continue using direct method calls for simplicity.
+- **Depends on:** SA1-SA10 (complete), transport integration (R4).
+- **Priority:** High — required before remote operations work end-to-end.
+
+---
+
+## Phase 10: Actor Lifecycle Handles (JoinHandle / Await-Stop)
 
 ### Background
 
@@ -553,7 +610,7 @@ await. Dactor currently discards ractor's JoinHandle (`_join` in
 
 ---
 
-## Phase 10: Async Spawn API
+## Phase 11: Async Spawn API
 
 ### Background
 
