@@ -34,6 +34,7 @@ use crate::interceptor::OutboundContext;
 use crate::mailbox::{MailboxConfig, OverflowStrategy};
 use crate::message::{Headers, Message, RuntimeHeaders};
 use crate::node::{ActorId, NodeId};
+use crate::registry::ActorRegistry;
 use crate::stream::{BatchConfig, BatchReader, BatchWriter, BoxStream, StreamReceiver, StreamSender};
 use crate::supervision::ChildTerminated;
 use tokio_util::sync::CancellationToken;
@@ -479,6 +480,8 @@ pub struct TestRuntime {
     dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
     /// Watch registry — maps watched actor ID to list of watcher entries.
     watchers: Arc<Mutex<HashMap<ActorId, Vec<WatchEntry>>>>,
+    /// Actor name registry for looking up actors by name.
+    registry: Arc<ActorRegistry>,
     /// Optional shared metrics registry. When set, a [`MetricsInterceptor`] is
     /// automatically prepended to every spawned actor's inbound interceptor list.
     #[cfg(feature = "metrics")]
@@ -494,6 +497,7 @@ impl TestRuntime {
             drop_observer: Arc::new(None),
             dead_letter_handler: Arc::new(None),
             watchers: Arc::new(Mutex::new(HashMap::new())),
+            registry: Arc::new(ActorRegistry::new()),
             #[cfg(feature = "metrics")]
             metrics_registry: None,
         }
@@ -508,9 +512,15 @@ impl TestRuntime {
             drop_observer: Arc::new(None),
             dead_letter_handler: Arc::new(None),
             watchers: Arc::new(Mutex::new(HashMap::new())),
+            registry: Arc::new(ActorRegistry::new()),
             #[cfg(feature = "metrics")]
             metrics_registry: None,
         }
+    }
+
+    /// Return a reference to the actor name registry.
+    pub fn registry(&self) -> &ActorRegistry {
+        &self.registry
     }
 
     /// Enable built-in metrics collection.
@@ -684,6 +694,7 @@ impl TestRuntime {
         let name_task = actor_name.clone();
         let watchers_ref = self.watchers.clone();
         let dead_letter_handler_task = self.dead_letter_handler.clone();
+        let registry_task = self.registry.clone();
 
         tokio::spawn(async move {
             let mut actor = A::create(args, deps);
@@ -896,16 +907,19 @@ impl TestRuntime {
             if !entries.is_empty() {
                 let notification = ChildTerminated {
                     child_id: actor_id,
-                    child_name: actor_name,
+                    child_name: actor_name.clone(),
                     reason: stop_reason,
                 };
                 for entry in &entries {
                     (entry.notify)(notification.clone());
                 }
             }
+
+            // Auto-unregister from the name registry on stop.
+            registry_task.unregister(&actor_name);
         });
 
-        TestActorRef {
+        let actor_ref = TestActorRef {
             id: actor_id,
             name: actor_name,
             sender: tx,
@@ -913,7 +927,11 @@ impl TestRuntime {
             outbound_interceptors: self.outbound_interceptors.clone(),
             drop_observer: (*self.drop_observer).clone(),
             dead_letter_handler: self.dead_letter_handler.clone(),
-        }
+        };
+
+        self.registry.register(name, actor_ref.clone());
+
+        actor_ref
     }
 }
 
@@ -985,6 +1003,30 @@ mod tests {
             let old = self.count;
             self.count = 0;
             old
+        }
+    }
+
+    // -- Shared test actor: Greeter (for registry type-mismatch tests) ------
+
+    struct Greet(String);
+    impl Message for Greet {
+        type Reply = String;
+    }
+
+    struct Greeter;
+
+    impl Actor for Greeter {
+        type Args = ();
+        type Deps = ();
+        fn create(_args: (), _deps: ()) -> Self {
+            Greeter
+        }
+    }
+
+    #[async_trait]
+    impl Handler<Greet> for Greeter {
+        async fn handle(&mut self, msg: Greet, _ctx: &mut ActorContext) -> String {
+            format!("Hello, {}!", msg.0)
         }
     }
 
@@ -3607,5 +3649,84 @@ mod tests {
 
         // No metrics store — nothing to query
         assert!(runtime.metrics().is_none());
+    }
+
+    // -- Registry tests -----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_registry_auto_register_on_spawn() {
+        let runtime = TestRuntime::new();
+        let _counter = runtime.spawn::<Counter>("my-counter", Counter { count: 0 });
+
+        assert!(runtime.registry().contains("my-counter"));
+        let looked_up: Option<TestActorRef<Counter>> = runtime.registry().lookup("my-counter");
+        assert!(looked_up.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_registry_lookup_and_use() {
+        let runtime = TestRuntime::new();
+        let counter = runtime.spawn::<Counter>("counter-a", Counter { count: 0 });
+        counter.tell(Increment(10)).unwrap();
+
+        // Look up by name and send a message through the looked-up ref
+        let looked_up: TestActorRef<Counter> = runtime.registry().lookup("counter-a").unwrap();
+        looked_up.tell(Increment(5)).unwrap();
+
+        let count = looked_up.ask(GetCount, None).unwrap().await.unwrap();
+        assert_eq!(count, 15);
+    }
+
+    #[tokio::test]
+    async fn test_registry_lookup_wrong_type_returns_none() {
+        let runtime = TestRuntime::new();
+        let _counter = runtime.spawn::<Counter>("typed-actor", Counter { count: 0 });
+
+        // Greeter is a different actor type — lookup should return None
+        let wrong: Option<TestActorRef<Greeter>> = runtime.registry().lookup("typed-actor");
+        assert!(wrong.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_registry_lookup_missing_name_returns_none() {
+        let runtime = TestRuntime::new();
+        let missing: Option<TestActorRef<Counter>> = runtime.registry().lookup("no-such-actor");
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_registry_unregister() {
+        let runtime = TestRuntime::new();
+        let _counter = runtime.spawn::<Counter>("removable", Counter { count: 0 });
+        assert!(runtime.registry().contains("removable"));
+
+        assert!(runtime.registry().unregister("removable"));
+        assert!(!runtime.registry().contains("removable"));
+
+        let gone: Option<TestActorRef<Counter>> = runtime.registry().lookup("removable");
+        assert!(gone.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_registry_multiple_actors() {
+        let runtime = TestRuntime::new();
+        let _c1 = runtime.spawn::<Counter>("counter-1", Counter { count: 0 });
+        let _c2 = runtime.spawn::<Counter>("counter-2", Counter { count: 100 });
+        let _g = runtime.spawn::<Greeter>("greeter", ());
+
+        assert_eq!(runtime.registry().len(), 3);
+
+        let c1: TestActorRef<Counter> = runtime.registry().lookup("counter-1").unwrap();
+        c1.tell(Increment(1)).unwrap();
+        let v1 = c1.ask(GetCount, None).unwrap().await.unwrap();
+        assert_eq!(v1, 1);
+
+        let c2: TestActorRef<Counter> = runtime.registry().lookup("counter-2").unwrap();
+        let v2 = c2.ask(GetCount, None).unwrap().await.unwrap();
+        assert_eq!(v2, 100);
+
+        let g: TestActorRef<Greeter> = runtime.registry().lookup("greeter").unwrap();
+        let reply = g.ask(Greet("World".into()), None).unwrap().await.unwrap();
+        assert_eq!(reply, "Hello, World!");
     }
 }
