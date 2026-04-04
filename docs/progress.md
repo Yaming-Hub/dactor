@@ -4,18 +4,18 @@
 
 ---
 
-## Current Status (PR #74)
+## Current Status (PR #78)
 - Phase 3: ✅ Complete (features, examples, conformance, batching)
-- Phase 4: ✅ Complete — R1-R6, R3b, R6b-c, S1-S4, SE1-SE6, C1-C5, P1-P3 all done
-- Phase 6: ✅ Complete (supervision, pools, timers, on_reply, AM1-AM5 done, AM6-AM7 pending)
-- Phase 7: ✅ Complete (metrics, dead letters, circuit breaker, drop observer)
-- Phase 8: NR1 done (actor registry), NR2-NR4 need adapter wiring (SA1-SA10)
-- Zero clippy warnings, cargo doc clean, 356 core tests, 483 total
+- Phase 4: ✅ Complete — R1-R6, R3b, R6b-c, S1-S4, SE1-SE5, C1-C5, P1-P3 all done
+- Phase 6: ✅ Complete (supervision, pools, timers, on_reply, AM1-AM7 all done)
+- Phase 7: ✅ Complete (metrics, dead letters, circuit breaker, drop observer; O4 dropped)
+- Phase 8: NR1 done (actor registry), NR2-NR4 need adapter wiring; SA9 done
+- Zero clippy warnings, cargo doc clean, 368 core tests, 502 total
 - Build: `cargo clippy --workspace --exclude dactor-test-harness --all-targets --all-features -- -D warnings`
-- Test: `cargo test --workspace --exclude dactor-test-harness` (exclude test-harness due to protoc permission issue)
-- Next: AM6 (pluggable comparer), AM7 (stream ordering), O4 (OpenTelemetry), SE6 (protobuf), SA1-SA10 (adapter wiring)
+- Test: `cargo test --workspace --exclude dactor-test-harness --features test-support` (exclude test-harness due to protoc permission issue)
+- Next: SA1-SA8 (ractor/kameo adapter wiring), SA10 (coerce), SE6 (protobuf), NR2-NR4
 
-### Session 2026-04-04 Summary (PRs #62-#74)
+### Session 2026-04-04 Summary (PRs #62-#78)
 - **R1** (#62): Transport trait, InMemoryTransport, TransportRegistry
 - **R2** (#63): WireEnvelope pipeline — TypeRegistry, JsonSerializer, HeaderRegistry
 - **R3** (#64): RemoteActorRef — location-transparent remote actor ref with tell/ask
@@ -28,15 +28,30 @@
 - **P1-P3** (#71): Remote spawn — SpawnConfig.target_node + ActorFactory/ErasedActorFactory/JsonActorFactory
 - **SE5** (#72): ActorRefEnvelope — serializable actor ref with type checking (try_into_builder)
 - **R5** (#73): BatchedTransportSender — batched remote sends (serde-gated, tell-only)
-- **AM5** (#74): OutboundPriorityQueue — 5-lane priority queue with fairness (max_consecutive) and capacity limit
+- **AM5** (#74): OutboundPriorityQueue — 5-lane priority queue with fairness + capacity
+- **O4** (#75): OtelInterceptor — CLOSED, tracing is app responsibility
+- **AM6** (#76): Pluggable WireEnvelopeComparer — StrictPriority + AgingWireComparer
+- **AM7** (#77): Stream item ordering — FIFO bypass with interleaving
+- **SA9** (#78): MockCluster system actor wiring — SpawnManager, WatchManager, CancelManager, NodeDirectory
 
 ### Key Design Decisions Made This Session
 - WireEnvelope.target_name is sender-supplied (hint, not authoritative) — documented in §9.0.4
 - ActorRefEnvelope uses std::any::type_name (not stable across compiler versions) — security doc added
 - BatchedTransportSender is serde-only and tell-only (ask/stream can't be batched)
-- OutboundPriorityQueue: AM6 (pluggable MessageComparer) and AM7 (stream ordering guarantee) deferred
+- OutboundPriorityQueue: pluggable WireEnvelopeComparer with Instant param for stable ordering
+- Stream/feed items bypass priority queue via FIFO with interleaving (prevents starvation)
+- O4 (OtelInterceptor) dropped — tracing should be added by application, not framework
 - SE6 (protobuf for system serialization) tracked as future work
-- Design doc updated: §9.0-9.0.5, §9.2, §9.3, §9.6 added for all Phase 4 implementation
+- Design doc updated: §5.5, §9.0-9.0.5, §9.2, §9.3, §9.6, §11.4 for all implementation
+
+### Multi-Model Review Process
+Every PR was reviewed by 4 AI models (GPT-5.2, GPT-5.4, Claude Haiku 4.5, Claude Sonnet 4.5).
+Findings were consolidated, addressed, and verified before merge. Key patterns found:
+- Span lifecycle issues in tracing (led to O4 redesign then drop)
+- Starvation risks in priority queues (led to interleaving + fairness)
+- Type safety gaps in ActorRefEnvelope (led to try_into_builder)
+- Mutex poisoning in rate limiters (led to unwrap_or_else pattern)
+- Missing comparer-mode code paths in priority queue (full rewrite)
 
 ---
 
