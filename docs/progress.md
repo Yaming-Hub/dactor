@@ -285,11 +285,11 @@ Each adapter runtime must wire the core system actors into its remote message ha
 
 ### 4.5 Remote Spawn & Placement
 
-| # | Feature | Design Section | Description |
-|---|---------|----------------|-------------|
-| P1 | Remote spawn | §9.2 | SpawnConfig.target_node for spawning on specific nodes |
-| P2 | ActorFactory trait | §9.2 | Factory for remote actor reconstruction |
-| P3 | Location transparency | §9.2 | Caller doesn't know if actor is local or remote |
+| # | Feature | Design Section | Description | Status |
+|---|---------|----------------|-------------|--------|
+| P1 | Remote spawn | §9.2 | SpawnConfig.target_node for spawning on specific nodes | ✅ PR #71 |
+| P2 | ActorFactory trait | §9.2 | Factory for remote actor reconstruction | ✅ PR #71 |
+| P3 | Location transparency | §9.2 | Caller doesn't know if actor is local or remote | ✅ PR #64 (RemoteActorRef implements ActorRef<A>) |
 
 ---
 

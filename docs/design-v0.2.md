@@ -5757,6 +5757,11 @@ choice of `MessageSerializer` affects what evolution strategies are available:
 > All remote runtime operations (spawn, cancel, watch) use **system actors**
 > (§8.2) via the adapter's existing remote messaging — no separate transport.
 
+> **Implementation status:** `SpawnConfig::target_node` is implemented.
+> `ActorFactory<A>` and `ErasedActorFactory` traits are in `type_registry.rs`.
+> `JsonActorFactory<A>` provides serde_json-based `Args` deserialization.
+> See `TypeRegistry::register_actor()` for registration.
+
 All three backend libraries (ractor, kameo, coerce) support spawning actors
 on remote nodes. dactor exposes this via `SpawnConfig::target_node`.
 

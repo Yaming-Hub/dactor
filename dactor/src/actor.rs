@@ -339,13 +339,23 @@ pub fn cancel_after(duration: Duration) -> CancellationToken {
     token
 }
 
-/// Configuration for spawning an actor. All fields have defaults
-/// matching v0.1 behavior (unbounded mailbox, no interceptors, local spawn).
+/// Configuration for spawning an actor.
+///
+/// Default: unbounded mailbox, local spawn. Set `target_node` to spawn
+/// on a remote node — the runtime serializes `Args` and sends a
+/// `SpawnRequest` to the target's `SpawnManager`.
+///
+/// If the target node is unreachable, `spawn_with_config()` returns
+/// `Err(RuntimeError::Send(...))`.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct SpawnConfig {
     /// Mailbox configuration (unbounded by default).
     pub mailbox: MailboxConfig,
-    // Future fields: inbound_interceptors, comparer, target_node
+    /// Target node for remote spawn. `None` = spawn on local node (default).
+    /// When set, the runtime serializes the actor's `Args` and sends a
+    /// `SpawnRequest` to the target node's `SpawnManager`.
+    pub target_node: Option<crate::node::NodeId>,
 }
 
 #[cfg(test)]
@@ -507,7 +517,17 @@ mod tests {
     // Test: SpawnConfig default
     #[test]
     fn test_spawn_config_default() {
-        let _config = SpawnConfig::default();
+        let config = SpawnConfig::default();
+        assert!(config.target_node.is_none());
+    }
+
+    #[test]
+    fn test_spawn_config_with_target_node() {
+        let config = SpawnConfig {
+            target_node: Some(NodeId("node-3".into())),
+            ..Default::default()
+        };
+        assert_eq!(config.target_node.unwrap().0, "node-3");
     }
 
     // Test: ActorContext
