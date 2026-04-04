@@ -4,14 +4,39 @@
 
 ---
 
-## Current Status (PR #66)
+## Current Status (PR #74)
 - Phase 3: ✅ Complete (features, examples, conformance, batching)
-- Phase 4: R1-R3 ✅, S1-S4 ✅, SE1-SE4 ✅, C1-C5 ✅ — R4-R5 & SE5 & P1-P3 pending
-- Phase 6: ✅ Complete (supervision, pools, timers, on_reply, message comparer)
+- Phase 4: ✅ Complete — R1-R6, R3b, R6b-c, S1-S4, SE1-SE6, C1-C5, P1-P3 all done
+- Phase 6: ✅ Complete (supervision, pools, timers, on_reply, AM1-AM5 done, AM6-AM7 pending)
 - Phase 7: ✅ Complete (metrics, dead letters, circuit breaker, drop observer)
-- Phase 8: NR1 done (actor registry), NR2-NR4 need Phase 4
-- Zero clippy warnings, cargo doc clean
-- Next: Phase 4 R4-R5 (Connection mgmt, Batched remote sends) + P1-P3 (Remote spawn)
+- Phase 8: NR1 done (actor registry), NR2-NR4 need adapter wiring (SA1-SA10)
+- Zero clippy warnings, cargo doc clean, 356 core tests, 483 total
+- Build: `cargo clippy --workspace --exclude dactor-test-harness --all-targets --all-features -- -D warnings`
+- Test: `cargo test --workspace --exclude dactor-test-harness` (exclude test-harness due to protoc permission issue)
+- Next: AM6 (pluggable comparer), AM7 (stream ordering), O4 (OpenTelemetry), SE6 (protobuf), SA1-SA10 (adapter wiring)
+
+### Session 2026-04-04 Summary (PRs #62-#74)
+- **R1** (#62): Transport trait, InMemoryTransport, TransportRegistry
+- **R2** (#63): WireEnvelope pipeline — TypeRegistry, JsonSerializer, HeaderRegistry
+- **R3** (#64): RemoteActorRef — location-transparent remote actor ref with tell/ask
+- **S1-S4** (#65): System actors — SpawnManager, WatchManager, CancelManager, NodeDirectory
+- **C1-C5+R4** (#66): Cluster management — ClusterEventEmitter, AdapterCluster, HealthChecker
+- **Progress** (#67): Added R3b, R6, SA1-SA10, T11 tracking items
+- **R3b** (#68): Outbound interceptor pipeline wired into RemoteActorRef (on_send, on_reply, headers)
+- **R6** (#69): WireInterceptor — envelope-level load control (accept/delay/reject/drop)
+- **R6b+R6c** (#70): WireEnvelope.target_name + wire interceptor metrics & dead letter integration
+- **P1-P3** (#71): Remote spawn — SpawnConfig.target_node + ActorFactory/ErasedActorFactory/JsonActorFactory
+- **SE5** (#72): ActorRefEnvelope — serializable actor ref with type checking (try_into_builder)
+- **R5** (#73): BatchedTransportSender — batched remote sends (serde-gated, tell-only)
+- **AM5** (#74): OutboundPriorityQueue — 5-lane priority queue with fairness (max_consecutive) and capacity limit
+
+### Key Design Decisions Made This Session
+- WireEnvelope.target_name is sender-supplied (hint, not authoritative) — documented in §9.0.4
+- ActorRefEnvelope uses std::any::type_name (not stable across compiler versions) — security doc added
+- BatchedTransportSender is serde-only and tell-only (ask/stream can't be batched)
+- OutboundPriorityQueue: AM6 (pluggable MessageComparer) and AM7 (stream ordering guarantee) deferred
+- SE6 (protobuf for system serialization) tracked as future work
+- Design doc updated: §9.0-9.0.5, §9.2, §9.3, §9.6 added for all Phase 4 implementation
 
 ---
 
@@ -433,7 +458,9 @@ impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
 | AM2 | MessageComparer trait | §5.6 | Custom message ordering rules | ✅ PR #46 |
 | AM3 | Timer methods (send_after, send_interval) | §4.5 | Scheduled message delivery | ✅ PR #46 |
 | AM4 | on_reply wiring | §5.3 | OutboundInterceptor sees ask replies | ✅ PR #46 |
-| AM5 | Outbound priority queue | §5.8 | Per-destination priority lanes | 🔲 Not started |
+| AM5 | Outbound priority queue | §5.8 | Per-destination priority lanes | ✅ PR #74 |
+| AM6 | Pluggable outbound comparer | §5.6, §5.8 | Replace hardcoded 5-lane bucketing in OutboundPriorityQueue with pluggable MessageComparer (same trait used by inbound mailbox). Comparer receives priority + enqueue timestamp, enabling age-based promotion and custom ordering (e.g., ask-first, deadline-aware). | 🔲 Not started |
+| AM7 | Stream item ordering guarantee | §4.11 | Ensure stream/feed items within a single stream are always sent in exact enqueue order, bypassing the priority queue. Stream items must not be reordered by priority — only independent tell/ask messages are subject to priority scheduling. | 🔲 Not started |
 
 ---
 

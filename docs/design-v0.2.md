@@ -3384,6 +3384,11 @@ pub struct NullDeadLetterHandler;
 
 ### 5.5 Outbound Throttling (`dactor-throttle`)
 
+> **Implementation:** `OutboundPriorityQueue` in `outbound_queue.rs`
+> provides a per-destination priority queue with 5 lanes (Critical, High,
+> Normal, Low, Background). Messages are bucketed by their `Priority`
+> header and dequeued highest-priority-first, FIFO within each lane.
+
 **Problem:** Without network-level priority (§5.8), a chatty actor can
 flood the outbound path and overwhelm peer nodes. dactor's core doesn't
 implement throttling (consistent with "delegate, don't own"), but outbound
