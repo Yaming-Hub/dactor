@@ -151,7 +151,10 @@ pub use timer::TimerHandle;
 pub use timer::{send_after, send_interval};
 pub use tokio_util::sync::CancellationToken;
 pub use transport::{InMemoryTransport, Transport, TransportError, TransportRegistry};
+#[cfg(feature = "serde")]
+pub use type_registry::JsonActorFactory;
 pub use type_registry::TypeRegistry;
+pub use type_registry::{ActorFactory, ErasedActorFactory};
 pub use wire_interceptor::{
     MaxBodySizeInterceptor, RateLimitWireInterceptor, WireDisposition, WireInterceptor,
     WireInterceptorPipeline, WireProcessResult, WireRejectError,
