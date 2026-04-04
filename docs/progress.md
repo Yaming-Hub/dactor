@@ -553,6 +553,72 @@ await. Dactor currently discards ractor's JoinHandle (`_join` in
 
 ---
 
+## Phase 10: Async Spawn API
+
+### Background
+
+All dactor adapter spawn methods are currently synchronous:
+
+```rust
+// ractor adapter — sync, but ractor::Actor::spawn() is async
+pub fn spawn<A>(&self, name: &str, args: A::Args) -> RactorActorRef<A>
+
+// kameo adapter — sync (kameo's Spawn::spawn_with_mailbox is also sync)
+pub fn spawn<A>(&self, name: &str, args: A::Args) -> KameoActorRef<A>
+
+// TestRuntime — sync
+pub fn spawn<A>(&self, name: &str, args: A::Args) -> TestActorRef<A>
+```
+
+Each backend's native spawn has a different signature:
+
+| Backend | Native Spawn | Async? | Notes |
+|---------|-------------|--------|-------|
+| **ractor** | `ractor::Actor::spawn()` | **async** | Returns `Result<(ActorRef, JoinHandle)>`. Dactor currently bridges via `std::thread::spawn` + `Handle::block_on` to keep the API sync. This is heavyweight and can panic if no tokio runtime is active. |
+| **kameo** | `Spawn::spawn_with_mailbox()` | **sync** | Calls `tokio::spawn` internally, returns `ActorRef` immediately. No bridging needed. |
+| **coerce** | `actor.into_actor(name, &system)` | **async** | Returns `Result<ActorRef>`. Would also need sync→async bridging. |
+| **TestRuntime** | In-process task spawn | **sync** | No runtime needed, purely local. |
+
+The sync API was chosen for simplicity but has drawbacks:
+
+1. **Ractor sync bridge is fragile** — spawns a std::thread + `block_on` just
+   to call an async function. This adds latency (~100μs per spawn), can panic
+   without a tokio runtime, and is unusual Rust async code.
+2. **Coerce can't be properly wired** — `into_actor()` is async, so a coerce
+   adapter would also need the same heavyweight bridging.
+3. **Error swallowing** — sync spawn panics on failure instead of returning
+   `Result`, because there's no natural way to propagate async errors in a
+   sync context.
+
+### Plan
+
+| # | Feature | Description | Status |
+|---|---------|-------------|--------|
+| AS1 | Async spawn for ractor | `pub async fn spawn<A>(...) -> Result<RactorActorRef<A>, RuntimeError>` — call `ractor::Actor::spawn().await` directly, remove std::thread bridge | 🔲 Not started |
+| AS2 | Async spawn for kameo | `pub async fn spawn<A>(...) -> Result<KameoActorRef<A>, RuntimeError>` — kameo is sync internally but async API is forward-compatible and consistent | 🔲 Not started |
+| AS3 | Async spawn for coerce | `pub async fn spawn<A>(...) -> Result<CoerceActorRef<A>, RuntimeError>` — enables direct `into_actor().await` | 🔲 Not started |
+| AS4 | Async spawn for TestRuntime | `pub async fn spawn<A>(...) -> Result<TestActorRef<A>, RuntimeError>` — consistent API, trivially wraps sync | 🔲 Not started |
+| AS5 | Return Result, not panic | All spawn methods return `Result<Ref, RuntimeError>` instead of panicking on failure | 🔲 Not started |
+| AS6 | Migration: keep sync wrappers | Provide `spawn_blocking()` sync wrappers that call `Handle::block_on(spawn())` for callers that need sync API. Deprecate the current sync `spawn()` over time | 🔲 Not started |
+| AS7 | Update examples & tests | All examples, conformance tests, and adapter tests updated to use `.await` | 🔲 Not started |
+
+### Design Notes
+
+- **Breaking change.** Moving spawn from sync to async changes every call site.
+  Mitigation: keep `spawn_blocking()` sync wrappers during transition.
+- **Kameo doesn't need async spawn** but should have it for API consistency.
+  The async version would simply wrap the sync call.
+- **TestRuntime** is sync by nature but async spawn is trivially
+  `async { Ok(self.spawn_sync(name, args)) }`.
+- **Error handling improves.** Async spawn can return `Result` naturally
+  instead of panicking. This is especially important for remote spawn where
+  network errors are expected.
+- **Priority:** Medium — the sync bridge works but is a known wart. Worth
+  doing before 1.0 but not blocking current development.
+- **Depends on:** JH1 (storing JoinHandle) pairs naturally with async spawn.
+
+---
+
 ## Not Planned / Out of Scope
 
 | Feature | Reason |
