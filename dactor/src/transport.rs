@@ -116,33 +116,35 @@ impl InMemoryTransport {
 
     /// Link two transports bidirectionally so each can send to the other's
     /// registered nodes. Both transports share route tables after linking.
+    ///
+    /// Note: The `pending` request-reply map is NOT shared — `complete_request`
+    /// must be called on the same transport that called `send_request`.
     pub async fn link(&self, other: &InMemoryTransport) {
-        // Copy other's routes into self, and self's routes into other.
-        let self_routes = self.routes.lock().await;
-        let mut other_routes = other.routes.lock().await;
+        // Collect routes from both transports without holding both locks
+        // simultaneously (avoids deadlock if link() is called concurrently
+        // in opposite direction).
+        let self_entries: Vec<_> = {
+            let routes = self.routes.lock().await;
+            routes.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let other_entries: Vec<_> = {
+            let routes = other.routes.lock().await;
+            routes.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
 
-        for (node, sender) in self_routes.iter() {
-            other_routes.insert(node.clone(), sender.clone());
+        // Merge: self gets other's routes, other gets self's routes.
+        {
+            let mut routes = self.routes.lock().await;
+            for (node, sender) in other_entries {
+                routes.insert(node, sender);
+            }
         }
-
-        // Now copy other → self (we need to drop self_routes first to avoid
-        // double-lock, so collect into a vec).
-        let other_entries: Vec<_> = other_routes
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        drop(other_routes);
-        drop(self_routes);
-
-        let mut self_routes = self.routes.lock().await;
-        for (node, sender) in other_entries {
-            self_routes.insert(node, sender);
+        {
+            let mut routes = other.routes.lock().await;
+            for (node, sender) in self_entries {
+                routes.insert(node, sender);
+            }
         }
-
-        // Share reply_senders so request/reply works across linked transports.
-        // After linking, both transports use the same reply_senders map.
-        // Merge other's reply_senders into self, then point other to self's.
-        // For simplicity, we share self's map with other.
 
         // Mark each other as connected.
         self.connected
@@ -209,8 +211,11 @@ impl Transport for InMemoryTransport {
         // Register the pending reply.
         self.pending.lock().await.insert(request_id, tx);
 
-        // Deliver the envelope to the target.
-        self.send(target_node, envelope).await?;
+        // Deliver the envelope to the target. Clean up pending on failure.
+        if let Err(e) = self.send(target_node, envelope).await {
+            self.pending.lock().await.remove(&request_id);
+            return Err(e);
+        }
 
         // Wait for the reply.
         rx.await
