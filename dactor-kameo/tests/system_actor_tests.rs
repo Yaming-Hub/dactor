@@ -59,7 +59,17 @@ fn sa5_spawn_unknown_type_fails() {
     };
 
     let result = runtime.handle_spawn_request(&request);
-    assert!(result.is_err());
+    match result {
+        Err(resp) => {
+            // Verify request_id is preserved for error correlation
+            if let dactor::system_actors::SpawnResponse::Failure { request_id, .. } = resp {
+                assert_eq!(request_id, "req-2");
+            } else {
+                panic!("expected SpawnResponse::Failure");
+            }
+        }
+        Ok(_) => panic!("spawn of unknown type should fail"),
+    }
     assert_eq!(runtime.spawn_manager().spawned_actors().len(), 0);
 }
 
@@ -304,6 +314,22 @@ fn sa7_double_cancel_returns_not_found() {
 
     let second = runtime.cancel_request("req-1");
     assert!(matches!(second, CancelResponse::NotFound { .. }));
+}
+
+#[test]
+fn sa7_complete_request_cleans_up_token() {
+    let mut runtime = KameoRuntime::new();
+    let token = CancellationToken::new();
+    runtime.register_cancel("req-cleanup".into(), token);
+    assert_eq!(runtime.cancel_manager().active_count(), 1);
+
+    // Simulate normal completion — token should be removed
+    runtime.complete_request("req-cleanup");
+    assert_eq!(runtime.cancel_manager().active_count(), 0);
+
+    // Cancel after completion should return NotFound
+    let response = runtime.cancel_request("req-cleanup");
+    assert!(matches!(response, CancelResponse::NotFound { .. }));
 }
 
 // ---------------------------------------------------------------------------
