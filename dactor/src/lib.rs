@@ -131,6 +131,9 @@ pub use metrics::{
 };
 pub use node::{ActorId, NodeId};
 pub use outbound_queue::OutboundPriorityQueue;
+pub use outbound_queue::{
+    AgingWireComparer, EnvelopeMetadata, StrictPriorityWireComparer, WireEnvelopeComparer,
+};
 pub use persistence::{
     recover_durable_state, recover_event_sourced, DurableState, EventSourced, InMemoryStorage,
     InMemoryStorageProvider, JournalEntry, JournalStorage, PersistError, PersistFailurePolicy,

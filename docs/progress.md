@@ -459,7 +459,7 @@ impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
 | AM3 | Timer methods (send_after, send_interval) | §4.5 | Scheduled message delivery | ✅ PR #46 |
 | AM4 | on_reply wiring | §5.3 | OutboundInterceptor sees ask replies | ✅ PR #46 |
 | AM5 | Outbound priority queue | §5.8 | Per-destination priority lanes | ✅ PR #74 |
-| AM6 | Pluggable outbound comparer | §5.6, §5.8 | Replace hardcoded 5-lane bucketing in OutboundPriorityQueue with pluggable MessageComparer (same trait used by inbound mailbox). Comparer receives priority + enqueue timestamp, enabling age-based promotion and custom ordering (e.g., ask-first, deadline-aware). | 🔲 Not started |
+| AM6 | Pluggable outbound comparer | §5.6, §5.8 | WireEnvelopeComparer trait + StrictPriorityWireComparer + AgingWireComparer, integrated into OutboundPriorityQueue via with_comparer() | ✅ PR #76 |
 | AM7 | Stream item ordering guarantee | §4.11 | Ensure stream/feed items within a single stream are always sent in exact enqueue order, bypassing the priority queue. Stream items must not be reordered by priority — only independent tell/ask messages are subject to priority scheduling. | 🔲 Not started |
 
 ---
