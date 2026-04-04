@@ -50,6 +50,8 @@ pub mod message;
 pub mod metrics;
 /// Node and actor identity types.
 pub mod node;
+/// Per-destination outbound priority queue for remote messages.
+pub mod outbound_queue;
 /// Persistence support: journals, snapshots, and durable state.
 pub mod persistence;
 /// Actor pool routing and configuration.
@@ -128,6 +130,7 @@ pub use metrics::{
     ActorMetricsHandle, ActorMetricsSnapshot, MetricsInterceptor, MetricsRegistry, RuntimeMetrics,
 };
 pub use node::{ActorId, NodeId};
+pub use outbound_queue::OutboundPriorityQueue;
 pub use persistence::{
     recover_durable_state, recover_event_sourced, DurableState, EventSourced, InMemoryStorage,
     InMemoryStorageProvider, JournalEntry, JournalStorage, PersistError, PersistFailurePolicy,
