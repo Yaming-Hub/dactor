@@ -65,6 +65,8 @@ pub mod clock;
 pub mod node;
 /// Remote actor types, wire format, and cluster discovery.
 pub mod remote;
+/// Abstract transport for remote actor communication.
+pub mod transport;
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -128,6 +130,7 @@ pub use persistence::{
     StorageProvider, InMemoryStorageProvider,
     recover_event_sourced, recover_durable_state,
 };
+pub use transport::{Transport, TransportError, InMemoryTransport, TransportRegistry};
 
 // Backward-compatible re-export of TestClock (feature-gated)
 #[cfg(feature = "test-support")]
