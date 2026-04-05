@@ -40,7 +40,10 @@ impl RactorClusterEvents {
             subs.values().cloned().collect()
         };
         for sub in snapshot {
-            sub(event.clone());
+            let event_clone = event.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sub(event_clone);
+            }));
         }
     }
 }

@@ -505,8 +505,8 @@ impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
 | # | Feature | Design Section | Description | Status |
 |---|---------|----------------|-------------|--------|
 | NR1 | Actor naming & registry | §8.3 | runtime.lookup(name) for named actor discovery | ✅ PR #58 |
-| NR2 | ClusterEvent enum | §10.1, §10.4 | NodeJoined, NodeLeft push events | ✅ PR #86 |
-| NR3 | Cluster event handlers | §10.4 | Actors subscribe to membership changes | ✅ PR #86 |
+| NR2 | ClusterEvent enum | §10.1, §10.4 | NodeJoined, NodeLeft push events | ✅ PR #86 (ractor, kameo; coerce deferred — stub) |
+| NR3 | Cluster event handlers | §10.4 | Actors subscribe to membership changes | ✅ PR #86 (ractor, kameo; coerce deferred — stub) |
 | NR4 | Processing groups | §2.2 | Actor group pub/sub (ractor pg, coerce sharding) |
 
 ---
