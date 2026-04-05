@@ -69,6 +69,8 @@ struct KameoDactorActor<A: Actor> {
     watchers: WatcherMap,
     stop_reason: Option<String>,
     dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
+    /// Notified when the actor stops (for await_stop).
+    stop_notifier: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Arguments passed to the kameo actor at spawn time.
@@ -80,6 +82,7 @@ struct KameoSpawnArgs<A: Actor> {
     interceptors: Vec<Box<dyn InboundInterceptor>>,
     watchers: WatcherMap,
     dead_letter_handler: Arc<Option<Arc<dyn DeadLetterHandler>>>,
+    stop_notifier: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl<A: Actor + 'static> kameo::Actor for KameoDactorActor<A> {
@@ -100,6 +103,7 @@ impl<A: Actor + 'static> kameo::Actor for KameoDactorActor<A> {
             watchers: args.watchers,
             stop_reason: None,
             dead_letter_handler: args.dead_letter_handler,
+            stop_notifier: args.stop_notifier,
         })
     }
 
@@ -137,6 +141,11 @@ impl<A: Actor + 'static> kameo::Actor for KameoDactorActor<A> {
             for entry in &entries {
                 (entry.notify)(notification.clone());
             }
+        }
+
+        // Notify await_stop() waiters
+        if let Some(tx) = self.stop_notifier.take() {
+            let _ = tx.send(());
         }
 
         Ok(())
@@ -720,6 +729,8 @@ pub struct KameoRuntime {
     node_directory: NodeDirectory,
     /// Native kameo system actor refs (lazily started via `start_system_actors()`).
     system_actors: Option<KameoSystemActorRefs>,
+    /// Stop notification receivers for await_stop(), keyed by ActorId.
+    stop_receivers: Arc<Mutex<HashMap<ActorId, tokio::sync::oneshot::Receiver<()>>>>,
 }
 
 /// References to the native kameo system actors spawned by the runtime.
@@ -758,6 +769,7 @@ impl KameoRuntime {
             cancel_manager: CancelManager::new(),
             node_directory: NodeDirectory::new(),
             system_actors: None,
+            stop_receivers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -887,6 +899,8 @@ impl KameoRuntime {
         };
         let actor_name = name.to_string();
 
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+
         let spawn_args = KameoSpawnArgs {
             args,
             deps,
@@ -895,11 +909,15 @@ impl KameoRuntime {
             interceptors,
             watchers: self.watchers.clone(),
             dead_letter_handler: self.dead_letter_handler.clone(),
+            stop_notifier: Some(stop_tx),
         };
 
         // kameo's Spawn::spawn_with_mailbox is synchronous (internally calls tokio::spawn)
         let actor_ref =
             KameoDactorActor::<A>::spawn_with_mailbox(spawn_args, kameo::mailbox::unbounded());
+
+        // Store stop receiver for await_stop()
+        self.stop_receivers.lock().unwrap().insert(actor_id.clone(), stop_rx);
 
         KameoActorRef {
             id: actor_id,
@@ -1129,6 +1147,70 @@ impl KameoRuntime {
     /// Check if a peer node is connected.
     pub fn is_peer_connected(&self, peer_id: &NodeId) -> bool {
         self.node_directory.is_connected(peer_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // JH1-JH2: Actor lifecycle handles
+    // -----------------------------------------------------------------------
+
+    /// Wait for an actor to stop.
+    ///
+    /// Returns `Ok(())` when the actor finishes. The stop receiver is consumed
+    /// and removed from the map.
+    ///
+    /// Returns `Ok(())` immediately if no stop receiver is stored for this ID.
+    pub async fn await_stop(&self, actor_id: &ActorId) -> Result<(), String> {
+        let rx = {
+            let mut receivers = self.stop_receivers.lock().unwrap();
+            receivers.remove(actor_id)
+        };
+        match rx {
+            Some(rx) => rx.await.map_err(|_| "stop notifier dropped".to_string()),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait for all spawned actors to stop.
+    ///
+    /// Drains all stored stop receivers and awaits them all. Returns the first
+    /// error encountered, but always waits for every actor to finish.
+    pub async fn await_all(&self) -> Result<(), String> {
+        let receivers: Vec<_> = {
+            let mut map = self.stop_receivers.lock().unwrap();
+            map.drain().collect()
+        };
+        let mut first_error = None;
+        for (_, rx) in receivers {
+            if let Err(e) = rx.await {
+                if first_error.is_none() {
+                    first_error = Some(format!("stop notifier dropped: {e}"));
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove completed stop receivers from the map.
+    ///
+    /// Call periodically to prevent stale entries from accumulating
+    /// for actors that stopped without being awaited.
+    pub fn cleanup_finished(&self) {
+        let mut receivers = self.stop_receivers.lock().unwrap();
+        receivers.retain(|_, rx| {
+            matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty))
+        });
+    }
+
+    /// Number of actors with stored stop receivers.
+    ///
+    /// Note: includes receivers for actors that have already stopped but
+    /// haven't been awaited or cleaned up. Call `cleanup_finished()` first
+    /// for an accurate count of running actors.
+    pub fn active_handle_count(&self) -> usize {
+        self.stop_receivers.lock().unwrap().len()
     }
 }
 
