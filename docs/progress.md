@@ -561,7 +561,7 @@ messages.
   (e.g., `SpawnRequest` → `SpawnResponse`). The transport layer awaits the
   reply and sends it back over the wire.
 - **Coerce/mock.** Coerce is a stub — native actors can be added when
-  coerce-rt integrates. MockCluster can optionally wrap in test actors or
+  coerce crate integrates. MockCluster can optionally wrap in test actors or
   continue using direct method calls for simplicity.
 - **Depends on:** SA1-SA10 (complete), transport integration (R4).
 - **Priority:** High — required before remote operations work end-to-end.
@@ -690,7 +690,7 @@ This phase brings coerce to feature parity with ractor/kameo.
 
 | Feature | Ractor | Kameo | Coerce | Gap |
 |---------|--------|-------|--------|-----|
-| Real provider runtime | ✅ ractor::Actor | ✅ kameo::Actor | ❌ Wraps TestRuntime | Need coerce-rt integration |
+| Real provider runtime | ✅ ractor::Actor | ✅ kameo::Actor | ❌ Wraps TestRuntime | Need coerce integration |
 | Native system actors (NA) | ✅ PR #83 | ✅ PR #84 | ❌ | Need coerce native actors |
 | Runtime auto-start (NA9) | ✅ PR #85 | ✅ PR #85 | ❌ | Need start_system_actors() |
 | ClusterEvents impl | ✅ RactorClusterEvents | ✅ KameoClusterEvents | ❌ | Need CoerceClusterEvents |
@@ -703,28 +703,148 @@ This phase brings coerce to feature parity with ractor/kameo.
 
 | # | Feature | Description | Priority | Status |
 |---|---------|-------------|----------|--------|
-| CP1 | Integrate coerce-rt | Replace TestRuntime with real `coerce::actor::Actor` spawning via `into_actor()`. Add coerce-rt dependency. | High | 🔲 Not started |
-| CP2 | CoerceClusterEvents | Implement `ClusterEvents` trait for coerce adapter (callback-based, same pattern as ractor/kameo) | High | 🔲 Not started |
-| CP3 | ClusterEvent emission | Wire `connect_peer()`/`disconnect_peer()` to emit NodeJoined/NodeLeft via CoerceClusterEvents | High | 🔲 Not started |
-| CP4 | Lifecycle handles | Implement `await_stop()`/`await_all()`/`cleanup_finished()` — wire oneshot into coerce actor stop lifecycle | High | 🔲 Not started |
+| CP1 | Integrate real coerce | Replace TestRuntime with real `coerce::actor::Actor` spawning via `start_actor()`. Type-erased `DactorMsg` dispatch through coerce's mailbox. | High | ✅ Done |
+| CP2 | CoerceClusterEvents | Implement `ClusterEvents` trait for coerce adapter (callback-based, same pattern as ractor/kameo) | High | ✅ Done |
+| CP3 | ClusterEvent emission | Wire `connect_peer()`/`disconnect_peer()` to emit NodeJoined/NodeLeft via CoerceClusterEvents | High | ✅ Done |
+| CP4 | Lifecycle handles | Implement `await_stop()`/`await_all()`/`cleanup_finished()` — wire oneshot into coerce actor stop lifecycle | High | ✅ Done |
 | CP5 | Native system actors | Implement coerce native actors for SpawnManager, WatchManager, CancelManager, NodeDirectory | Medium | 🔲 Not started |
 | CP6 | Runtime auto-start | `start_system_actors()` spawns native coerce system actors | Medium | 🔲 Not started |
-| CP7 | Interceptor pipeline | Ensure inbound/outbound interceptor pipelines work with real coerce actors (not just TestRuntime delegation) | Medium | 🔲 Not started |
-| CP8 | Watch/unwatch | Wire coerce's actor lifecycle into WatchManager for real DeathWatch notifications | Medium | 🔲 Not started |
+| CP7 | Interceptor pipeline | Ensure inbound/outbound interceptor pipelines work with real coerce actors (not just TestRuntime delegation) | Medium | ✅ Done |
+| CP8 | Watch/unwatch | Wire coerce's actor lifecycle into WatchManager for real DeathWatch notifications | Medium | ✅ Done |
 | CP9 | Mailbox config | Wire coerce's mailbox options (bounded/unbounded) instead of ignoring MailboxConfig | Low | 🔲 Not started |
-| CP10 | Comprehensive tests | Adapter tests, system actor tests, lifecycle tests, conformance suite — all on real coerce runtime | High | 🔲 Not started |
+| CP10 | Comprehensive tests | Adapter tests, system actor tests, lifecycle tests, conformance suite — all on real coerce runtime | High | ✅ Done |
 
 ### Design Notes
 
-- **CP1 is the gate** — all other items depend on replacing TestRuntime with
-  real coerce actors. Without this, everything is just wrapping a test mock.
-- **coerce-rt dependency risk** — the crate may have compatibility issues or
-  be under-maintained. If integration is blocked, document the blockers and
-  keep the stub with a clear upgrade path.
-- **CP2-CP4 can be done on the stub** as interim work if CP1 is blocked,
-  but the real value comes from CP1.
-- **Priority: High** — coerce parity is needed before v1.0. The stub was
-  acceptable for API design but not for production readiness.
+- **CP1 is complete** — TestRuntime replaced with real coerce actors using
+  `CoerceDactorActor<A>` wrapper, type-erased `DactorMsg<A>` dispatch, and
+  coerce's `start_actor()` for synchronous spawning.
+- **CP2-CP4, CP7-CP8, CP10 also complete** — ClusterEvents, lifecycle handles,
+  interceptor pipelines, watch/unwatch, and comprehensive tests all work on
+  real coerce actors. All 41 tests pass (16 conformance + 24 system actor + 1 doc).
+- **CP5-CP6 remain** — native coerce system actors (currently struct-based).
+- **CP9 remains** — bounded mailbox support (coerce uses unbounded internally).
+- **Limitation:** dactor actors used with the coerce adapter must be `Send + Sync`
+  (required by `coerce::actor::Actor`). This is satisfied by most actors.
+
+---
+
+## Phase 13: Transform Pattern & Streaming API Naming
+
+### Background: Current Streaming Call Patterns
+
+dactor currently supports three streaming call patterns:
+
+| Pattern | Method | Direction | Description |
+|---------|--------|-----------|-------------|
+| **stream** | `actor_ref.stream(msg)` | Actor → Caller | Actor produces a stream of items to the caller |
+| **feed** | `actor_ref.feed(input)` | Caller → Actor | Caller sends a stream of items to the actor, gets a single reply |
+| **ask** | `actor_ref.ask(msg)` | Caller ↔ Actor | Single request, single reply |
+
+Missing: **transform** — caller sends a stream of items, actor produces a
+stream of transformed items (bidirectional streaming).
+
+Currently listed under "Not Planned" as "Bidirectional streaming — composed
+from feed() + stream() at app level". However, the compose-it-yourself
+approach has significant drawbacks:
+
+1. **Two separate channels** — feed() and stream() create independent
+   mailbox entries, so ordering between input consumption and output
+   production is not guaranteed.
+2. **No backpressure coupling** — if the output stream is slow to consume,
+   the input feed has no way to slow down.
+3. **Lifecycle complexity** — the caller must coordinate two independent
+   async flows (the feed drain task and the stream consumer).
+
+A first-class `transform()` primitive solves all three issues.
+
+### Proposed API
+
+```rust
+// Transform: stream-in, stream-out
+let output: BoxStream<OutputItem> = actor_ref.transform(
+    input,          // BoxStream<InputItem>
+    buffer,         // output buffer size
+    batch_config,   // Optional<BatchConfig>
+    cancel,         // Optional<CancellationToken>
+)?;
+
+// The actor implements TransformHandler:
+#[async_trait]
+trait TransformHandler<Item: Send + 'static, Output: Send + 'static>: Actor {
+    async fn on_item(
+        &mut self,
+        item: Item,
+        sender: &StreamSender<Output>,
+        ctx: &mut ActorContext,
+    );
+
+    async fn on_complete(
+        &mut self,
+        sender: &StreamSender<Output>,
+        ctx: &mut ActorContext,
+    ) {}
+}
+```
+
+### Plan
+
+| # | Feature | Description | Status |
+|---|---------|-------------|--------|
+| TF1 | TransformHandler trait | `on_item(item, sender, ctx)` + `on_complete(sender, ctx)` | 🔲 Not started |
+| TF2 | `actor_ref.transform()` | Wires input stream → actor → output stream with shared lifecycle | 🔲 Not started |
+| TF3 | Backpressure coupling | Output stream backpressure slows input consumption | 🔲 Not started |
+| TF4 | Batch support | `Option<BatchConfig>` for both input and output | 🔲 Not started |
+| TF5 | Interceptor integration | Outbound pipeline on each output item | 🔲 Not started |
+| TF6 | Cancellation | Single CancellationToken cancels both input and output | 🔲 Not started |
+| TF7 | Adapter wiring | Wire into ractor, kameo, coerce, TestRuntime | 🔲 Not started |
+
+### Streaming API Naming Review
+
+The current naming (`stream`, `feed`, `transform`) is **verb-oriented** and
+describes the communication direction. However, from a **stream processing**
+perspective, these names may be confusing:
+
+| Current Name | Stream Semantics | Proposed Name |
+|-------------|------------------|--------------|
+| `tell(msg)` → no reply | **Fire-and-forget** | `tell` (no change) |
+| `ask(msg)` → single reply | **Request-Reply** (1→1) | `ask` (no change) |
+| `stream(msg)` → stream of items | **Expand** (1→N) — one request expands into many items | `expand` |
+| `feed(input)` → single reply | **Reduce** (N→1) — consume stream, produce aggregate | `reduce` |
+| `transform(input)` → stream of items | **Transform** (N→M) — consume stream, produce stream | `transform` |
+
+**Proposed full naming scheme (stream-processing aligned):**
+
+```
+tell(msg)              → tell(msg)              // 1→0  fire-and-forget
+ask(msg)               → ask(msg)               // 1→1  request-reply
+stream(msg)            → expand(msg)            // 1→N  one request, many results
+feed(input)            → reduce(input)          // N→1  many inputs, one result
+transform(input)       → transform(input)       // N→M  many inputs, many results
+```
+
+This naming scheme maps naturally to **cardinality**:
+
+```
+         Input
+         1       N
+Reply  ┌───────┬──────────┐
+  0    │ tell  │          │
+  1    │ ask   │ reduce   │
+  N    │expand │transform │
+       └───────┴──────────┘
+```
+
+**Decision needed:** Renaming `stream` → `expand` and `feed` → `reduce` are
+API changes.
+
+Since **dactor is not yet released**, there are no external consumers to
+break. This is the ideal time for naming changes.
+
+**Recommendation:** Option 1 (rename now) — do a clean rename before the
+first release. No aliases or deprecation needed since there are no
+downstream users. Update all traits, impls, tests, examples, and docs
+in a single PR.
 
 ---
 
@@ -736,4 +856,3 @@ This phase brings coerce to feature parity with ractor/kameo.
 | Passivation | Not in design spec |
 | Security (TLS, auth) | Deferred to interceptors + application code |
 | CLI tools / dashboard | Not in design spec |
-| Bidirectional streaming | Composed from feed() + stream() at app level |
