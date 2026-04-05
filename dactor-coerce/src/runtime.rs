@@ -65,16 +65,21 @@ type WatcherMap = Arc<Mutex<HashMap<ActorId, Vec<WatchEntry>>>>;
 // ---------------------------------------------------------------------------
 
 /// The coerce message type wrapping a type-erased dactor dispatch envelope.
-struct DactorMsg<A: Actor>(Box<dyn Dispatch<A>>);
+// Wrap Box<dyn Dispatch<A>> in a Sync-safe container using Mutex.
+// coerce::actor::message::Message requires Sync + Send + 'static.
+// The Mutex is never contended — it's locked once in handle() to take
+// the dispatch out. This avoids an unsound manual Sync impl.
+struct DactorMsg<A: Actor>(std::sync::Mutex<Option<Box<dyn Dispatch<A>>>>);
 
-// SAFETY: DactorMsg<A> is only ever:
-// - Constructed on the sender thread,
-// - Transferred via mpsc channel (requires Send, which Box<dyn Dispatch<A>>
-//   satisfies),
-// - Consumed on the actor loop thread (single-threaded sequential processing).
-// No concurrent access ever occurs, so the Sync impl is sound.
-// coerce::actor::message::Message requires Sync + Send + 'static + Sized.
-unsafe impl<A: Actor> Sync for DactorMsg<A> {}
+impl<A: Actor> DactorMsg<A> {
+    fn new(dispatch: Box<dyn Dispatch<A>>) -> Self {
+        Self(std::sync::Mutex::new(Some(dispatch)))
+    }
+
+    fn take(&self) -> Option<Box<dyn Dispatch<A>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
 
 impl<A: Actor + Send + Sync + 'static> CoerceMessage for DactorMsg<A> {
     type Result = ();
@@ -141,7 +146,10 @@ impl<A: Actor + Send + Sync + 'static> CoerceActor for CoerceDactorActor<A> {
 #[async_trait::async_trait]
 impl<A: Actor + Send + Sync + 'static> CoerceHandler<DactorMsg<A>> for CoerceDactorActor<A> {
     async fn handle(&mut self, msg: DactorMsg<A>, coerce_ctx: &mut CoerceActorCtx) {
-        let dispatch = msg.0;
+        let dispatch = match msg.take() {
+            Some(d) => d,
+            None => return,
+        };
 
         // Capture metadata before dispatch consumes the message
         let send_mode = dispatch.send_mode();
@@ -400,7 +408,7 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
         }
 
         let dispatch: Box<dyn Dispatch<A>> = Box::new(TypedDispatch { msg });
-        self.inner.notify(DactorMsg(dispatch)).map_err(|e| {
+        self.inner.notify(DactorMsg::new(dispatch)).map_err(|e| {
             self.notify_dead_letter(
                 std::any::type_name::<M>(),
                 SendMode::Tell,
@@ -455,7 +463,7 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
             reply_tx: tx,
             cancel,
         });
-        self.inner.notify(DactorMsg(dispatch)).map_err(|e| {
+        self.inner.notify(DactorMsg::new(dispatch)).map_err(|e| {
             self.notify_dead_letter(
                 std::any::type_name::<M>(),
                 SendMode::Ask,
@@ -506,7 +514,7 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
             cancel,
         });
         self.inner
-            .notify(DactorMsg(dispatch))
+            .notify(DactorMsg::new(dispatch))
             .map_err(|e| ActorSendError(e.to_string()))?;
 
         match batch_config {
@@ -583,7 +591,7 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
             cancel: cancel.clone(),
         });
         self.inner
-            .notify(DactorMsg(dispatch))
+            .notify(DactorMsg::new(dispatch))
             .map_err(|e| ActorSendError(e.to_string()))?;
 
         let pipeline = self.outbound_pipeline();
@@ -824,7 +832,7 @@ impl CoerceRuntime {
         let coerce_ref = coerce::actor::scheduler::start_actor(
             wrapper,
             coerce::actor::new_actor_id(),
-            coerce::actor::scheduler::ActorType::Anonymous,
+            coerce::actor::scheduler::ActorType::Tracked,
             None,
             Some(system),
             None,
@@ -862,7 +870,7 @@ impl CoerceRuntime {
             watcher_id,
             notify: Box::new(move |msg: ChildTerminated| {
                 let dispatch: Box<dyn Dispatch<W>> = Box::new(TypedDispatch { msg });
-                if watcher_inner.notify(DactorMsg(dispatch)).is_err() {
+                if watcher_inner.notify(DactorMsg::new(dispatch)).is_err() {
                     tracing::debug!("watch notification dropped — watcher may have stopped");
                 }
             }),
