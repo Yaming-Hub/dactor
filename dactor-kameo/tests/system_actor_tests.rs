@@ -12,14 +12,14 @@ use tokio_util::sync::CancellationToken;
 // SA5: SpawnManager wiring
 // ---------------------------------------------------------------------------
 
-#[test]
-fn sa5_runtime_has_spawn_manager() {
+#[tokio::test]
+async fn sa5_runtime_has_spawn_manager() {
     let runtime = KameoRuntime::new();
     assert_eq!(runtime.spawn_manager().spawned_actors().len(), 0);
 }
 
-#[test]
-fn sa5_register_factory_and_create() {
+#[tokio::test]
+async fn sa5_register_factory_and_create() {
     let mut runtime = KameoRuntime::new();
     runtime.register_factory("test::Counter", |bytes: &[u8]| {
         let value: i32 = serde_json::from_slice(bytes)
@@ -48,8 +48,8 @@ fn sa5_register_factory_and_create() {
     assert_eq!(runtime.spawn_manager().spawned_actors().len(), 1);
 }
 
-#[test]
-fn sa5_spawn_unknown_type_fails() {
+#[tokio::test]
+async fn sa5_spawn_unknown_type_fails() {
     let mut runtime = KameoRuntime::new();
     let request = SpawnRequest {
         type_name: "nonexistent::Actor".into(),
@@ -73,8 +73,8 @@ fn sa5_spawn_unknown_type_fails() {
     assert_eq!(runtime.spawn_manager().spawned_actors().len(), 0);
 }
 
-#[test]
-fn sa5_with_node_id() {
+#[tokio::test]
+async fn sa5_with_node_id() {
     let mut runtime = KameoRuntime::with_node_id(NodeId("node-42".into()));
     runtime.register_factory("test::Actor", |_| Ok(Box::new(())));
 
@@ -96,8 +96,8 @@ fn sa5_with_node_id() {
     }
 }
 
-#[test]
-fn sa5_multiple_spawns_get_unique_ids() {
+#[tokio::test]
+async fn sa5_multiple_spawns_get_unique_ids() {
     let mut runtime = KameoRuntime::new();
     runtime.register_factory("test::Actor", |_| Ok(Box::new(())));
 
@@ -118,8 +118,8 @@ fn sa5_multiple_spawns_get_unique_ids() {
     assert_eq!(unique.len(), 5);
 }
 
-#[test]
-fn sa5_spawn_returns_actor_for_caller_to_use() {
+#[tokio::test]
+async fn sa5_spawn_returns_actor_for_caller_to_use() {
     let mut runtime = KameoRuntime::new();
     runtime.register_factory("test::Pair", |bytes: &[u8]| {
         let pair: (String, u32) = serde_json::from_slice(bytes)
@@ -140,8 +140,8 @@ fn sa5_spawn_returns_actor_for_caller_to_use() {
     assert_eq!(actor_id.node, *runtime.node_id());
 }
 
-#[test]
-fn sa5_malformed_bytes_returns_error() {
+#[tokio::test]
+async fn sa5_malformed_bytes_returns_error() {
     let mut runtime = KameoRuntime::new();
     runtime.register_factory("test::Counter", |bytes: &[u8]| {
         let _: i32 = serde_json::from_slice(bytes)
@@ -164,14 +164,14 @@ fn sa5_malformed_bytes_returns_error() {
 // SA6: WatchManager wiring
 // ---------------------------------------------------------------------------
 
-#[test]
-fn sa6_runtime_has_watch_manager() {
+#[tokio::test]
+async fn sa6_runtime_has_watch_manager() {
     let runtime = KameoRuntime::new();
     assert_eq!(runtime.watch_manager().watched_count(), 0);
 }
 
-#[test]
-fn sa6_remote_watch_and_notify() {
+#[tokio::test]
+async fn sa6_remote_watch_and_notify() {
     let mut runtime = KameoRuntime::new();
     let target = ActorId {
         node: NodeId("node-1".into()),
@@ -195,8 +195,8 @@ fn sa6_remote_watch_and_notify() {
     assert_eq!(runtime.watch_manager().watched_count(), 0);
 }
 
-#[test]
-fn sa6_remote_unwatch() {
+#[tokio::test]
+async fn sa6_remote_unwatch() {
     let mut runtime = KameoRuntime::new();
     let target = ActorId {
         node: NodeId("node-1".into()),
@@ -217,8 +217,8 @@ fn sa6_remote_unwatch() {
     assert_eq!(notifications.len(), 0);
 }
 
-#[test]
-fn sa6_multiple_watchers() {
+#[tokio::test]
+async fn sa6_multiple_watchers() {
     let mut runtime = KameoRuntime::new();
     let target = ActorId {
         node: NodeId("node-1".into()),
@@ -239,8 +239,8 @@ fn sa6_multiple_watchers() {
     assert_eq!(notifications.len(), 3);
 }
 
-#[test]
-fn sa6_unwatch_nonexistent_is_noop() {
+#[tokio::test]
+async fn sa6_unwatch_nonexistent_is_noop() {
     let mut runtime = KameoRuntime::new();
     let target = ActorId { node: NodeId("n1".into()), local: 1 };
     let watcher = ActorId { node: NodeId("n2".into()), local: 2 };
@@ -253,14 +253,14 @@ fn sa6_unwatch_nonexistent_is_noop() {
 // SA7: CancelManager wiring
 // ---------------------------------------------------------------------------
 
-#[test]
-fn sa7_runtime_has_cancel_manager() {
+#[tokio::test]
+async fn sa7_runtime_has_cancel_manager() {
     let runtime = KameoRuntime::new();
     assert_eq!(runtime.cancel_manager().active_count(), 0);
 }
 
-#[test]
-fn sa7_register_and_cancel() {
+#[tokio::test]
+async fn sa7_register_and_cancel() {
     let mut runtime = KameoRuntime::new();
     let token = CancellationToken::new();
     let token_clone = token.clone();
@@ -274,15 +274,15 @@ fn sa7_register_and_cancel() {
     assert_eq!(runtime.cancel_manager().active_count(), 0);
 }
 
-#[test]
-fn sa7_cancel_unknown_request() {
+#[tokio::test]
+async fn sa7_cancel_unknown_request() {
     let mut runtime = KameoRuntime::new();
     let response = runtime.cancel_request("nonexistent");
     assert!(matches!(response, CancelResponse::NotFound { .. }));
 }
 
-#[test]
-fn sa7_multiple_tokens() {
+#[tokio::test]
+async fn sa7_multiple_tokens() {
     let mut runtime = KameoRuntime::new();
     let tokens: Vec<_> = (0..3)
         .map(|i| {
@@ -303,8 +303,8 @@ fn sa7_multiple_tokens() {
     assert_eq!(runtime.cancel_manager().active_count(), 2);
 }
 
-#[test]
-fn sa7_double_cancel_returns_not_found() {
+#[tokio::test]
+async fn sa7_double_cancel_returns_not_found() {
     let mut runtime = KameoRuntime::new();
     let token = CancellationToken::new();
     runtime.register_cancel("req-1".into(), token);
@@ -316,8 +316,8 @@ fn sa7_double_cancel_returns_not_found() {
     assert!(matches!(second, CancelResponse::NotFound { .. }));
 }
 
-#[test]
-fn sa7_complete_request_cleans_up_token() {
+#[tokio::test]
+async fn sa7_complete_request_cleans_up_token() {
     let mut runtime = KameoRuntime::new();
     let token = CancellationToken::new();
     runtime.register_cancel("req-cleanup".into(), token);
@@ -336,14 +336,14 @@ fn sa7_complete_request_cleans_up_token() {
 // SA8: NodeDirectory wiring
 // ---------------------------------------------------------------------------
 
-#[test]
-fn sa8_runtime_has_node_directory() {
+#[tokio::test]
+async fn sa8_runtime_has_node_directory() {
     let runtime = KameoRuntime::new();
     assert_eq!(runtime.node_directory().peer_count(), 0);
 }
 
-#[test]
-fn sa8_connect_and_disconnect_peer() {
+#[tokio::test]
+async fn sa8_connect_and_disconnect_peer() {
     let mut runtime = KameoRuntime::new();
     let peer = NodeId("peer-1".into());
 
@@ -361,8 +361,8 @@ fn sa8_connect_and_disconnect_peer() {
     assert_eq!(runtime.node_directory().connected_count(), 0);
 }
 
-#[test]
-fn sa8_multiple_peers() {
+#[tokio::test]
+async fn sa8_multiple_peers() {
     let mut runtime = KameoRuntime::new();
     for i in 0..5 {
         runtime.connect_peer(NodeId(format!("peer-{i}")), None);
@@ -381,8 +381,8 @@ fn sa8_multiple_peers() {
     assert_eq!(disconnected[0].node_id, NodeId("peer-2".into()));
 }
 
-#[test]
-fn sa8_node_id_accessor() {
+#[tokio::test]
+async fn sa8_node_id_accessor() {
     let runtime = KameoRuntime::new();
     assert_eq!(runtime.node_id(), &NodeId("kameo-node".into()));
 
@@ -390,8 +390,8 @@ fn sa8_node_id_accessor() {
     assert_eq!(custom.node_id(), &NodeId("custom-42".into()));
 }
 
-#[test]
-fn sa8_connect_without_address() {
+#[tokio::test]
+async fn sa8_connect_without_address() {
     let mut runtime = KameoRuntime::new();
     let peer = NodeId("peer-no-addr".into());
     runtime.connect_peer(peer.clone(), None);
@@ -401,8 +401,8 @@ fn sa8_connect_without_address() {
     assert_eq!(info.status, PeerStatus::Connected);
 }
 
-#[test]
-fn sa8_reconnect_preserves_address() {
+#[tokio::test]
+async fn sa8_reconnect_preserves_address() {
     let mut runtime = KameoRuntime::new();
     let peer = NodeId("peer-1".into());
 
@@ -418,8 +418,8 @@ fn sa8_reconnect_preserves_address() {
     );
 }
 
-#[test]
-fn sa8_reconnect_updates_address() {
+#[tokio::test]
+async fn sa8_reconnect_updates_address() {
     let mut runtime = KameoRuntime::new();
     let peer = NodeId("peer-1".into());
 
@@ -438,8 +438,8 @@ fn sa8_reconnect_updates_address() {
 // Cross-system-actor integration
 // ---------------------------------------------------------------------------
 
-#[test]
-fn all_system_actors_initialized_on_new() {
+#[tokio::test]
+async fn all_system_actors_initialized_on_new() {
     let runtime = KameoRuntime::new();
     assert_eq!(runtime.spawn_manager().spawned_actors().len(), 0);
     assert_eq!(runtime.watch_manager().watched_count(), 0);
@@ -447,8 +447,8 @@ fn all_system_actors_initialized_on_new() {
     assert_eq!(runtime.node_directory().peer_count(), 0);
 }
 
-#[test]
-fn with_node_id_initializes_all_system_actors() {
+#[tokio::test]
+async fn with_node_id_initializes_all_system_actors() {
     let runtime = KameoRuntime::with_node_id(NodeId("test-node".into()));
     assert_eq!(runtime.node_id(), &NodeId("test-node".into()));
     assert_eq!(runtime.spawn_manager().spawned_actors().len(), 0);
@@ -456,3 +456,4 @@ fn with_node_id_initializes_all_system_actors() {
     assert_eq!(runtime.cancel_manager().active_count(), 0);
     assert_eq!(runtime.node_directory().peer_count(), 0);
 }
+
