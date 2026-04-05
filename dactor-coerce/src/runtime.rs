@@ -990,9 +990,8 @@ impl CoerceRuntime {
 
     /// Register an actor type for remote spawning on this node.
     ///
-    /// The factory closure deserializes actor `Args` from bytes and returns
-    /// the constructed actor as `Box<dyn Any + Send>`. The runtime is
-    /// responsible for actually spawning the returned actor.
+    /// Registers the factory in both the struct-based SpawnManager and the
+    /// native SpawnManagerActor (if started via `start_system_actors()`).
     pub fn register_factory(
         &mut self,
         type_name: impl Into<String>,
@@ -1001,9 +1000,27 @@ impl CoerceRuntime {
             + Sync
             + 'static,
     ) {
+        let type_name = type_name.into();
+        let factory = Arc::new(factory);
+
+        // Register in struct-based manager
         self.spawn_manager
             .type_registry_mut()
-            .register_factory(type_name, factory);
+            .register_factory(type_name.clone(), {
+                let f = factory.clone();
+                move |bytes: &[u8]| f(bytes)
+            });
+
+        // Forward to native actor if started
+        if let Some(ref actors) = self.system_actors {
+            let f = factory;
+            let _ = actors.spawn_manager.notify(
+                crate::system_actors::RegisterFactory {
+                    type_name,
+                    factory: Box::new(move |bytes: &[u8]| f(bytes)),
+                },
+            );
+        }
     }
 
     /// Process a remote spawn request.

@@ -897,7 +897,7 @@ pub enum BroadcastReceipt<R> {
 
 | # | Feature | Description | Status |
 |---|---------|-------------|--------|
-| BC1 | BroadcastRef<A> | A reference to a group of actors of the same type. Holds `Vec<Box<dyn ActorRef<A>>>`. | 🔲 Not started |
+| BC1 | BroadcastRef<A> | A reference to a group of actors of the same type. Holds `Vec<Arc<dyn ErasedActorRef<A>>>` (type-erased to avoid object-safety issues with `ActorRef<A>` generic methods). | 🔲 Not started |
 | BC2 | `broadcast.tell(msg)` | Fire-and-forget: clone and send `msg` to all actors. Requires `M: Clone`. Errors on individual actors are logged but don't fail the broadcast. | 🔲 Not started |
 | BC3 | `broadcast.ask(msg, timeout)` | Request-reply: clone and send `msg` to all actors, collect `BroadcastReceipt<R>` within timeout. Uses `tokio::time::timeout` per actor. | 🔲 Not started |
 | BC4 | BroadcastReceipt<R> | Per-actor result enum: Ok, Timeout, Error. | 🔲 Not started |
