@@ -454,3 +454,82 @@ pub fn spawn_reduce_batched_drain<T: Send + 'static>(
         let _ = intercept_handle.await;
     });
 }
+
+/// Spawn the transform input drain task: reads items from the input stream,
+/// runs per-item outbound interception, and forwards to the actor's item channel.
+pub fn spawn_transform_drain<T: Send + 'static>(
+    input: BoxStream<T>,
+    item_tx: tokio::sync::mpsc::Sender<T>,
+    cancel: Option<CancellationToken>,
+    pipeline: OutboundPipeline,
+    message_type: &'static str,
+) {
+    tokio::spawn(async move {
+        let mut input = input;
+        let mut seq: u64 = 0;
+        let item_headers = Headers::new();
+        let result = std::panic::AssertUnwindSafe(async {
+            loop {
+                let next_item = if let Some(ref token) = cancel {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => break,
+                        item = input.next() => item,
+                    }
+                } else {
+                    input.next().await
+                };
+                match next_item {
+                    Some(item) => {
+                        let octx = OutboundContext {
+                            target_id: pipeline.target_id.clone(),
+                            target_name: &pipeline.target_name,
+                            message_type,
+                            send_mode: SendMode::Transform,
+                            remote: false,
+                        };
+                        let interception_result = intercept_outbound_stream_item(
+                            &pipeline.interceptors,
+                            &octx,
+                            &item_headers,
+                            seq,
+                            &item as &dyn Any,
+                        );
+                        seq += 1;
+                        match interception_result.disposition {
+                            Disposition::Continue => {
+                                if item_tx.send(item).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Disposition::Drop | Disposition::Retry(_) => {
+                                pipeline.notify_item_drop(
+                                    message_type,
+                                    SendMode::Transform,
+                                    "transform input item",
+                                    interception_result.interceptor_name,
+                                    seq - 1,
+                                );
+                                continue;
+                            }
+                            Disposition::Delay(d) => {
+                                tokio::time::sleep(d).await;
+                                if item_tx.send(item).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Disposition::Reject(_) => break,
+                        }
+                    }
+                    None => break,
+                }
+            }
+        })
+        .catch_unwind()
+        .await;
+
+        if result.is_err() {
+            tracing::error!("transform drain task panicked — input stream dropped");
+        }
+    });
+}
