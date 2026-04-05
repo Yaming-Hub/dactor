@@ -590,9 +590,9 @@ await. Dactor currently discards ractor's JoinHandle (`_join` in
 
 | # | Feature | Description | Status |
 |---|---------|-------------|--------|
-| JH1 | Store ractor JoinHandle | `RactorRuntime` stores JoinHandle in an internal map (`ActorId → JoinHandle`), cleaned up on actor stop | 🔲 Not started |
-| JH2 | `runtime.await_stop(id)` | Backend-agnostic API: returns a future that resolves when the actor finishes. Ractor: awaits stored JoinHandle. Kameo/coerce: uses a oneshot channel wired into `on_stop()` | 🔲 Not started |
-| JH3 | `runtime.await_all()` | Await all spawned actors — useful for graceful shutdown | 🔲 Not started |
+| JH1 | Store ractor JoinHandle | `RactorRuntime` stores JoinHandle in an internal map (`ActorId → JoinHandle`), cleaned up on actor stop | ✅ PR #87 |
+| JH2 | `runtime.await_stop(id)` | Backend-agnostic API: returns a future that resolves when the actor finishes. Ractor: awaits stored JoinHandle. Kameo/coerce: uses a oneshot channel wired into `on_stop()` | ✅ PR #87 |
+| JH3 | `runtime.await_all()` | Await all spawned actors — useful for graceful shutdown | ✅ PR #87 |
 | JH4 | Propagate panics | If an actor panics in `post_stop`, `await_stop()` should return the error instead of silently swallowing it | 🔲 Not started |
 | JH5 | TestRuntime support | Wire `await_stop` into TestRuntime for test teardown verification | 🔲 Not started |
 

@@ -698,6 +698,8 @@ pub struct RactorRuntime {
     node_directory: NodeDirectory,
     /// Native ractor system actor refs (lazily started via `start_system_actors()`).
     system_actors: Option<RactorSystemActorRefs>,
+    /// JoinHandles for spawned actors, keyed by ActorId.
+    join_handles: Arc<Mutex<HashMap<ActorId, ractor::concurrency::JoinHandle<()>>>>,
 }
 
 /// References to the native ractor system actors spawned by the runtime.
@@ -736,6 +738,7 @@ impl RactorRuntime {
             cancel_manager: CancelManager::new(),
             node_directory: NodeDirectory::new(),
             system_actors: None,
+            join_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -889,8 +892,8 @@ impl RactorRuntime {
             handle.block_on(async move {
                 let result = ractor::Actor::spawn(Some(name_for_ractor), wrapper, spawn_args).await;
                 match result {
-                    Ok((actor_ref, _join)) => {
-                        let _ = tx.send(Ok(actor_ref));
+                    Ok((actor_ref, join_handle)) => {
+                        let _ = tx.send(Ok((actor_ref, join_handle)));
                     }
                     Err(e) => {
                         let _ = tx.send(Err(e.to_string()));
@@ -899,11 +902,17 @@ impl RactorRuntime {
             });
         });
 
-        let actor_ref = match rx.recv() {
-            Ok(Ok(actor_ref)) => actor_ref,
+        let (actor_ref, join_handle) = match rx.recv() {
+            Ok(Ok(pair)) => pair,
             Ok(Err(e)) => panic!("failed to spawn ractor actor: {e}"),
             Err(_) => panic!("ractor actor spawn channel closed unexpectedly"),
         };
+
+        // Store JoinHandle for await_stop()
+        {
+            let mut handles = self.join_handles.lock().unwrap();
+            handles.insert(actor_id.clone(), join_handle);
+        }
 
         RactorActorRef {
             id: actor_id,
@@ -1154,6 +1163,48 @@ impl RactorRuntime {
     /// Check if a peer node is connected.
     pub fn is_peer_connected(&self, peer_id: &NodeId) -> bool {
         self.node_directory.is_connected(peer_id)
+    }
+
+    // -----------------------------------------------------------------------
+    // JH1-JH2: Actor lifecycle handles
+    // -----------------------------------------------------------------------
+
+    /// Wait for an actor to stop.
+    ///
+    /// Returns `Ok(())` when the actor finishes, or `Err` if the actor's
+    /// task panicked. The JoinHandle is consumed and removed from the map.
+    ///
+    /// Returns `Ok(())` immediately if no JoinHandle is stored for this ID
+    /// (e.g., actor was already awaited or was not spawned by this runtime).
+    pub async fn await_stop(&self, actor_id: &ActorId) -> Result<(), String> {
+        let handle = {
+            let mut handles = self.join_handles.lock().unwrap();
+            handles.remove(actor_id)
+        };
+        match handle {
+            Some(jh) => jh.await.map_err(|e| format!("actor task failed: {e}")),
+            None => Ok(()),
+        }
+    }
+
+    /// Wait for all spawned actors to stop.
+    ///
+    /// Drains all stored JoinHandles and awaits them. Returns the first
+    /// error encountered, or `Ok(())` if all actors stopped cleanly.
+    pub async fn await_all(&self) -> Result<(), String> {
+        let handles: Vec<_> = {
+            let mut map = self.join_handles.lock().unwrap();
+            map.drain().map(|(_, jh)| jh).collect()
+        };
+        for jh in handles {
+            jh.await.map_err(|e| format!("actor task failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Number of actors with stored JoinHandles.
+    pub fn active_handle_count(&self) -> usize {
+        self.join_handles.lock().unwrap().len()
     }
 }
 
