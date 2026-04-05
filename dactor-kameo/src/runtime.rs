@@ -718,8 +718,8 @@ pub struct KameoRuntime {
     watch_manager: WatchManager,
     cancel_manager: CancelManager,
     node_directory: NodeDirectory,
-    /// Native kameo system actor refs (for transport routing).
-    system_actors: KameoSystemActorRefs,
+    /// Native kameo system actor refs (lazily started via `start_system_actors()`).
+    system_actors: Option<KameoSystemActorRefs>,
 }
 
 /// References to the native kameo system actors spawned by the runtime.
@@ -733,38 +733,21 @@ pub struct KameoSystemActorRefs {
 impl KameoRuntime {
     /// Create a new `KameoRuntime`.
     ///
-    /// Spawns native kameo system actors for remote operations.
+    /// System actors are not spawned until `start_system_actors()` is called.
+    /// This allows the runtime to be constructed outside a tokio context.
     pub fn new() -> Self {
         Self::create(NodeId("kameo-node".into()))
     }
 
     /// Create a new `KameoRuntime` with a specific node ID.
-    ///
-    /// Spawns native kameo system actors for remote operations.
     pub fn with_node_id(node_id: NodeId) -> Self {
         Self::create(node_id)
     }
 
     fn create(node_id: NodeId) -> Self {
-        use crate::system_actors::*;
-        use kameo::actor::Spawn;
-
-        let next_local = Arc::new(AtomicU64::new(1));
-
-        let spawn_mgr_ref = SpawnManagerActor::spawn_with_mailbox(
-            (node_id.clone(), TypeRegistry::new(), next_local.clone()),
-            kameo::mailbox::unbounded(),
-        );
-        let watch_mgr_ref =
-            WatchManagerActor::spawn_with_mailbox((), kameo::mailbox::unbounded());
-        let cancel_mgr_ref =
-            CancelManagerActor::spawn_with_mailbox((), kameo::mailbox::unbounded());
-        let node_dir_ref =
-            NodeDirectoryActor::spawn_with_mailbox((), kameo::mailbox::unbounded());
-
         Self {
             node_id,
-            next_local,
+            next_local: Arc::new(AtomicU64::new(1)),
             cluster_events: KameoClusterEvents::new(),
             outbound_interceptors: Arc::new(Vec::new()),
             drop_observer: None,
@@ -774,13 +757,38 @@ impl KameoRuntime {
             watch_manager: WatchManager::new(),
             cancel_manager: CancelManager::new(),
             node_directory: NodeDirectory::new(),
-            system_actors: KameoSystemActorRefs {
-                spawn_manager: spawn_mgr_ref,
-                watch_manager: watch_mgr_ref,
-                cancel_manager: cancel_mgr_ref,
-                node_directory: node_dir_ref,
-            },
+            system_actors: None,
         }
+    }
+
+    /// Spawn native kameo system actors for transport routing.
+    ///
+    /// Must be called from within a tokio runtime context. After this call,
+    /// `system_actor_refs()` returns the native actor references.
+    ///
+    /// Factory registrations made via `register_factory()` before this call
+    /// are forwarded to the native SpawnManagerActor.
+    pub fn start_system_actors(&mut self) {
+        use crate::system_actors::*;
+        use kameo::actor::Spawn;
+
+        let spawn_mgr_ref = SpawnManagerActor::spawn_with_mailbox(
+            (self.node_id.clone(), TypeRegistry::new(), self.next_local.clone()),
+            kameo::mailbox::unbounded(),
+        );
+        let watch_mgr_ref =
+            WatchManagerActor::spawn_with_mailbox((), kameo::mailbox::unbounded());
+        let cancel_mgr_ref =
+            CancelManagerActor::spawn_with_mailbox((), kameo::mailbox::unbounded());
+        let node_dir_ref =
+            NodeDirectoryActor::spawn_with_mailbox((), kameo::mailbox::unbounded());
+
+        self.system_actors = Some(KameoSystemActorRefs {
+            spawn_manager: spawn_mgr_ref,
+            watch_manager: watch_mgr_ref,
+            cancel_manager: cancel_mgr_ref,
+            node_directory: node_dir_ref,
+        });
     }
 
     /// Returns the node ID of this runtime.
@@ -789,8 +797,10 @@ impl KameoRuntime {
     }
 
     /// Access the native system actor references for transport routing.
-    pub fn system_actor_refs(&self) -> &KameoSystemActorRefs {
-        &self.system_actors
+    ///
+    /// Returns `None` if `start_system_actors()` has not been called yet.
+    pub fn system_actor_refs(&self) -> Option<&KameoSystemActorRefs> {
+        self.system_actors.as_ref()
     }
 
     /// Add a global outbound interceptor.
