@@ -389,3 +389,99 @@ async fn sa10_local_and_remote_spawn_ids_dont_collide() {
         "local spawn ({}) and remote spawn ({}) should have different local IDs",
         local_id.local, remote_id.local);
 }
+
+// ---------------------------------------------------------------------------
+// NR2: Cluster event emission
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn nr2_connect_peer_emits_node_joined() {
+    use dactor::{ClusterEvent, ClusterEvents};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mut runtime = CoerceRuntime::new();
+    let joined_count = std::sync::Arc::new(AtomicU64::new(0));
+    let joined_clone = joined_count.clone();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+
+    runtime.cluster_events().subscribe(Box::new(move |event| {
+        if matches!(event, ClusterEvent::NodeJoined(_)) {
+            joined_clone.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        captured_clone.lock().unwrap().push(event);
+    })).unwrap();
+
+    runtime.connect_peer(NodeId("peer-1".into()), None);
+    assert_eq!(joined_count.load(AtomicOrdering::SeqCst), 1);
+
+    let events = captured.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0], ClusterEvent::NodeJoined(NodeId("peer-1".into())));
+}
+
+#[tokio::test]
+async fn nr2_disconnect_peer_emits_node_left() {
+    use dactor::{ClusterEvent, ClusterEvents};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mut runtime = CoerceRuntime::new();
+    let left_count = std::sync::Arc::new(AtomicU64::new(0));
+    let left_clone = left_count.clone();
+
+    runtime.cluster_events().subscribe(Box::new(move |event| {
+        if matches!(event, ClusterEvent::NodeLeft(_)) {
+            left_clone.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    })).unwrap();
+
+    let peer = NodeId("peer-1".into());
+    runtime.connect_peer(peer.clone(), None);
+    runtime.disconnect_peer(&peer);
+
+    assert_eq!(left_count.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn nr2_reconnect_emits_only_one_join() {
+    use dactor::{ClusterEvent, ClusterEvents};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mut runtime = CoerceRuntime::new();
+    let joined_count = std::sync::Arc::new(AtomicU64::new(0));
+    let joined_clone = joined_count.clone();
+
+    runtime.cluster_events().subscribe(Box::new(move |event| {
+        if matches!(event, ClusterEvent::NodeJoined(_)) {
+            joined_clone.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    })).unwrap();
+
+    let peer = NodeId("peer-1".into());
+    runtime.connect_peer(peer.clone(), None);
+    // Reconnect same peer (already connected) — should not emit again
+    runtime.connect_peer(peer.clone(), None);
+
+    assert_eq!(joined_count.load(AtomicOrdering::SeqCst), 1,
+        "reconnecting an already-connected peer should not emit NodeJoined again");
+}
+
+#[tokio::test]
+async fn nr2_disconnect_unconnected_does_not_emit() {
+    use dactor::{ClusterEvent, ClusterEvents};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mut runtime = CoerceRuntime::new();
+    let left_count = std::sync::Arc::new(AtomicU64::new(0));
+    let left_clone = left_count.clone();
+
+    runtime.cluster_events().subscribe(Box::new(move |event| {
+        if matches!(event, ClusterEvent::NodeLeft(_)) {
+            left_clone.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    })).unwrap();
+
+    // Disconnect a peer that was never connected
+    runtime.disconnect_peer(&NodeId("unknown".into()));
+    assert_eq!(left_count.load(AtomicOrdering::SeqCst), 0);
+}
