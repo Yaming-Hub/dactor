@@ -148,8 +148,8 @@ Findings were consolidated, addressed, and verified before merge. Key patterns f
 | 2026-03-31 | PR 10 | Lifecycle: stop(), on_error→ErrorAction, expanded ActorContext |
 | 2026-03-31 | PR 11 | MailboxConfig (Unbounded/Bounded), OverflowStrategy, MailboxSender/Receiver |
 | 2026-03-31 | PR 12 | ChildTerminated message, watch/unwatch, type-erased watcher notifications |
-| 2026-03-31 | PR 13 | StreamHandler, StreamSender, BoxStream, stream() on TypedActorRef |
-| 2026-03-31 | PR 14 | FeedMessage, FeedHandler, StreamReceiver, feed() with drain task |
+| 2026-03-31 | PR 13 | ExpandHandler, StreamSender, BoxStream, expand() on TypedActorRef |
+| 2026-03-31 | PR 14 | FeedMessage, ReduceHandler, StreamReceiver, reduce() with drain task |
 | 2026-03-31 | PR 15 | CancellationToken, ctx.cancelled(), cancel_after(), RuntimeError::Cancelled |
 | 2026-04-01 | PR 16 | ActorError with ErrorCode/details/chain, NotSupportedError, 11 error codes |
 | 2026-04-01 | PR 17 | Persistence traits (Journal/Snapshot/State storage), InMemoryStorage, PersistenceId |
@@ -235,10 +235,10 @@ Real multi-process cluster tests using dactor-test-harness with gRPC control:
 | B1 | BatchConfig (max_items + max_delay + max_bytes) | ✅ Done |
 | B2 | BatchWriter (generic push + Vec\<u8\>::push_bytes) | ✅ Done |
 | B3 | BatchReader (unbatching) | ✅ Done |
-| B4 | Merged stream()/stream_batched() → Option\<BatchConfig\> | ✅ Done |
-| B5 | Merged feed()/feed_batched() → Option\<BatchConfig\> | ✅ Done |
+| B4 | Merged expand()/expand_batched() → Option\<BatchConfig\> | ✅ Done |
+| B5 | Merged reduce()/reduce_batched() → Option\<BatchConfig\> | ✅ Done |
 | B6 | Removed FeedMessage trait (direct Item/Reply generics) | ✅ Done |
-| B7 | Per-item on_stream_item interception with Disposition | ✅ Done |
+| B7 | Per-item on_expand_item interception with Disposition | ✅ Done |
 | B8 | DropObserver trait for observing interceptor drops | ✅ Done |
 | B9 | runtime_support module (shared OutboundPipeline helpers) | ✅ Done |
 | B10 | ContentLength built-in header | ✅ Done |
@@ -737,18 +737,18 @@ dactor currently supports three streaming call patterns:
 
 | Pattern | Method | Direction | Description |
 |---------|--------|-----------|-------------|
-| **stream** | `actor_ref.stream(msg)` | Actor → Caller | Actor produces a stream of items to the caller |
-| **feed** | `actor_ref.feed(input)` | Caller → Actor | Caller sends a stream of items to the actor, gets a single reply |
+| **expand** | `actor_ref.expand(msg)` | Actor → Caller | Actor produces a stream of items to the caller |
+| **reduce** | `actor_ref.reduce(input)` | Caller → Actor | Caller sends a stream of items to the actor, gets a single reply |
 | **ask** | `actor_ref.ask(msg)` | Caller ↔ Actor | Single request, single reply |
 
 Missing: **transform** — caller sends a stream of items, actor produces a
 stream of transformed items (bidirectional streaming).
 
 Currently listed under "Not Planned" as "Bidirectional streaming — composed
-from feed() + stream() at app level". However, the compose-it-yourself
+from reduce() + expand() at app level". However, the compose-it-yourself
 approach has significant drawbacks:
 
-1. **Two separate channels** — feed() and stream() create independent
+1. **Two separate channels** — reduce() and expand() create independent
    mailbox entries, so ordering between input consumption and output
    production is not guaranteed.
 2. **No backpressure coupling** — if the output stream is slow to consume,
@@ -809,8 +809,8 @@ perspective, these names may be confusing:
 |-------------|------------------|--------------|
 | `tell(msg)` → no reply | **Fire-and-forget** | `tell` (no change) |
 | `ask(msg)` → single reply | **Request-Reply** (1→1) | `ask` (no change) |
-| `stream(msg)` → stream of items | **Expand** (1→N) — one request expands into many items | `expand` |
-| `feed(input)` → single reply | **Reduce** (N→1) — consume stream, produce aggregate | `reduce` |
+| `expand(msg)` → stream of items | **Expand** (1→N) — one request expands into many items | `expand` |
+| `reduce(input)` → single reply | **Reduce** (N→1) — consume stream, produce aggregate | `reduce` |
 | `transform(input)` → stream of items | **Transform** (N→M) — consume stream, produce stream | `transform` |
 
 **Proposed full naming scheme (stream-processing aligned):**
@@ -818,8 +818,8 @@ perspective, these names may be confusing:
 ```
 tell(msg)              → tell(msg)              // 1→0  fire-and-forget
 ask(msg)               → ask(msg)               // 1→1  request-reply
-stream(msg)            → expand(msg)            // 1→N  one request, many results
-feed(input)            → reduce(input)          // N→1  many inputs, one result
+expand(msg)            → expand(msg)            // 1→N  one request, many results
+reduce(input)            → reduce(input)          // N→1  many inputs, one result
 transform(input)       → transform(input)       // N→M  many inputs, many results
 ```
 

@@ -63,7 +63,7 @@
 |---|---|---|
 | `Outcome::AskSuccess { reply: &dyn Any }` needs lifetime `<'a>` | Sonnet | 🟡 |
 | `impl<M> Message for M` blanket impl in ClosureActor — conflicts | Sonnet | 🟡 |
-| ToggleableInterceptor missing `on_complete`/`on_stream_item` delegation | Haiku | ✅ Fixed |
+| ToggleableInterceptor missing `on_complete`/`on_expand_item` delegation | Haiku | ✅ Fixed |
 
 ---
 

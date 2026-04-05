@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dactor::actor::{
-    cancel_after, Actor, ActorContext, ActorRef, FeedHandler, Handler, StreamHandler,
+    cancel_after, Actor, ActorContext, ActorRef, ReduceHandler, Handler, ExpandHandler,
 };
 use dactor::circuit_breaker::CircuitBreakerInterceptor;
 use dactor::dead_letter::CollectingDeadLetterHandler;
@@ -70,8 +70,8 @@ impl Handler<GetStatus> for TaskProcessor {
 }
 
 #[async_trait]
-impl StreamHandler<StreamItems> for TaskProcessor {
-    async fn handle_stream(
+impl ExpandHandler<StreamItems> for TaskProcessor {
+    async fn handle_expand(
         &mut self,
         _msg: StreamItems,
         sender: StreamSender<u32>,
@@ -86,8 +86,8 @@ impl StreamHandler<StreamItems> for TaskProcessor {
 }
 
 #[async_trait]
-impl FeedHandler<u64, u64> for TaskProcessor {
-    async fn handle_feed(&mut self, mut rx: StreamReceiver<u64>, _ctx: &mut ActorContext) -> u64 {
+impl ReduceHandler<u64, u64> for TaskProcessor {
+    async fn handle_reduce(&mut self, mut rx: StreamReceiver<u64>, _ctx: &mut ActorContext) -> u64 {
         let mut sum = 0u64;
         while let Some(n) = rx.recv().await {
             sum += n;
@@ -159,7 +159,7 @@ async fn main() {
 
     // --- 3. Stream (server-streaming) ---
     println!("\n--- Stream: server-streaming items ---");
-    let mut stream = workers[1].stream(StreamItems, 8, None, None).unwrap();
+    let mut stream = workers[1].expand(StreamItems, 8, None, None).unwrap();
     let mut items = Vec::new();
     while let Some(n) = stream.next().await {
         items.push(n);
@@ -170,7 +170,7 @@ async fn main() {
     println!("\n--- Feed: client-streaming sum ---");
     let input = futures::stream::iter(vec![10u64, 20, 30]);
     let sum = workers[2]
-        .feed::<u64, u64>(Box::pin(input), 8, None, None)
+        .reduce::<u64, u64>(Box::pin(input), 8, None, None)
         .unwrap()
         .await
         .unwrap();
@@ -243,3 +243,4 @@ async fn main() {
 
     println!("\n=== Done ===");
 }
+

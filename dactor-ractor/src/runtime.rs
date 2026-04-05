@@ -13,10 +13,10 @@ use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use dactor::actor::{
-    Actor, ActorContext, ActorError, ActorRef, AskReply, FeedHandler, Handler, StreamHandler,
+    Actor, ActorContext, ActorError, ActorRef, AskReply, ReduceHandler, Handler, ExpandHandler,
 };
 use dactor::dead_letter::{DeadLetterEvent, DeadLetterHandler, DeadLetterReason};
-use dactor::dispatch::{AskDispatch, Dispatch, FeedDispatch, StreamDispatch, TypedDispatch};
+use dactor::dispatch::{AskDispatch, Dispatch, ReduceDispatch, ExpandDispatch, TypedDispatch};
 use dactor::errors::{ActorSendError, ErrorAction, RuntimeError};
 use dactor::interceptor::{
     Disposition, DropObserver, InboundContext, InboundInterceptor, OutboundInterceptor, Outcome,
@@ -26,7 +26,7 @@ use dactor::mailbox::MailboxConfig;
 use dactor::message::{Headers, Message, RuntimeHeaders};
 use dactor::node::{ActorId, NodeId};
 use dactor::runtime_support::{
-    spawn_feed_batched_drain, spawn_feed_drain, wrap_batched_stream_with_interception,
+    spawn_reduce_batched_drain, spawn_reduce_drain, wrap_batched_stream_with_interception,
     wrap_stream_with_interception, OutboundPipeline,
 };
 use dactor::stream::{
@@ -491,7 +491,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         Ok(AskReply::new(rx))
     }
 
-    fn stream<M>(
+    fn expand<M>(
         &self,
         msg: M,
         buffer: usize,
@@ -499,11 +499,11 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, ActorSendError>
     where
-        A: StreamHandler<M>,
+        A: ExpandHandler<M>,
         M: Message,
     {
         let pipeline = self.outbound_pipeline();
-        let result = pipeline.run_on_send(SendMode::Stream, &msg);
+        let result = pipeline.run_on_send(SendMode::Expand, &msg);
         match result.disposition {
             Disposition::Continue => {}
             Disposition::Delay(_) => {}
@@ -525,7 +525,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         let buffer = buffer.max(1);
         let (tx, mut rx) = tokio::sync::mpsc::channel(buffer);
         let sender = StreamSender::new(tx);
-        let dispatch: Box<dyn Dispatch<A>> = Box::new(StreamDispatch {
+        let dispatch: Box<dyn Dispatch<A>> = Box::new(ExpandDispatch {
             msg,
             sender,
             cancel,
@@ -585,7 +585,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         }
     }
 
-    fn feed<Item, Reply>(
+    fn reduce<Item, Reply>(
         &self,
         input: BoxStream<Item>,
         buffer: usize,
@@ -593,7 +593,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         cancel: Option<CancellationToken>,
     ) -> Result<AskReply<Reply>, ActorSendError>
     where
-        A: FeedHandler<Item, Reply>,
+        A: ReduceHandler<Item, Reply>,
         Item: Send + 'static,
         Reply: Send + 'static,
     {
@@ -601,7 +601,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         let (item_tx, item_rx) = tokio::sync::mpsc::channel(buffer);
         let receiver = StreamReceiver::new(item_rx);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let dispatch: Box<dyn Dispatch<A>> = Box::new(FeedDispatch {
+        let dispatch: Box<dyn Dispatch<A>> = Box::new(ReduceDispatch {
             receiver,
             reply_tx,
             cancel: cancel.clone(),
@@ -613,7 +613,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         let pipeline = self.outbound_pipeline();
         match batch_config {
             Some(batch_config) => {
-                spawn_feed_batched_drain(
+                spawn_reduce_batched_drain(
                     input,
                     item_tx,
                     buffer,
@@ -624,7 +624,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
                 );
             }
             None => {
-                spawn_feed_drain(
+                spawn_reduce_drain(
                     input,
                     item_tx,
                     cancel,

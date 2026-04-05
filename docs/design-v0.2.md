@@ -288,7 +288,7 @@ classDiagram
         +id() ActorId
         +tell(M)
         +ask(M, Option~CancellationToken~) M::Reply
-        +stream(M, buffer, Option~CancellationToken~) BoxStream
+        +expand(M, buffer, Option~CancellationToken~) BoxStream
         +is_alive() bool
     }
     class ActorRuntime {
@@ -833,7 +833,7 @@ impl<A: Actor> ActorRef<A> {
     where A: Handler<M>, M: Message { ... }
 
     /// Request-stream: send a request and receive a stream of responses.
-    pub fn stream<M>(
+    pub fn expand<M>(
         &self, msg: M, buffer: usize, cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, RuntimeError>
     where A: Handler<M>, M: Message { ... }
@@ -961,7 +961,7 @@ pub struct ActorContext {
     pub actor_id: ActorId,
     /// The name the actor was spawned with.
     pub actor_name: String,
-    /// How the message was sent (Tell, Ask, Stream, Feed).
+    /// How the message was sent (Tell, Ask, Expand, Reduce).
     pub send_mode: SendMode,
 }
 
@@ -1090,14 +1090,14 @@ sequenceDiagram
     A-->>C: M::Reply
 
     Note over C,A: 3. Stream (server-streaming)
-    C->>A: stream(msg, buffer)
+    C->>A: expand(msg, buffer)
     A-->>C: item 1
     A-->>C: item 2
     A-->>C: item N
     A-->>C: (stream ends)
 
     Note over C,A: 4. Feed (client-streaming)
-    C->>A: feed(msg, input_stream)
+    C->>A: reduce(msg, input_stream)
     C->>A: item 1
     C->>A: item 2
     C->>A: item N
@@ -1241,7 +1241,7 @@ streaming is the dominant RPC pattern for streaming data. In Rust, the async
 `tokio::sync::mpsc` channels convert naturally into streams via
 `tokio_stream::wrappers::ReceiverStream`.
 
-dactor should provide a `stream()` method on actor references that sends a
+dactor should provide a `expand()` method on actor references that sends a
 request to an actor and returns an async stream of response items. This enables
 use cases like:
 
@@ -1257,7 +1257,7 @@ use std::pin::Pin;
 use futures_core::Stream;
 
 /// A pinned, boxed, Send-safe async stream of items.
-/// This is the return type from `StreamRef::stream()` — the caller
+/// This is the return type from `StreamRef::expand()` — the caller
 /// consumes it with `while let Some(item) = stream.next().await`.
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
@@ -1324,21 +1324,21 @@ impl<A: Actor> ActorRef<A> {
     ///
     /// Returns `Err(RuntimeError::NotSupported)` if the adapter doesn't
     /// support streaming.
-    pub fn stream<M>(
+    pub fn expand<M>(
         &self,
         msg: M,
         buffer: usize,
         cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, RuntimeError>
     where
-        A: StreamHandler<M>,
+        A: ExpandHandler<M>,
         M: Message;
 }
 ```
 
-**`StreamHandler` trait:**
+**`ExpandHandler` trait:**
 
-Actors that produce a stream of responses implement `StreamHandler<M>` instead
+Actors that produce a stream of responses implement `ExpandHandler<M>` instead
 of `Handler<M>`. The handler receives a `StreamSender` to push items into;
 the caller receives them as a `BoxStream` on the other end:
 
@@ -1347,7 +1347,7 @@ the caller receives them as a `BoxStream` on the other end:
 /// The handler receives a `StreamSender<M::Reply>` to push items into.
 /// When the handler returns (or drops the sender), the stream closes.
 #[async_trait]
-pub trait StreamHandler<M: Message>: Actor {
+pub trait ExpandHandler<M: Message>: Actor {
     async fn handle_stream(
         &mut self,
         msg: M,
@@ -1365,7 +1365,7 @@ sequenceDiagram
     participant A as Adapter Layer
     participant H as Actor Handler
 
-    C->>A: stream(request, buf=16)
+    C->>A: expand(request, buf=16)
     A->>A: create mpsc(16)
     A->>A: tx = StreamSender, rx = ReceiverStream
     A->>H: deliver (request, tx)
@@ -1395,7 +1395,7 @@ dropped, closing the channel. The actor's next `tx.send()` returns
 use tokio_stream::StreamExt;
 
 async fn get_logs(log_actor: &ActorRef<LogServer>) {
-    let mut stream = log_actor.stream(GetLogs { since: yesterday() }, 32, None).unwrap();
+    let mut stream = log_actor.expand(GetLogs { since: yesterday() }, 32, None).unwrap();
 
     while let Some(entry) = stream.next().await {
         println!("{}: {}", entry.timestamp, entry.message);
@@ -1407,7 +1407,7 @@ async fn get_logs(log_actor: &ActorRef<LogServer>) {
 
 ```rust
 // The actor receives a tuple of (request, StreamSender)
-// when dispatched via stream(). The adapter wraps the handler.
+// when dispatched via expand(). The adapter wraps the handler.
 async fn handle_get_logs(request: GetLogs, tx: StreamSender<LogEntry>) {
     for entry in database.query_logs(request.since).await {
         if tx.send(entry).await.is_err() {
@@ -1425,11 +1425,11 @@ complete matrix (mirroring gRPC's four RPC types):
 |---|---|---|---|
 | `tell()` | single message | no reply | — |
 | `ask()` | single message | single reply | Unary |
-| `stream()` | single message | stream of replies | Server streaming |
-| `feed()` | stream of items | optional single reply | Client streaming |
+| `expand()` | single message | stream of replies | Server streaming |
+| `reduce()` | stream of items | optional single reply | Client streaming |
 
-All four are methods on `ActorRef<A>`, providing a unified API. The `feed()`
-pattern is detailed in §4.12; batching for both `stream()` and `feed()` is
+All four are methods on `ActorRef<A>`, providing a unified API. The `reduce()`
+pattern is detailed in §4.12; batching for both `expand()` and `reduce()` is
 covered in §4.11.1.
 
 **Dependencies:** The core crate adds `futures-core` (for the `Stream` trait)
@@ -1438,7 +1438,7 @@ and standard in the async Rust ecosystem.
 
 #### 4.11.1 Stream & Feed Batching
 
-**Problem:** In both `stream()` and `feed()`, each item is an independent
+**Problem:** In both `expand()` and `reduce()`, each item is an independent
 message through the channel (and over the wire for remote actors). For
 high-throughput streams with small items (e.g., sensor readings, log lines,
 pixel rows), per-item overhead dominates: serialization framing, channel
@@ -1483,7 +1483,7 @@ impl Default for BatchConfig {
 ```rust
 impl<A: Actor> ActorRef<A> {
     /// Send a request and receive a stream of responses, with optional batching.
-    pub fn stream<M>(
+    pub fn expand<M>(
         &self,
         msg: M,
         buffer: usize,
@@ -1495,7 +1495,7 @@ impl<A: Actor> ActorRef<A> {
         M: Message;
 
     /// Feed an async stream into the actor, with optional batching.
-    pub fn feed<Item, Reply>(
+    pub fn reduce<Item, Reply>(
         &self,
         input: BoxStream<Item>,
         buffer: usize,
@@ -1503,7 +1503,7 @@ impl<A: Actor> ActorRef<A> {
         cancel: Option<CancellationToken>,
     ) -> Result<AskReply<Reply>, ActorSendError>
     where
-        A: FeedHandler<Item, Reply>,
+        A: ReduceHandler<Item, Reply>,
         Item: Send + 'static,
         Reply: Send + 'static;
 }
@@ -1559,12 +1559,12 @@ as usual.
 | `max_items=64, max_delay=5ms` | Good (default) | ≤5ms added latency |
 | `max_items=256, max_delay=50ms` | Best for bulk transfer | Higher latency acceptable |
 
-> **Note:** Pass `batch_config: None` to `stream()` and `feed()` for
+> **Note:** Pass `batch_config: None` to `expand()` and `reduce()` for
 > per-item delivery with no batching. Batching is opt-in.
 
 ### 4.12 Feed (Client-Streaming / Stream-to-Actor)
 
-**Rationale:** The `stream()` pattern (§4.11) covers *server-streaming* — one
+**Rationale:** The `expand()` pattern (§4.11) covers *server-streaming* — one
 request yields many response items. The inverse pattern is equally important:
 the caller has an async stream of items to feed into an actor, which digests
 them and optionally returns a final result. Use cases include:
@@ -1616,7 +1616,7 @@ impl<T: Send + 'static> StreamReceiver<T> {
 /// The handler receives a `StreamReceiver` to pull items from.
 /// It returns a final reply after processing.
 #[async_trait]
-pub trait FeedHandler<Item: Send + 'static, Reply: Send + 'static>: Actor {
+pub trait ReduceHandler<Item: Send + 'static, Reply: Send + 'static>: Actor {
     async fn handle_feed(
         &mut self,
         receiver: StreamReceiver<Item>,
@@ -1632,7 +1632,7 @@ impl<A: Actor> ActorRef<A> {
     /// Feed an async stream of items into the actor and await a final reply.
     ///
     /// `input` is an async stream the caller provides. The runtime drains
-    /// items from it and delivers them to the actor's `FeedHandler`.
+    /// items from it and delivers them to the actor's `ReduceHandler`.
     ///
     /// `buffer` controls the internal channel capacity (backpressure).
     ///
@@ -1643,7 +1643,7 @@ impl<A: Actor> ActorRef<A> {
     ///
     /// Returns the actor's final reply after the stream is fully consumed
     /// (or cancelled).
-    pub fn feed<Item, Reply>(
+    pub fn reduce<Item, Reply>(
         &self,
         input: BoxStream<Item>,
         buffer: usize,
@@ -1651,7 +1651,7 @@ impl<A: Actor> ActorRef<A> {
         cancel: Option<CancellationToken>,
     ) -> Result<AskReply<Reply>, ActorSendError>
     where
-        A: FeedHandler<Item, Reply>,
+        A: ReduceHandler<Item, Reply>,
         Item: Send + 'static,
         Reply: Send + 'static;
 }
@@ -1663,9 +1663,9 @@ impl<A: Actor> ActorRef<A> {
 sequenceDiagram
     participant C as Caller
     participant A as Adapter Layer
-    participant H as Actor FeedHandler
+    participant H as Actor ReduceHandler
 
-    C->>A: feed(config, input_stream, buf=16)
+    C->>A: reduce(config, input_stream, buf=16)
     A->>A: create mpsc(16)
     A->>A: tx = Sender, rx = StreamReceiver
     A->>A: spawn drain task: input_stream → tx
@@ -1699,7 +1699,7 @@ the caller's input stream. No unbounded buffering occurs.
 struct Aggregator;
 
 #[async_trait]
-impl FeedHandler<i64, i64> for Aggregator {
+impl ReduceHandler<i64, i64> for Aggregator {
     async fn handle_feed(
         &mut self,
         mut receiver: StreamReceiver<i64>,
@@ -1738,7 +1738,7 @@ async fn compute_sum(aggregator: &ActorRef<Aggregator>) -> i64 {
 
 ```rust
 #[async_trait]
-impl FeedHandler<Bytes, UploadResult> for StorageActor {
+impl ReduceHandler<Bytes, UploadResult> for StorageActor {
     async fn handle_feed(
         &mut self,
         mut receiver: StreamReceiver<Bytes>,
@@ -1762,24 +1762,24 @@ the provider's transport. Stream items are sent as a sequence of serialized
 payloads on the same logical channel.
 
 **Interceptor visibility:** The **real interception** happens per-Item
-via `on_stream_item()`:
+via `on_expand_item()`:
 
-- **Outbound `on_stream_item()`:** called on the caller side for each Item
+- **Outbound `on_expand_item()`:** called on the caller side for each Item
   *before* it is sent to the actor. This is where throttling interceptors
   can observe per-item data and make rate-limiting decisions.
-- **Inbound `on_stream_item()`:** called on the actor side as each Item
+- **Inbound `on_expand_item()`:** called on the actor side as each Item
   is delivered from the `StreamReceiver`.
 
 The final reply is visible to `OutboundInterceptor::on_reply`.
 
 > **Note:** Bidirectional streaming (stream in + stream out) can be composed
-> from `feed()` + actor-internal `stream()`, or by having the `FeedHandler`
+> from `reduce()` + actor-internal `expand()`, or by having the `ReduceHandler`
 > return a `BoxStream` as its reply type. This is left as an application-level
 > composition rather than a first-class primitive, to keep the core API simple.
 
 ### 4.13 Cancellation
 
-Cancellation applies to `ask()`, `stream()`, and `feed()` — the design is
+Cancellation applies to `ask()`, `expand()`, and `reduce()` — the design is
 identical. `tell()` is fire-and-forget and does not support cancellation.
 
 **The problem:** Actors process messages sequentially on a single task
@@ -1794,7 +1794,7 @@ through `ActorContext`. The handler is never *interrupted* mid-computation
 
 #### 4.13.1 Local Cancellation
 
-For local `ask()` / `stream()`, the caller's `CancellationToken` is passed
+For local `ask()` / `expand()`, the caller's `CancellationToken` is passed
 directly to the runtime, which makes it available via `ctx.cancelled()`:
 
 ```rust
@@ -1957,7 +1957,7 @@ handler against `local_token.cancelled()`. This means:
 
 #### 4.13.5 Cancellation Outcomes
 
-| Scenario | `ask()` result | `stream()` result | `feed()` result |
+| Scenario | `ask()` result | `expand()` result | `reduce()` result |
 |---|---|---|---|
 | Token cancelled before handler starts | `Err(Cancelled)` | `Err(Cancelled)` — stream never opens | `Err(Cancelled)` — input stream not drained |
 | Token cancelled during handler | `Err(Cancelled)` | Stream closes, `StreamSender` returns `ConsumerDropped` | Drain task stops, `StreamReceiver` yields `None`, handler can finalize early |
@@ -2095,7 +2095,7 @@ impl<A: Actor> PoolRef<A> {
     where A: Handler<M>, M: Message + Keyed { ... }
 
     /// Request-stream: route a message to a pool worker and receive a stream.
-    pub fn stream<M>(
+    pub fn expand<M>(
         &self, msg: M, buffer: usize, cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, RuntimeError>
     where A: Handler<M>, M: Message { ... }
@@ -2589,7 +2589,7 @@ pub enum Disposition {
     /// already in the queue are not affected.
     ///
     /// **Outbound (on_send):** The delay occurs before the message is sent,
-    /// blocking the caller's `tell()`/`ask()`/`stream()`/`feed()` call for
+    /// blocking the caller's `tell()`/`ask()`/`expand()`/`reduce()` call for
     /// the specified duration. This provides natural caller-side throttling.
     ///
     /// Multiple interceptors can each return `Delay` — delays are cumulative.
@@ -2604,7 +2604,7 @@ pub enum Disposition {
     /// - `tell()`: behaves like `Drop` (fire-and-forget has no error path)
     /// - `ask()`: sender receives `Err(RuntimeError::Rejected { interceptor, reason })`
     ///   immediately — giving a clear, actionable error
-    /// - `stream()` / `feed()`: sender receives `Err(RuntimeError::Rejected { .. })`
+    /// - `expand()` / `reduce()`: sender receives `Err(RuntimeError::Rejected { .. })`
     ///   before any stream items flow
     Reject(String),
     /// Tell the caller to retry after the suggested duration. Unlike `Delay`
@@ -2618,7 +2618,7 @@ pub enum Disposition {
     /// Semantics per send mode:
     /// - `tell()`: behaves like `Drop` (fire-and-forget has no error path)
     /// - `ask()`: sender receives `Err(RuntimeError::RetryAfter { interceptor, retry_after })`
-    /// - `stream()` / `feed()`: same as `ask()`
+    /// - `expand()` / `reduce()`: same as `ask()`
     Retry(Duration),
 }
 ```
@@ -2694,8 +2694,8 @@ pub struct InboundContext<'a> {
 pub enum SendMode {
     Tell,
     Ask,
-    Stream,
-    Feed,
+    Expand,
+    Reduce,
 }
 
 /// An interceptor that can observe or modify messages in transit.
@@ -2723,25 +2723,25 @@ pub enum SendMode {
 ///
 /// ### `Stream` (request-stream)
 /// ```text
-/// on_receive → handler starts → on_stream_item per item
+/// on_receive → handler starts → on_expand_item per item
 ///                              → on_complete(outcome=StreamCompleted)   if stream ends normally
 ///                              → on_complete(outcome=StreamCancelled)   if consumer drops stream
 ///                              → on_complete(outcome=HandlerError)      if handler fails
 /// ```
 /// `on_complete` is called exactly **once** at the end of the stream,
-/// not per item. For per-item observation, use `on_stream_item`.
+/// not per item. For per-item observation, use `on_expand_item`.
 ///
 /// ### `Feed` (client-streaming)
 /// ```text
 /// on_receive → handler starts consuming StreamReceiver
-///   → on_stream_item per input item   (as items arrive from caller)
+///   → on_expand_item per input item   (as items arrive from caller)
 ///   → on_complete(outcome=Replied)         if handler returns Ok
 ///   → on_complete(outcome=HandlerError)    if handler fails
 ///   → on_complete(outcome=StreamCancelled) if cancel token fires
 /// ```
-/// The real interception happens per-Item via `on_stream_item`.
+/// The real interception happens per-Item via `on_expand_item`.
 /// On the outbound (caller) side,
-/// `OutboundInterceptor::on_stream_item` fires for each Item *before*
+/// `OutboundInterceptor::on_expand_item` fires for each Item *before*
 /// it is sent to the actor — enabling per-item throttling and metrics.
 pub trait InboundInterceptor: Send + Sync + 'static {
     /// Human-readable name for this interceptor (e.g., "auth-check",
@@ -2781,7 +2781,7 @@ pub trait InboundInterceptor: Send + Sync + 'static {
     /// Called for each item emitted by a streaming handler.
     /// Only invoked when `send_mode == Stream`. Default is a no-op.
     /// The item is provided as `&dyn Any` for optional downcasting.
-    fn on_stream_item(
+    fn on_expand_item(
         &self,
         ctx: &InboundContext<'_>,
         headers: &Headers,
@@ -2898,10 +2898,10 @@ impl InboundInterceptor for RequestReplyLogger {
 |---|---|---|---|
 | `on_receive(ctx, runtime_headers, headers, msg)` | ✅ `message: &dyn Any` | ❌ | Before handler runs |
 | `on_complete(outcome)` | ❌ (stash in headers) | ✅ `AskSuccess { reply: &dyn Any }` | After handler finishes |
-| `on_stream_item(item)` | ❌ (stash in headers) | ✅ `item: &dyn Any` | Per stream item |
+| `on_expand_item(item)` | ❌ (stash in headers) | ✅ `item: &dyn Any` | Per stream item |
 
 Headers are the bridge — they're mutable in `on_receive` and readable in
-`on_complete` / `on_stream_item`, carrying data across the handler boundary.
+`on_complete` / `on_expand_item`, carrying data across the handler boundary.
 
 **Example: Logging interceptor (using external context crate)**
 
@@ -3120,10 +3120,10 @@ impl InboundInterceptor for ToggleableInterceptor {
         self.inner.on_complete(ctx, headers, outcome);
     }
 
-    fn on_stream_item(
+    fn on_expand_item(
         &self, ctx: &InboundContext<'_>, headers: &Headers, seq: u64, item: &dyn Any,
     ) {
-        self.inner.on_stream_item(ctx, headers, seq, item);
+        self.inner.on_expand_item(ctx, headers, seq, item);
     }
 }
 ```
@@ -3188,7 +3188,7 @@ pub trait OutboundInterceptor: Send + Sync + 'static {
 
     /// Called for each stream item received back on the sender side.
     /// Allows per-item observation from the sender's perspective.
-    fn on_stream_item(
+    fn on_expand_item(
         &self,
         ctx: &OutboundContext<'_>,
         headers: &Headers,
@@ -3220,7 +3220,7 @@ pub struct OutboundContext<'a> {
 |---|---|---|
 | **Request message** | `on_send(msg)` — before sending | `on_receive(msg)` — before handling |
 | **Ask reply** | `on_reply(outcome)` — when reply arrives back | `on_complete(AskSuccess)` — after handler returns |
-| **Stream item** | `on_stream_item(item)` — when item arrives back | `on_stream_item(item)` — when handler emits |
+| **Stream item** | `on_expand_item(item)` — when item arrives back | `on_expand_item(item)` — when handler emits |
 | **Stream end** | `on_reply(StreamCompleted)` — when stream ends | `on_complete(StreamCompleted)` — when handler finishes |
 | **Error** | `on_reply(HandlerError)` — when error arrives back | `on_complete(HandlerError)` — when handler fails |
 | **Can reject?** | ✅ `on_send` returns `Disposition` | ✅ `on_receive` returns `Disposition` |
@@ -5540,10 +5540,10 @@ runtime.set_message_serializer(Box::new(MyCustomSerializer));
 |---|---|
 | Remote `tell()` / `ask()` message body | ✅ |
 | Remote `ask()` reply | ✅ |
-| `stream()` items | ✅ |
-| `feed()` initial request | ✅ |
-| `feed()` streamed items | ✅ |
-| `feed()` final reply | ✅ |
+| `expand()` items | ✅ |
+| `reduce()` initial request | ✅ |
+| `reduce()` streamed items | ✅ |
+| `reduce()` final reply | ✅ |
 | Remote spawn `Args` | ✅ |
 | `ActorError` (including `ErrorPayload`) | ✅ |
 | `WireHeaders` (header values via `HeaderValue::to_bytes`) | ❌ — headers serialize themselves |
@@ -6328,7 +6328,7 @@ The actor has been spawned but `on_start()` has not completed.
 |---|---|
 | `tell()` | Message is **queued** in the mailbox. Delivered after `on_start()` completes. Returns `Ok(())` — the caller is unaware of the delay. |
 | `ask()` | The future **blocks** until `on_start()` completes and the handler processes the message. If using `ask_with(cancel)`, the cancellation token's deadline includes the `on_start()` wait time. |
-| `stream()` | Same as `ask()` — the stream setup is queued until `on_start()` completes. |
+| `expand()` | Same as `ask()` — the stream setup is queued until `on_start()` completes. |
 
 This is by design — `spawn()` returns an `ActorRef` immediately, and
 callers can start sending without waiting for initialization.
@@ -6342,7 +6342,7 @@ supervision decision).
 |---|---|---|
 | `tell()` | Returns `Err(RuntimeError::Send(...))`. The message is forwarded to the dead letter handler (§5.4). | `ActorSendError("actor stopped")` |
 | `ask()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Caller gets a structured error with the actor ID. |
-| `stream()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Same as `ask()`. |
+| `expand()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Same as `ask()`. |
 
 **Remote variant:** If the actor was on a remote node, the adapter may not
 immediately know it has stopped. The message is sent over the network, and
@@ -6359,7 +6359,7 @@ invalid (e.g., stale reference from a previous incarnation).
 |---|---|---|
 | `tell()` | Returns `Err(RuntimeError::Send(...))`. Message goes to dead letter handler. | `ActorSendError("actor not found")` |
 | `ask()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Immediate error — no network round-trip needed for local refs. |
-| `stream()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Same as `ask()`. |
+| `expand()` | Returns `Err(RuntimeError::Actor(ActorError { code: ActorNotFound, ... }))`. | Same as `ask()`. |
 
 **How can this happen?**
 - Stale `ActorRef` from before a restart (new incarnation, different `ActorId.local`)
@@ -8649,8 +8649,8 @@ For each feature and each adapter, there are exactly three possibilities:
 |---|:---:|:---:|:---:|---|
 | `tell()` | ✅ Library | ✅ Library | ✅ Library | ractor `cast()` / kameo `tell().try_send()` / coerce `notify()` |
 | `ask()` | ✅ Library | ✅ Library | ✅ Library | ractor `call()` / kameo `ask()` / coerce `send()` |
-| `stream()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has streaming; adapter creates `mpsc` channel shim |
-| `feed()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has client-streaming; adapter creates `mpsc` channel shim |
+| `expand()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has streaming; adapter creates `mpsc` channel shim |
+| `reduce()` | ⚙️ Adapter | ⚙️ Adapter | ⚙️ Adapter | No library has client-streaming; adapter creates `mpsc` channel shim |
 | `ActorRef::id()` | ✅ Library | ✅ Library | ✅ Library | Each library provides actor identity |
 | `ActorRef::is_alive()` | ✅ Library | ✅ Library | ✅ Library | Check actor cell / ref validity |
 | Lifecycle hooks | ✅ Library | ✅ Library | ✅ Library | ractor `pre_start`/`post_stop` / kameo `on_start`/`on_stop` / coerce lifecycle events |
@@ -8683,8 +8683,8 @@ For each feature and each adapter, there are exactly three possibilities:
 |---------|:---:|---|
 | `tell()` | ✅ Library | `ractor::ActorRef::cast()` |
 | `ask()` | ✅ Library | `ractor::ActorRef::call()` |
-| `stream()` | ⚙️ Adapter | ractor has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
-| `feed()` | ⚙️ Adapter | ractor has no client-streaming; adapter creates `mpsc` channel, drains caller's stream into actor's `StreamReceiver` |
+| `expand()` | ⚙️ Adapter | ractor has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
+| `reduce()` | ⚙️ Adapter | ractor has no client-streaming; adapter creates `mpsc` channel, drains caller's stream into actor's `StreamReceiver` |
 | `ActorRef::id()` | ✅ Library | `ractor::ActorRef::get_id()` → `ActorId` |
 | `ActorRef::is_alive()` | ✅ Library | Check ractor actor cell liveness |
 | Lifecycle hooks | ✅ Library | ractor `pre_start` / `post_stop` callbacks |
@@ -8707,8 +8707,8 @@ For each feature and each adapter, there are exactly three possibilities:
 |---------|:---:|---|
 | `tell()` | ✅ Library | `kameo::ActorRef::tell().try_send()` |
 | `ask()` | ✅ Library | `kameo::ActorRef::ask()` |
-| `stream()` | ⚙️ Adapter | kameo has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
-| `feed()` | ⚙️ Adapter | kameo has no client-streaming; adapter creates `mpsc` channel, drains caller's stream into actor's `StreamReceiver` |
+| `expand()` | ⚙️ Adapter | kameo has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
+| `reduce()` | ⚙️ Adapter | kameo has no client-streaming; adapter creates `mpsc` channel, drains caller's stream into actor's `StreamReceiver` |
 | `ActorRef::id()` | ✅ Library | `kameo::actor::ActorId` → `ActorId` |
 | `ActorRef::is_alive()` | ✅ Library | Check kameo actor ref validity |
 | Lifecycle hooks | ✅ Library | kameo `on_start` / `on_stop` hooks |
@@ -8731,8 +8731,8 @@ For each feature and each adapter, there are exactly three possibilities:
 |---------|:---:|---|
 | `tell()` | ✅ Library | `coerce::ActorRef::notify()` |
 | `ask()` | ✅ Library | `coerce::ActorRef::send()` — returns `Result` with reply |
-| `stream()` | ⚙️ Adapter | coerce has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
-| `feed()` | ⚙️ Adapter | coerce has no client-streaming; adapter creates `mpsc` channel, drains caller's stream into actor's `StreamReceiver` |
+| `expand()` | ⚙️ Adapter | coerce has no streaming; adapter creates `mpsc` channel, passes `StreamSender` to actor, returns `ReceiverStream` |
+| `reduce()` | ⚙️ Adapter | coerce has no client-streaming; adapter creates `mpsc` channel, drains caller's stream into actor's `StreamReceiver` |
 | `ActorRef::id()` | ✅ Library | coerce actors have identity via `ActorId` |
 | `ActorRef::is_alive()` | ✅ Library | coerce `ActorRef` tracks actor liveness (local and remote) |
 | Lifecycle hooks | ✅ Library | coerce `Actor` trait has lifecycle events |
@@ -8915,7 +8915,7 @@ dactor/src/
 
 7. **What's the threshold for adapter-level shims vs NotSupported?** → **Effort and correctness.** If the adapter can implement the feature correctly with reasonable overhead (e.g., bounded channel wrapper for ractor), use a shim. If the emulation would be incorrect, surprising, or prohibitively expensive (e.g., DropOldest requires draining a queue), return `NotSupported`.
 
-8. **Should `stream()` support bidirectional streaming?** → **Deferred.** Start with request-stream (one request, many responses). Bidirectional streaming (many-to-many) can be added later as a separate `BidiStreamRef` trait if there is demand. The channel-based approach naturally extends to this.
+8. **Should `expand()` support bidirectional streaming?** → **Deferred.** Start with request-stream (one request, many responses). Bidirectional streaming (many-to-many) can be added later as a separate `BidiStreamRef` trait if there is demand. The channel-based approach naturally extends to this.
 
 ---
 
@@ -9221,6 +9221,6 @@ These features exist in the provider but cannot be accessed through dactor:
 
 3. **Persistence**: Coerce's persistence model (journaling + snapshots) is a significant feature that dactor doesn't model. Consider adding a `Persistence` extension trait in a future version.
 
-4. **Streaming**: All providers require adapter-level shimming for `stream()`. Consider documenting the exact expected semantics (ordering, backpressure, cancellation) more precisely so all adapters implement consistent behavior.
+4. **Streaming**: All providers require adapter-level shimming for `expand()`. Consider documenting the exact expected semantics (ordering, backpressure, cancellation) more precisely so all adapters implement consistent behavior.
 
 5. **MessageSerializer pluggability**: Coerce's fixed protobuf transport limits dactor's pluggable serializer to payload-level only. Document this limitation clearly — the serializer controls message body encoding, not the transport framing.

@@ -93,8 +93,8 @@ type-erased `DactorMsg(Box<dyn Any>)` + TypeId-keyed dispatch table.
 **Goal:** Implement stream/feed via mpsc channel shims.
 
 **Changes:**
-- `stream()` → create mpsc, pass StreamSender to handler
-- `feed()` → create mpsc, spawn drain task
+- `expand()` → create mpsc, pass StreamSender to handler
+- `reduce()` → create mpsc, spawn drain task
 - Backpressure via bounded channels
 
 **Tests:**

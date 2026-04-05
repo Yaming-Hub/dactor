@@ -65,7 +65,7 @@ pub struct WireEnvelope {
     pub target_name: String,
     /// Rust type name of the message (for deserialization dispatch).
     pub message_type: String,
-    /// How the message was sent (Tell, Ask, Stream, Feed).
+    /// How the message was sent (Tell, Ask, Expand, Reduce).
     pub send_mode: SendMode,
     /// Serialized headers (string key → bytes).
     pub headers: WireHeaders,

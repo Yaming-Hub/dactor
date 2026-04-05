@@ -737,7 +737,7 @@ mod stream_tests {
     use async_trait::async_trait;
     use futures::StreamExt;
 
-    use dactor::actor::{Actor, ActorContext, ActorRef, StreamHandler};
+    use dactor::actor::{Actor, ActorContext, ActorRef, ExpandHandler};
     use dactor::message::Message;
     use dactor::stream::StreamSender;
     use dactor_ractor::RactorRuntime;
@@ -760,8 +760,8 @@ mod stream_tests {
     }
 
     #[async_trait]
-    impl StreamHandler<StreamN> for Streamer {
-        async fn handle_stream(
+    impl ExpandHandler<StreamN> for Streamer {
+        async fn handle_expand(
             &mut self,
             msg: StreamN,
             sender: StreamSender<u32>,
@@ -781,8 +781,8 @@ mod stream_tests {
     }
 
     #[async_trait]
-    impl StreamHandler<StreamEmpty> for Streamer {
-        async fn handle_stream(
+    impl ExpandHandler<StreamEmpty> for Streamer {
+        async fn handle_expand(
             &mut self,
             _msg: StreamEmpty,
             _sender: StreamSender<u32>,
@@ -797,7 +797,7 @@ mod stream_tests {
         let runtime = RactorRuntime::new();
         let actor = runtime.spawn::<Streamer>("streamer-items", ());
 
-        let stream = actor.stream(StreamN(5), 8, None, None).unwrap();
+        let stream = actor.expand(StreamN(5), 8, None, None).unwrap();
         let items: Vec<u32> = stream.collect().await;
         assert_eq!(items, vec![0, 1, 2, 3, 4]);
     }
@@ -807,7 +807,7 @@ mod stream_tests {
         let runtime = RactorRuntime::new();
         let actor = runtime.spawn::<Streamer>("streamer-empty", ());
 
-        let stream = actor.stream(StreamEmpty, 8, None, None).unwrap();
+        let stream = actor.expand(StreamEmpty, 8, None, None).unwrap();
         let items: Vec<u32> = stream.collect().await;
         assert!(items.is_empty());
     }
@@ -818,7 +818,7 @@ mod stream_tests {
         let actor = runtime.spawn::<Streamer>("streamer-drop", ());
 
         // Request a stream of 1000 items but only take 2
-        let stream = actor.stream(StreamN(1000), 1, None, None).unwrap();
+        let stream = actor.expand(StreamN(1000), 1, None, None).unwrap();
         let items: Vec<u32> = stream.take(2).collect().await;
         assert_eq!(items, vec![0, 1]);
 
@@ -835,7 +835,7 @@ mod stream_tests {
 mod feed_tests {
     use async_trait::async_trait;
 
-    use dactor::actor::{Actor, ActorContext, ActorRef, FeedHandler};
+    use dactor::actor::{Actor, ActorContext, ActorRef, ReduceHandler};
     use dactor::stream::{BoxStream, StreamReceiver};
     use dactor_ractor::RactorRuntime;
 
@@ -852,8 +852,8 @@ mod feed_tests {
     }
 
     #[async_trait]
-    impl FeedHandler<u64, u64> for Summer {
-        async fn handle_feed(
+    impl ReduceHandler<u64, u64> for Summer {
+        async fn handle_reduce(
             &mut self,
             mut receiver: StreamReceiver<u64>,
             _ctx: &mut ActorContext,
@@ -877,7 +877,7 @@ mod feed_tests {
 
         let input = items_stream(vec![1, 2, 3, 4, 5]);
         let reply = actor
-            .feed::<u64, u64>(input, 8, None, None)
+            .reduce::<u64, u64>(input, 8, None, None)
             .unwrap()
             .await
             .unwrap();
@@ -891,7 +891,7 @@ mod feed_tests {
 
         let input = items_stream(vec![]);
         let reply = actor
-            .feed::<u64, u64>(input, 8, None, None)
+            .reduce::<u64, u64>(input, 8, None, None)
             .unwrap()
             .await
             .unwrap();
@@ -1138,3 +1138,4 @@ mod mailbox_tests {
         actor.stop();
     }
 }
+

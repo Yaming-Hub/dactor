@@ -9,7 +9,7 @@ use std::any::Any;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{Actor, ActorContext, FeedHandler, Handler, StreamHandler};
+use crate::actor::{Actor, ActorContext, ReduceHandler, Handler, ExpandHandler};
 use crate::errors::RuntimeError;
 use crate::interceptor::{Disposition, SendMode};
 use crate::message::Message;
@@ -20,8 +20,8 @@ use crate::stream::{StreamReceiver, StreamSender};
 // ---------------------------------------------------------------------------
 
 /// Type-erased message envelope. Each concrete message type is wrapped in a
-/// `TypedDispatch<M>`, `AskDispatch<M>`, `StreamDispatch<M>`, or
-/// `FeedDispatch<M>` that knows how to invoke the appropriate handler.
+/// `TypedDispatch<M>`, `AskDispatch<M>`, `ExpandDispatch<M>`, or
+/// `ReduceDispatch<M>` that knows how to invoke the appropriate handler.
 #[async_trait]
 pub trait Dispatch<A: Actor>: Send {
     /// Dispatch the message to the actor's handler.
@@ -201,11 +201,11 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// StreamDispatch
+// ExpandDispatch
 // ---------------------------------------------------------------------------
 
 /// Stream envelope: carries the message and a StreamSender for pushing items.
-pub struct StreamDispatch<M: Message> {
+pub struct ExpandDispatch<M: Message> {
     /// The message payload.
     pub msg: M,
     /// Sender for pushing stream reply items.
@@ -215,13 +215,13 @@ pub struct StreamDispatch<M: Message> {
 }
 
 #[async_trait]
-impl<A, M> Dispatch<A> for StreamDispatch<M>
+impl<A, M> Dispatch<A> for ExpandDispatch<M>
 where
-    A: StreamHandler<M>,
+    A: ExpandHandler<M>,
     M: Message,
 {
     async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) -> DispatchResult {
-        actor.handle_stream(self.msg, self.sender, ctx).await;
+        actor.handle_expand(self.msg, self.sender, ctx).await;
         DispatchResult::tell()
     }
 
@@ -230,7 +230,7 @@ where
     }
 
     fn send_mode(&self) -> SendMode {
-        SendMode::Stream
+        SendMode::Expand
     }
 
     fn message_type_name(&self) -> &'static str {
@@ -247,11 +247,11 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// FeedDispatch
+// ReduceDispatch
 // ---------------------------------------------------------------------------
 
 /// Feed envelope: carries a StreamReceiver for items and a oneshot for the reply.
-pub struct FeedDispatch<Item: Send + 'static, Reply: Send + 'static> {
+pub struct ReduceDispatch<Item: Send + 'static, Reply: Send + 'static> {
     /// Receiver for incoming stream items.
     pub receiver: StreamReceiver<Item>,
     /// Channel to send the final reply back to the caller.
@@ -261,14 +261,14 @@ pub struct FeedDispatch<Item: Send + 'static, Reply: Send + 'static> {
 }
 
 #[async_trait]
-impl<A, Item, Reply> Dispatch<A> for FeedDispatch<Item, Reply>
+impl<A, Item, Reply> Dispatch<A> for ReduceDispatch<Item, Reply>
 where
-    A: FeedHandler<Item, Reply>,
+    A: ReduceHandler<Item, Reply>,
     Item: Send + 'static,
     Reply: Send + 'static,
 {
     async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) -> DispatchResult {
-        let reply = actor.handle_feed(self.receiver, ctx).await;
+        let reply = actor.handle_reduce(self.receiver, ctx).await;
         let reply_any: Box<dyn Any + Send> = Box::new(reply);
         let reply_tx = self.reply_tx;
         DispatchResult {
@@ -286,12 +286,12 @@ where
     }
 
     fn message_any(&self) -> &dyn Any {
-        // FeedDispatch has no message — return unit
+        // ReduceDispatch has no message — return unit
         &()
     }
 
     fn send_mode(&self) -> SendMode {
-        SendMode::Feed
+        SendMode::Reduce
     }
 
     fn message_type_name(&self) -> &'static str {
@@ -325,3 +325,4 @@ where
         self.cancel.clone()
     }
 }
+

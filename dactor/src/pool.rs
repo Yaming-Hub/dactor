@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{Actor, ActorRef, AskReply, FeedHandler, Handler, StreamHandler};
+use crate::actor::{Actor, ActorRef, AskReply, ReduceHandler, Handler, ExpandHandler};
 use crate::errors::ActorSendError;
 use crate::message::Message;
 #[cfg(feature = "metrics")]
@@ -88,7 +88,7 @@ pub trait Keyed {
 /// - **KeyBased** — messages routed via `tell_keyed()`/`ask_keyed()` use
 ///   [`Keyed::routing_key()`] for deterministic per-key routing (sticky
 ///   sessions). Messages sent via the standard `ActorRef` methods
-///   (`tell()`/`ask()`/`stream()`/`feed()`) fall back to round-robin,
+///   (`tell()`/`ask()`/`expand()`/`reduce()`) fall back to round-robin,
 ///   since the trait can't enforce `Keyed` bounds.
 pub struct PoolRef<A: Actor, R: ActorRef<A>> {
     workers: Vec<R>,
@@ -272,7 +272,7 @@ impl<A: Actor, R: ActorRef<A>> ActorRef<A> for PoolRef<A, R> {
         self.select_worker().ask(msg, cancel)
     }
 
-    fn stream<M>(
+    fn expand<M>(
         &self,
         msg: M,
         buffer: usize,
@@ -280,14 +280,14 @@ impl<A: Actor, R: ActorRef<A>> ActorRef<A> for PoolRef<A, R> {
         cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, ActorSendError>
     where
-        A: StreamHandler<M>,
+        A: ExpandHandler<M>,
         M: Message,
     {
         self.select_worker()
-            .stream(msg, buffer, batch_config, cancel)
+            .expand(msg, buffer, batch_config, cancel)
     }
 
-    fn feed<Item, Reply>(
+    fn reduce<Item, Reply>(
         &self,
         input: BoxStream<Item>,
         buffer: usize,
@@ -295,12 +295,12 @@ impl<A: Actor, R: ActorRef<A>> ActorRef<A> for PoolRef<A, R> {
         cancel: Option<CancellationToken>,
     ) -> Result<AskReply<Reply>, ActorSendError>
     where
-        A: FeedHandler<Item, Reply>,
+        A: ReduceHandler<Item, Reply>,
         Item: Send + 'static,
         Reply: Send + 'static,
     {
         self.select_worker()
-            .feed(input, buffer, batch_config, cancel)
+            .reduce(input, buffer, batch_config, cancel)
     }
 }
 

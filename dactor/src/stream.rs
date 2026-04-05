@@ -6,11 +6,11 @@ use futures::Stream;
 
 /// A pinned, boxed, `Send`-safe async stream of items.
 ///
-/// Returned by [`ActorRef::stream`](crate::actor::ActorRef::stream)
+/// Returned by [`ActorRef::expand`](crate::actor::ActorRef::expand)
 /// so callers can consume streamed replies with `StreamExt` combinators.
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
-/// A sender handle given to the actor's [`StreamHandler`](crate::actor::StreamHandler).
+/// A sender handle given to the actor's [`ExpandHandler`](crate::actor::ExpandHandler).
 ///
 /// The actor pushes items into this sender; the caller receives them
 /// as a [`BoxStream`] on the other end. When the handler returns,
@@ -80,7 +80,7 @@ impl std::fmt::Display for StreamSendError {
 
 impl std::error::Error for StreamSendError {}
 
-/// A receiver handle given to the actor's [`FeedHandler`](crate::actor::FeedHandler).
+/// A receiver handle given to the actor's [`ReduceHandler`](crate::actor::ReduceHandler).
 ///
 /// The caller pushes items from a `BoxStream` into the channel; the actor
 /// consumes them through this receiver. Can be used directly with `recv()`

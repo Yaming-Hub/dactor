@@ -30,7 +30,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{Actor, ActorRef, AskReply, FeedHandler, Handler, StreamHandler};
+use crate::actor::{Actor, ActorRef, AskReply, ReduceHandler, Handler, ExpandHandler};
 use crate::errors::{ActorSendError, RuntimeError};
 use crate::interceptor::{Disposition, OutboundContext, OutboundInterceptor, SendMode};
 use crate::message::{Headers, Message, RuntimeHeaders};
@@ -439,7 +439,7 @@ impl<A: Actor + Sync> ActorRef<A> for RemoteActorRef<A> {
         Ok(AskReply::new(rx))
     }
 
-    fn stream<M>(
+    fn expand<M>(
         &self,
         _msg: M,
         _buffer: usize,
@@ -447,7 +447,7 @@ impl<A: Actor + Sync> ActorRef<A> for RemoteActorRef<A> {
         _cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, ActorSendError>
     where
-        A: StreamHandler<M>,
+        A: ExpandHandler<M>,
         M: Message,
     {
         Err(ActorSendError(
@@ -455,7 +455,7 @@ impl<A: Actor + Sync> ActorRef<A> for RemoteActorRef<A> {
         ))
     }
 
-    fn feed<Item, Reply>(
+    fn reduce<Item, Reply>(
         &self,
         _input: BoxStream<Item>,
         _buffer: usize,
@@ -463,7 +463,7 @@ impl<A: Actor + Sync> ActorRef<A> for RemoteActorRef<A> {
         _cancel: Option<CancellationToken>,
     ) -> Result<AskReply<Reply>, ActorSendError>
     where
-        A: FeedHandler<Item, Reply>,
+        A: ReduceHandler<Item, Reply>,
         Item: Send + 'static,
         Reply: Send + 'static,
     {

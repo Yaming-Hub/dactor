@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::{
-    Actor, ActorContext, ActorError, ActorRef, FeedHandler, Handler, StreamHandler,
+    Actor, ActorContext, ActorError, ActorRef, ReduceHandler, Handler, ExpandHandler,
 };
 use crate::errors::{ActorSendError, ErrorAction, RuntimeError};
 use crate::message::Message;
@@ -85,8 +85,8 @@ impl Message for StreamNumbers {
 }
 
 #[async_trait]
-impl StreamHandler<StreamNumbers> for ConformanceStreamer {
-    async fn handle_stream(
+impl ExpandHandler<StreamNumbers> for ConformanceStreamer {
+    async fn handle_expand(
         &mut self,
         msg: StreamNumbers,
         sender: StreamSender<u64>,
@@ -114,8 +114,8 @@ impl Actor for ConformanceAggregator {
 }
 
 #[async_trait]
-impl FeedHandler<i64, i64> for ConformanceAggregator {
-    async fn handle_feed(&mut self, mut rx: StreamReceiver<i64>, _ctx: &mut ActorContext) -> i64 {
+impl ReduceHandler<i64, i64> for ConformanceAggregator {
+    async fn handle_reduce(&mut self, mut rx: StreamReceiver<i64>, _ctx: &mut ActorContext) -> i64 {
         let mut sum = 0i64;
         while let Some(v) = rx.recv().await {
             sum += v;
@@ -343,7 +343,7 @@ where
 
     let actor = spawn("conf-streamer", ());
     let stream = actor
-        .stream(StreamNumbers { count: 5 }, 16, None, None)
+        .expand(StreamNumbers { count: 5 }, 16, None, None)
         .unwrap();
     let items: Vec<u64> = stream.collect().await;
     assert_eq!(items, vec![0, 1, 2, 3, 4]);
@@ -359,7 +359,7 @@ where
 
     let actor = spawn("conf-streamer-empty", ());
     let stream = actor
-        .stream(StreamNumbers { count: 0 }, 16, None, None)
+        .expand(StreamNumbers { count: 0 }, 16, None, None)
         .unwrap();
     let items: Vec<u64> = stream.collect().await;
     assert!(items.is_empty(), "expected empty stream, got {:?}", items);
@@ -378,7 +378,7 @@ where
     let actor = spawn("conf-agg", ());
     let input: BoxStream<i64> = Box::pin(futures::stream::iter(vec![10, 20, 30]));
     let result = actor
-        .feed::<i64, i64>(input, 16, None, None)
+        .reduce::<i64, i64>(input, 16, None, None)
         .unwrap()
         .await
         .unwrap();
@@ -497,7 +497,7 @@ where
     let actor = spawn("conf-batch-stream", ());
     let batch = BatchConfig::new(3, Duration::from_millis(50));
     let stream = actor
-        .stream(StreamNumbers { count: 7 }, 16, Some(batch), None)
+        .expand(StreamNumbers { count: 7 }, 16, Some(batch), None)
         .unwrap();
     let items: Vec<u64> = stream.collect().await;
     assert_eq!(
@@ -517,7 +517,7 @@ where
     let batch = BatchConfig::new(3, Duration::from_millis(50));
     let input: BoxStream<i64> = Box::pin(futures::stream::iter(vec![1, 2, 3, 4, 5]));
     let result = actor
-        .feed::<i64, i64>(input, 16, Some(batch), None)
+        .reduce::<i64, i64>(input, 16, Some(batch), None)
         .unwrap()
         .await
         .unwrap();
@@ -534,7 +534,7 @@ where
 
     let actor = spawn("conf-stream-none-batch", ());
     let stream = actor
-        .stream(StreamNumbers { count: 6 }, 16, None, None)
+        .expand(StreamNumbers { count: 6 }, 16, None, None)
         .unwrap();
     let items: Vec<u64> = stream.collect().await;
     assert_eq!(
@@ -553,7 +553,7 @@ where
     let actor = spawn("conf-feed-none-batch", ());
     let input: BoxStream<i64> = Box::pin(futures::stream::iter(vec![5, 10, 15, 20]));
     let result = actor
-        .feed::<i64, i64>(input, 16, None, None)
+        .reduce::<i64, i64>(input, 16, None, None)
         .unwrap()
         .await
         .unwrap();
@@ -714,7 +714,7 @@ where
 
     let actor = spawn("stream-slow", ());
     let mut stream = actor
-        .stream(StreamNumbers { count: 20 }, 2, None, None)
+        .expand(StreamNumbers { count: 20 }, 2, None, None)
         .unwrap();
 
     let mut items = Vec::new();
@@ -769,3 +769,4 @@ where
     let ask_result = actor.ask(GetCount, None);
     assert!(ask_result.is_err(), "ask after stop should return error");
 }
+

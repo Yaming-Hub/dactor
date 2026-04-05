@@ -20,7 +20,7 @@ All §X.Y references in the document map to valid section headers. No stale or u
 
 ### Critical: ToggleableInterceptor missing delegation (lines 2637–2666) — RESOLVED
 
-The `ToggleableInterceptor` wrapper was missing `on_complete()` and `on_stream_item()` delegation. This has been corrected in the design document.
+The `ToggleableInterceptor` wrapper was missing `on_complete()` and `on_expand_item()` delegation. This has been corrected in the design document.
 
 **Original issue:** Composability was broken. When wrapping stateful interceptors like `CircuitBreakerInterceptor` (which resets error counts on success in `on_complete`, lines 5754–5770), those callbacks silently used default no-op implementations, causing users to create interceptors that silently drop state tracking.
 
@@ -30,8 +30,8 @@ fn on_complete(&self, ctx: &InboundContext<'_>, headers: &Headers, outcome: &Out
     self.inner.on_complete(ctx, headers, outcome);
 }
 
-fn on_stream_item(&self, ctx: &InboundContext<'_>, headers: &Headers, seq: u64, item: &dyn Any) {
-    self.inner.on_stream_item(ctx, headers, seq, item);
+fn on_expand_item(&self, ctx: &InboundContext<'_>, headers: &Headers, seq: u64, item: &dyn Any) {
+    self.inner.on_expand_item(ctx, headers, seq, item);
 }
 ```
 

@@ -11,13 +11,13 @@ Write your actor logic once, swap the runtime underneath.
 ## Key Features
 
 - **4 communication patterns** — `tell` (fire-and-forget), `ask`
-  (request-reply), `stream` (server-streaming), `feed` (client-streaming)
-- **Transparent batching** — `BatchConfig` on `stream()` / `feed()` groups
+  (request-reply), `expand` (server-streaming), `reduce` (client-streaming)
+- **Transparent batching** — `BatchConfig` on `expand()` / `reduce()` groups
   items into batches (max_items + max_delay) to reduce per-item overhead
 - **Actor pools** — `PoolRef` with `RoundRobin`, `Random`, and `KeyBased`
   routing strategies for distributing work across workers
 - **Interceptor pipelines** — inbound and outbound hooks for logging, auth,
-  header stamping, rate limiting, and more; per-item `on_stream_item`
+  header stamping, rate limiting, and more; per-item `on_expand_item`
   interception returning `Disposition`; `on_reply` for outbound ask replies
 - **DropObserver** — global observer for interceptor-driven message drops
   (metrics, alerting, dead-letter routing)
@@ -30,7 +30,7 @@ Write your actor logic once, swap the runtime underneath.
   `CancellationToken`
 - **Bounded & unbounded mailboxes** — configurable `OverflowStrategy`
   (Block, RejectWithError, DropNewest)
-- **Cooperative cancellation** — `CancellationToken` on ask / stream / feed,
+- **Cooperative cancellation** — `CancellationToken` on ask / expand / reduce,
   `ctx.cancelled()` for select!-based cancellation
 - **Persistence** — `PersistentActor`, `EventSourced`, `DurableState` traits
   with recovery pipeline (`recover_event_sourced`, `recover_durable_state`),
@@ -110,8 +110,8 @@ async fn main() {
 |---------|--------|-------------|
 | **Tell** | `actor.tell(msg)` | Fire-and-forget — no reply, returns immediately |
 | **Ask** | `actor.ask(msg, cancel)` | Request-reply — returns `AskReply<T>` future |
-| **Stream** | `actor.stream(msg, buf, batch, cancel)` | Server-streaming — handler sends multiple items via `StreamSender`. Pass `Some(BatchConfig)` or `None`. |
-| **Feed** | `actor.feed::<Item, Reply>(input, buf, batch, cancel)` | Client-streaming — sends a `BoxStream` of items, gets one reply. Pass `Some(BatchConfig)` or `None`. |
+| **Expand** | `actor.expand(msg, buf, batch, cancel)` | Server-streaming — handler sends multiple items via `StreamSender`. Pass `Some(BatchConfig)` or `None`. |
+| **Reduce** | `actor.reduce::<Item, Reply>(input, buf, batch, cancel)` | Client-streaming — sends a `BoxStream` of items, gets one reply. Pass `Some(BatchConfig)` or `None`. |
 
 ## Architecture
 
@@ -135,15 +135,15 @@ async fn main() {
 |-------|---------|
 | `Actor` | Core trait with `create()`, `on_start()`, `on_stop()`, `on_error()` |
 | `Handler<M>` | Per-message handler — `async fn handle(&mut self, msg, ctx) -> M::Reply` |
-| `StreamHandler<M>` | Server-streaming handler — sends items via `StreamSender` |
-| `FeedHandler<Item, Reply>` | Client-streaming handler — receives `StreamReceiver<Item>`, returns `Reply` |
+| `ExpandHandler<M>` | Server-streaming handler — sends items via `StreamSender` |
+| `ReduceHandler<Item, Reply>` | Client-streaming handler — receives `StreamReceiver<Item>`, returns `Reply` |
 | `PersistentActor` | Base persistence trait with `persistence_id()` and recovery hooks |
 | `EventSourced` | Event-sourcing — `apply()`, `persist()`, `snapshot()`, `restore_snapshot()` |
 | `DurableState` | Durable-state — `save_state()`, `restore_state()` |
 | `SupervisionStrategy` | Determines supervisor response to child failure — `on_child_failed()` |
-| `ActorRef<A>` | Typed handle — `tell`, `ask`, `stream`, `feed`, `stop`, `is_alive` |
+| `ActorRef<A>` | Typed handle — `tell`, `ask`, `expand`, `reduce`, `stop`, `is_alive` |
 | `Message` | Message trait with associated `Reply` type |
-| `InboundInterceptor` | Runs on actor task before handler (logging, auth, metrics, `on_stream_item`) |
+| `InboundInterceptor` | Runs on actor task before handler (logging, auth, metrics, `on_expand_item`) |
 | `OutboundInterceptor` | Runs on caller task before send (rate limiting, tracing, `on_reply`) |
 | `DropObserver` | Global observer notified when interceptors drop messages |
 
@@ -178,8 +178,8 @@ examples:
 |---------|-------------|---------|
 | [`readme_quickstart`](dactor/examples/readme_quickstart.rs) | Quick start — basic counter with tell + ask | `cargo run --example readme_quickstart -p dactor --features test-support` |
 | [`basic_counter`](dactor/examples/basic_counter.rs) | Tell + ask patterns with a counter actor | `cargo run --example basic_counter -p dactor --features test-support` |
-| [`streaming`](dactor/examples/streaming.rs) | Server-streaming and client-streaming (feed) | `cargo run --example streaming -p dactor --features test-support` |
-| [`batch_streaming`](dactor/examples/batch_streaming.rs) | Transparent batching for stream/feed with `BatchConfig` | `cargo run --example batch_streaming -p dactor --features test-support` |
+| [`streaming`](dactor/examples/streaming.rs) | Server-streaming and client-streaming (reduce) | `cargo run --example streaming -p dactor --features test-support` |
+| [`batch_streaming`](dactor/examples/batch_streaming.rs) | Transparent batching for expand/reduce with `BatchConfig` | `cargo run --example batch_streaming -p dactor --features test-support` |
 | [`cancellation`](dactor/examples/cancellation.rs) | Cancellation tokens and `cancel_after()` for streams | `cargo run --example cancellation -p dactor --features test-support` |
 | [`supervision`](dactor/examples/supervision.rs) | Supervision strategies (OneForOne, AllForOne, RestForOne) | `cargo run --example supervision -p dactor --features test-support` |
 | [`interceptors`](dactor/examples/interceptors.rs) | Inbound/outbound interceptor pipelines | `cargo run --example interceptors -p dactor --features test-support` |
@@ -196,10 +196,10 @@ examples:
 dactor/                  Workspace root
 ├── dactor/              Core library — traits, types, test support
 │   ├── src/
-│   │   ├── actor.rs         Actor, Handler, StreamHandler, FeedHandler, ActorRef
+│   │   ├── actor.rs         Actor, Handler, ExpandHandler, ReduceHandler, ActorRef
 │   │   ├── message.rs       Message, Headers, Priority
 │   │   ├── interceptor.rs   InboundInterceptor, OutboundInterceptor, Disposition,
-│   │   │                    DropObserver, on_stream_item, on_reply
+│   │   │                    DropObserver, on_expand_item, on_reply
 │   │   ├── mailbox.rs       MailboxConfig, OverflowStrategy
 │   │   ├── supervision.rs   ChildTerminated, OneForOne, AllForOne, RestForOne
 │   │   ├── persistence.rs   PersistentActor, EventSourced, DurableState,

@@ -96,9 +96,9 @@ pub mod prelude {
 
 // Backward-compatible re-exports at crate root
 pub use actor::cancel_after;
-pub use actor::FeedHandler;
+pub use actor::ReduceHandler;
 pub use actor::{Actor, ActorContext, ActorError, ActorRef, SpawnConfig};
-pub use actor::{AskReply, Handler, StreamHandler};
+pub use actor::{AskReply, Handler, ExpandHandler};
 pub use async_trait::async_trait;
 #[cfg(feature = "serde")]
 pub use batched_transport::{

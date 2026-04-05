@@ -116,7 +116,7 @@ impl OutboundPipeline {
 }
 
 /// Wrap a stream with per-item outbound interception.
-/// Each item goes through `on_stream_item` — Drop skips (notifies observer),
+/// Each item goes through `on_expand_item` — Drop skips (notifies observer),
 /// Delay sleeps, Reject terminates.
 pub fn wrap_stream_with_interception<T: Send + 'static>(
     rx: tokio::sync::mpsc::Receiver<T>,
@@ -134,7 +134,7 @@ pub fn wrap_stream_with_interception<T: Send + 'static>(
                 target_id: pipeline.target_id.clone(),
                 target_name: &pipeline.target_name,
                 message_type,
-                send_mode: SendMode::Stream,
+                send_mode: SendMode::Expand,
                 remote: false,
             };
             let interception_result = intercept_outbound_stream_item(
@@ -154,7 +154,7 @@ pub fn wrap_stream_with_interception<T: Send + 'static>(
                 Disposition::Drop | Disposition::Retry(_) => {
                     pipeline.notify_item_drop(
                         message_type,
-                        SendMode::Stream,
+                        SendMode::Expand,
                         "stream reply",
                         interception_result.interceptor_name,
                         seq - 1,
@@ -191,7 +191,7 @@ pub fn wrap_batched_stream_with_interception<T: Send + 'static>(
                 target_id: pipeline.target_id.clone(),
                 target_name: &pipeline.target_name,
                 message_type,
-                send_mode: SendMode::Stream,
+                send_mode: SendMode::Expand,
                 remote: false,
             };
             let interception_result = intercept_outbound_stream_item(
@@ -211,7 +211,7 @@ pub fn wrap_batched_stream_with_interception<T: Send + 'static>(
                 Disposition::Drop | Disposition::Retry(_) => {
                     pipeline.notify_item_drop(
                         message_type,
-                        SendMode::Stream,
+                        SendMode::Expand,
                         "stream reply (batched)",
                         interception_result.interceptor_name,
                         seq - 1,
@@ -233,7 +233,7 @@ pub fn wrap_batched_stream_with_interception<T: Send + 'static>(
 
 /// Spawn the feed drain task: reads items from the input stream, runs
 /// per-item outbound interception, and forwards to the actor's item channel.
-pub fn spawn_feed_drain<T: Send + 'static>(
+pub fn spawn_reduce_drain<T: Send + 'static>(
     input: BoxStream<T>,
     item_tx: tokio::sync::mpsc::Sender<T>,
     cancel: Option<CancellationToken>,
@@ -261,7 +261,7 @@ pub fn spawn_feed_drain<T: Send + 'static>(
                             target_id: pipeline.target_id.clone(),
                             target_name: &pipeline.target_name,
                             message_type,
-                            send_mode: SendMode::Feed,
+                            send_mode: SendMode::Reduce,
                             remote: false,
                         };
                         let interception_result = intercept_outbound_stream_item(
@@ -281,7 +281,7 @@ pub fn spawn_feed_drain<T: Send + 'static>(
                             Disposition::Drop | Disposition::Retry(_) => {
                                 pipeline.notify_item_drop(
                                     message_type,
-                                    SendMode::Feed,
+                                    SendMode::Reduce,
                                     "feed item",
                                     interception_result.interceptor_name,
                                     seq - 1,
@@ -312,7 +312,7 @@ pub fn spawn_feed_drain<T: Send + 'static>(
 
 /// Spawn the batched feed drain: intercept → batch → unbatch → actor.
 /// Returns immediately; the drain runs in the background.
-pub fn spawn_feed_batched_drain<T: Send + 'static>(
+pub fn spawn_reduce_batched_drain<T: Send + 'static>(
     input: BoxStream<T>,
     item_tx: tokio::sync::mpsc::Sender<T>,
     buffer: usize,
@@ -347,7 +347,7 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
                                 target_id: pipeline.target_id.clone(),
                                 target_name: &pipeline.target_name,
                                 message_type,
-                                send_mode: SendMode::Feed,
+                                send_mode: SendMode::Reduce,
                                 remote: false,
                             };
                             let interception_result = intercept_outbound_stream_item(
@@ -367,7 +367,7 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
                                 Disposition::Drop | Disposition::Retry(_) => {
                                     pipeline.notify_item_drop(
                                         message_type,
-                                        SendMode::Feed,
+                                        SendMode::Reduce,
                                         "feed item (batched)",
                                         interception_result.interceptor_name,
                                         seq - 1,
@@ -427,7 +427,7 @@ pub fn spawn_feed_batched_drain<T: Send + 'static>(
             .catch_unwind()
             .await;
             if result.is_err() {
-                tracing::error!("feed_batched writer task panicked");
+                tracing::error!("reduce_batched writer task panicked");
             }
         });
 
