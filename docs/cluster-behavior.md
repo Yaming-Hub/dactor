@@ -133,10 +133,39 @@ runtime.cluster_events().subscribe(Box::new(|event| {
 
 | Environment | Discovery Method | How It Works |
 |------------|-----------------|--------------|
-| **Kubernetes** | Headless Service DNS | DNS SRV/A records for `my-service.namespace.svc.cluster.local` return all pod IPs. Polled periodically. |
+| **Kubernetes (EKS, AKS, GKE)** | Headless Service DNS | DNS SRV/A records for `my-service.namespace.svc.cluster.local` return all pod IPs. Polled periodically. Works identically on EKS, AKS, and GKE. |
+| **AWS EKS** | Headless Service DNS or Cloud Map | Same K8s DNS as above. Alternatively, AWS Cloud Map (Service Discovery) registers pods as service instances; discovery queries the Cloud Map namespace via AWS SDK. |
+| **AWS EC2 Auto Scaling** | EC2 API + Tag query | Query `DescribeInstances` with Auto Scaling group tag filter. Returns private IPs of all instances in the group. Poll periodically or subscribe to ASG lifecycle hooks via SNS/SQS for instant notification. |
+| **Amazon ECS / AGS** | ECS Service Discovery (Cloud Map) | ECS tasks register with AWS Cloud Map on startup. Discovery queries Cloud Map `DiscoverInstances` API. Supports health-check gating — only healthy tasks are returned. |
 | **Azure VMSS** | Instance Metadata + Tag query | Query IMDS for VMSS instances with matching tag. Or use static seed list in config. |
+| **Azure AKS** | Headless Service DNS | Same K8s DNS mechanism as EKS/GKE. |
 | **Static** | `StaticSeeds` | Hardcoded list of `host:port` in config. New node must be added to config and existing nodes restarted (or config hot-reloaded). |
 | **Consul/etcd** | Service registry | Nodes register on startup, deregister on shutdown. Discovery polls the registry. |
+
+#### AWS-Specific Notes
+
+**EKS (Elastic Kubernetes Service)**:
+- Headless Service DNS is the simplest approach — works out of the box.
+- For cross-namespace or cross-cluster discovery, use AWS Cloud Map.
+- Pod IPs are routable within the VPC (no NAT needed for node-to-node).
+
+**EC2 Auto Scaling Groups**:
+- Use ASG lifecycle hooks for faster detection:
+  ```
+  ASG launches instance → lifecycle hook → SNS → your discovery service
+  → connect_peer() on all existing nodes
+  ```
+- Without hooks, poll `DescribeInstances` every 10-30s.
+- Instances get new private IPs on launch — use instance ID as NodeId,
+  resolve IP via API.
+
+**ECS / AGS (Amazon Game Server)**:
+- AWS Cloud Map provides DNS-based and API-based discovery.
+- ECS tasks automatically register/deregister with Cloud Map.
+- AGS game server groups work similarly — instances register with a
+  fleet discovery endpoint.
+- Use `DiscoverInstances` API with health status filter for accurate
+  membership.
 
 ---
 
