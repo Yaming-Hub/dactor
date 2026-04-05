@@ -16,8 +16,23 @@ use std::sync::Arc;
 // NA5: SpawnManager actor
 // ---------------------------------------------------------------------------
 
-/// Result type for spawn requests.
-pub type SpawnResult = Result<(ActorId, Box<dyn std::any::Any + Send>), SpawnResponse>;
+/// Reply for spawn requests — wraps the outcome as a non-Result type so
+/// domain failures (unknown type, bad args) stay as reply data rather than
+/// being promoted to kameo's handler error channel.
+#[derive(kameo::Reply)]
+pub enum SpawnOutcome {
+    /// Actor created successfully.
+    Success {
+        actor_id: ActorId,
+        actor: Box<dyn std::any::Any + Send>,
+    },
+    /// Spawn failed (unknown type, deserialization error).
+    Failure(SpawnResponse),
+}
+
+/// Reply wrapper for CancelResponse (implements kameo's Reply trait).
+#[derive(kameo::Reply)]
+pub struct CancelOutcome(pub CancelResponse);
 
 /// Factory function type for creating actors from serialized bytes.
 pub type FactoryFn = Box<
@@ -55,7 +70,7 @@ impl kameo::Actor for SpawnManagerActor {
 pub struct HandleSpawnRequest(pub SpawnRequest);
 
 impl kameo::message::Message<HandleSpawnRequest> for SpawnManagerActor {
-    type Reply = SpawnResult;
+    type Reply = SpawnOutcome;
 
     async fn handle(
         &mut self,
@@ -70,9 +85,9 @@ impl kameo::message::Message<HandleSpawnRequest> for SpawnManagerActor {
                     local,
                 };
                 self.manager.record_spawn(actor_id.clone());
-                Ok((actor_id, actor))
+                SpawnOutcome::Success { actor_id, actor }
             }
-            Err(e) => Err(SpawnResponse::Failure {
+            Err(e) => SpawnOutcome::Failure(SpawnResponse::Failure {
                 request_id: msg.0.request_id.clone(),
                 error: e.to_string(),
             }),
@@ -249,14 +264,14 @@ impl kameo::message::Message<RegisterCancel> for CancelManagerActor {
 pub struct CancelById(pub String);
 
 impl kameo::message::Message<CancelById> for CancelManagerActor {
-    type Reply = Result<CancelResponse, kameo::error::Infallible>;
+    type Reply = CancelOutcome;
 
     async fn handle(
         &mut self,
         msg: CancelById,
         _ctx: &mut kameo::message::Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        Ok(self.manager.cancel(&msg.0))
+        CancelOutcome(self.manager.cancel(&msg.0))
     }
 }
 

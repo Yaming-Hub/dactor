@@ -5,7 +5,7 @@
 //! message delivery using kameo's native tell/ask semantics.
 
 use dactor::node::{ActorId, NodeId};
-use dactor::system_actors::{CancelResponse, SpawnRequest};
+use dactor::system_actors::{CancelResponse, SpawnRequest, SpawnResponse};
 use dactor::type_registry::TypeRegistry;
 use dactor_kameo::system_actors::*;
 use kameo::actor::Spawn;
@@ -38,23 +38,27 @@ async fn na5_spawn_manager_handles_request() {
         request_id: "req-1".into(),
     };
 
-    let result = actor_ref
+    let outcome = actor_ref
         .ask(HandleSpawnRequest(request))
         .await
         .expect("ask failed");
 
-    let (actor_id, actor) = result;
-    assert_eq!(actor_id.node, node_id);
-    let val = actor.downcast::<i32>().expect("should be i32");
-    assert_eq!(*val, 42);
+    match outcome {
+        SpawnOutcome::Success { actor_id, actor } => {
+            assert_eq!(actor_id.node, node_id);
+            let val = actor.downcast::<i32>().expect("should be i32");
+            assert_eq!(*val, 42);
 
-    // Verify spawned actors list
-    let spawned = actor_ref
-        .ask(GetSpawnedActors)
-        .await
-        .expect("ask failed");
-    assert_eq!(spawned.len(), 1);
-    assert_eq!(spawned[0], actor_id);
+            // Verify spawned actors list
+            let spawned = actor_ref
+                .ask(GetSpawnedActors)
+                .await
+                .expect("ask failed");
+            assert_eq!(spawned.len(), 1);
+            assert_eq!(spawned[0], actor_id);
+        }
+        SpawnOutcome::Failure(resp) => panic!("spawn should succeed, got: {resp:?}"),
+    }
 }
 
 #[tokio::test]
@@ -74,12 +78,17 @@ async fn na5_spawn_manager_unknown_type() {
         request_id: "req-2".into(),
     };
 
-    let result = actor_ref
+    let outcome = actor_ref
         .ask(HandleSpawnRequest(request))
-        .await;
+        .await
+        .expect("ask failed");
 
-    // Kameo unwraps Result replies — SpawnResponse::Failure becomes the ask error
-    assert!(result.is_err(), "expected spawn failure for unknown type");
+    match outcome {
+        SpawnOutcome::Failure(SpawnResponse::Failure { request_id, .. }) => {
+            assert_eq!(request_id, "req-2");
+        }
+        _ => panic!("expected SpawnOutcome::Failure"),
+    }
 }
 
 #[tokio::test]
@@ -109,11 +118,11 @@ async fn na5_spawn_manager_register_factory() {
         request_id: "req-3".into(),
     };
 
-    actor_ref
+    let outcome = actor_ref
         .ask(HandleSpawnRequest(request))
         .await
         .expect("ask failed");
-    // If we got here, the spawn succeeded (kameo unwraps Result::Ok)
+    assert!(matches!(outcome, SpawnOutcome::Success { .. }));
 }
 
 // ---------------------------------------------------------------------------
@@ -199,11 +208,11 @@ async fn na7_cancel_manager_register_and_cancel() {
     let count = actor_ref.ask(GetActiveCount).await.expect("ask failed");
     assert_eq!(count, 1);
 
-    let response = actor_ref
+    let outcome = actor_ref
         .ask(CancelById("req-1".into()))
         .await
         .expect("ask failed");
-    assert!(matches!(response, CancelResponse::Acknowledged));
+    assert!(matches!(outcome.0, CancelResponse::Acknowledged));
     assert!(token_clone.is_cancelled());
 
     let count = actor_ref.ask(GetActiveCount).await.expect("ask failed");
