@@ -1099,7 +1099,9 @@ impl KameoRuntime {
     ///
     /// If the peer already exists, updates its status to `Connected` and
     /// preserves the existing address when `address` is `None`.
+    /// Emits a `ClusterEvent::NodeJoined` if the peer was not previously connected.
     pub fn connect_peer(&mut self, peer_id: NodeId, address: Option<String>) {
+        let was_connected = self.node_directory.is_connected(&peer_id);
         if let Some(existing) = self.node_directory.get_peer(&peer_id) {
             let resolved_address = address.or_else(|| existing.address.clone());
             self.node_directory.remove_peer(&peer_id);
@@ -1108,11 +1110,20 @@ impl KameoRuntime {
             self.node_directory.add_peer(peer_id.clone(), address);
         }
         self.node_directory.set_status(&peer_id, PeerStatus::Connected);
+        if !was_connected {
+            self.cluster_events.emit(dactor::ClusterEvent::NodeJoined(peer_id));
+        }
     }
 
     /// Mark a peer as disconnected.
+    ///
+    /// Emits a `ClusterEvent::NodeLeft` if the peer was previously connected.
     pub fn disconnect_peer(&mut self, peer_id: &NodeId) {
+        let was_connected = self.node_directory.is_connected(peer_id);
         self.node_directory.set_status(peer_id, PeerStatus::Disconnected);
+        if was_connected {
+            self.cluster_events.emit(dactor::ClusterEvent::NodeLeft(peer_id.clone()));
+        }
     }
 
     /// Check if a peer node is connected.
