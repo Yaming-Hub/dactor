@@ -9,7 +9,7 @@ framework.
 **⚠️ Current Status: STUB**
 
 The adapter currently wraps `TestRuntime` as a placeholder. The real
-`coerce-rt` integration has not been done due to potential dependency or
+`coerce crate` integration has not been done due to potential dependency or
 maintenance issues with the coerce-rs crate. The stub locks down the
 public API surface and passes conformance tests, so the interface will
 remain stable when the real engine is swapped in.
@@ -42,7 +42,7 @@ remain stable when the real engine is swapped in.
 
 ## Why a Stub?
 
-The coerce-rs crate (`coerce-rt`) may have dependency or maintenance issues.
+The coerce-rs crate (`coerce crate`) may have dependency or maintenance issues.
 This stub lets us:
 
 1. **Lock down the API surface** — `CoerceRuntime` and `CoerceActorRef` define
@@ -126,14 +126,14 @@ impl<A: Actor + 'static> ActorRef<A> for CoerceActorRef<A> {
 See `docs/progress.md` Phase 12 (CP1-CP10) for the full plan to bring
 coerce to feature parity with ractor and kameo. Key milestones:
 
-1. **CP1**: Replace TestRuntime with real `coerce-rt` actors
+1. **CP1**: Replace TestRuntime with real `coerce crate` actors
 2. **CP2-CP3**: ClusterEvents and emission
 3. **CP4**: Lifecycle handles (await_stop/await_all)
 4. **CP5-CP6**: Native system actors + runtime auto-start
 5. **CP7-CP9**: Interceptors, watch, mailbox on real engine
 6. **CP10**: Comprehensive test suite
 
-CP1 (coerce-rt integration) is the gate — all other items depend on it.
+CP1 (coerce crate integration) is the gate — all other items depend on it.
 
 ## Limitations
 

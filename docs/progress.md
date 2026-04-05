@@ -561,7 +561,7 @@ messages.
   (e.g., `SpawnRequest` → `SpawnResponse`). The transport layer awaits the
   reply and sends it back over the wire.
 - **Coerce/mock.** Coerce is a stub — native actors can be added when
-  coerce-rt integrates. MockCluster can optionally wrap in test actors or
+  coerce crate integrates. MockCluster can optionally wrap in test actors or
   continue using direct method calls for simplicity.
 - **Depends on:** SA1-SA10 (complete), transport integration (R4).
 - **Priority:** High — required before remote operations work end-to-end.
@@ -690,7 +690,7 @@ This phase brings coerce to feature parity with ractor/kameo.
 
 | Feature | Ractor | Kameo | Coerce | Gap |
 |---------|--------|-------|--------|-----|
-| Real provider runtime | ✅ ractor::Actor | ✅ kameo::Actor | ❌ Wraps TestRuntime | Need coerce-rt integration |
+| Real provider runtime | ✅ ractor::Actor | ✅ kameo::Actor | ❌ Wraps TestRuntime | Need coerce integration |
 | Native system actors (NA) | ✅ PR #83 | ✅ PR #84 | ❌ | Need coerce native actors |
 | Runtime auto-start (NA9) | ✅ PR #85 | ✅ PR #85 | ❌ | Need start_system_actors() |
 | ClusterEvents impl | ✅ RactorClusterEvents | ✅ KameoClusterEvents | ❌ | Need CoerceClusterEvents |
@@ -703,7 +703,7 @@ This phase brings coerce to feature parity with ractor/kameo.
 
 | # | Feature | Description | Priority | Status |
 |---|---------|-------------|----------|--------|
-| CP1 | Integrate coerce-rt | Replace TestRuntime with real `coerce::actor::Actor` spawning via `into_actor()`. Add coerce-rt dependency. | High | 🔲 Not started |
+| CP1 | Integrate real coerce | Replace TestRuntime with real `coerce::actor::Actor` spawning via `into_actor()`. Already added as dependency. | High | 🔲 Not started |
 | CP2 | CoerceClusterEvents | Implement `ClusterEvents` trait for coerce adapter (callback-based, same pattern as ractor/kameo) | High | 🔲 Not started |
 | CP3 | ClusterEvent emission | Wire `connect_peer()`/`disconnect_peer()` to emit NodeJoined/NodeLeft via CoerceClusterEvents | High | 🔲 Not started |
 | CP4 | Lifecycle handles | Implement `await_stop()`/`await_all()`/`cleanup_finished()` — wire oneshot into coerce actor stop lifecycle | High | 🔲 Not started |
@@ -718,7 +718,7 @@ This phase brings coerce to feature parity with ractor/kameo.
 
 - **CP1 is the gate** — all other items depend on replacing TestRuntime with
   real coerce actors. Without this, everything is just wrapping a test mock.
-- **coerce-rt dependency risk** — the crate may have compatibility issues or
+- **coerce crate maintenance risk** — the crate may have compatibility issues or
   be under-maintained. If integration is blocked, document the blockers and
   keep the stub with a clear upgrade path.
 - **CP2-CP4 can be done on the stub** as interim work if CP1 is blocked,

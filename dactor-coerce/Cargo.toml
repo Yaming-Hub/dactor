@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["sync", "rt", "time", "macros", "rt-multi-t
 async-trait = "0.1"
 tokio-util = "0.7"
 tracing = "0.1"
+coerce = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,12 +1,12 @@
 //! Coerce adapter runtime.
 //!
-//! Currently wraps `TestRuntime` as a placeholder. The actual `coerce-rt`
+//! Currently wraps `TestRuntime` as a placeholder. The actual `coerce crate`
 //! integration will replace the internal implementation while keeping
 //! the same public API.
 //!
 //! # Why a stub?
 //!
-//! The coerce-rs crate (`coerce-rt`) may have dependency or maintenance
+//! The coerce-rs crate (`coerce crate`) may have dependency or maintenance
 //! issues. This stub lets us lock down the API surface and pass
 //! conformance tests now, then swap in the real engine later.
 
@@ -53,7 +53,7 @@ impl Default for SpawnOptions {
 /// Coerce adapter runtime.
 ///
 /// Currently backed by [`TestRuntime`] as a placeholder.
-/// The `coerce-rt` dependency will be integrated in a future PR,
+/// The `coerce crate` dependency will be integrated in a future PR,
 /// replacing the internals while preserving this public API.
 ///
 /// ## System Actors
@@ -70,7 +70,7 @@ pub struct CoerceRuntime {
     ///
     /// Local spawns (via `spawn()`) use `TestRuntime`'s internal counter.
     /// Remote spawns (via `handle_spawn_request()`) use this counter with
-    /// an offset to avoid collisions. When the real coerce-rt engine
+    /// an offset to avoid collisions. When the real coerce crate engine
     /// replaces TestRuntime, a single counter will be used.
     next_remote_local: AtomicU64,
     /// Manages remote actor spawn requests for this node.
