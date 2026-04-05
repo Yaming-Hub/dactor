@@ -728,6 +728,115 @@ This phase brings coerce to feature parity with ractor/kameo.
 
 ---
 
+## Phase 13: Transform Pattern & Streaming API Naming
+
+### Background: Current Streaming Call Patterns
+
+dactor currently supports three streaming call patterns:
+
+| Pattern | Method | Direction | Description |
+|---------|--------|-----------|-------------|
+| **stream** | `actor_ref.stream(msg)` | Actor → Caller | Actor produces a stream of items to the caller |
+| **feed** | `actor_ref.feed(input)` | Caller → Actor | Caller sends a stream of items to the actor, gets a single reply |
+| **ask** | `actor_ref.ask(msg)` | Caller ↔ Actor | Single request, single reply |
+
+Missing: **transform** — caller sends a stream of items, actor produces a
+stream of transformed items (bidirectional streaming).
+
+Currently listed under "Not Planned" as "Bidirectional streaming — composed
+from feed() + stream() at app level". However, the compose-it-yourself
+approach has significant drawbacks:
+
+1. **Two separate channels** — feed() and stream() create independent
+   mailbox entries, so ordering between input consumption and output
+   production is not guaranteed.
+2. **No backpressure coupling** — if the output stream is slow to consume,
+   the input feed has no way to slow down.
+3. **Lifecycle complexity** — the caller must coordinate two independent
+   async flows (the feed drain task and the stream consumer).
+
+A first-class `transform()` primitive solves all three issues.
+
+### Proposed API
+
+```rust
+// Transform: stream-in, stream-out
+let output: BoxStream<OutputItem> = actor_ref.transform(
+    input,          // BoxStream<InputItem>
+    buffer,         // output buffer size
+    batch_config,   // Optional<BatchConfig>
+    cancel,         // Optional<CancellationToken>
+)?;
+
+// The actor implements TransformHandler:
+#[async_trait]
+trait TransformHandler<Item: Send + 'static, Output: Send + 'static>: Actor {
+    async fn on_item(
+        &mut self,
+        item: Item,
+        sender: &StreamSender<Output>,
+        ctx: &mut ActorContext,
+    );
+
+    async fn on_complete(
+        &mut self,
+        sender: &StreamSender<Output>,
+        ctx: &mut ActorContext,
+    ) {}
+}
+```
+
+### Plan
+
+| # | Feature | Description | Status |
+|---|---------|-------------|--------|
+| TF1 | TransformHandler trait | `on_item(item, sender, ctx)` + `on_complete(sender, ctx)` | 🔲 Not started |
+| TF2 | `actor_ref.transform()` | Wires input stream → actor → output stream with shared lifecycle | 🔲 Not started |
+| TF3 | Backpressure coupling | Output stream backpressure slows input consumption | 🔲 Not started |
+| TF4 | Batch support | `Option<BatchConfig>` for both input and output | 🔲 Not started |
+| TF5 | Interceptor integration | Outbound pipeline on each output item | 🔲 Not started |
+| TF6 | Cancellation | Single CancellationToken cancels both input and output | 🔲 Not started |
+| TF7 | Adapter wiring | Wire into ractor, kameo, coerce, TestRuntime | 🔲 Not started |
+
+### Streaming API Naming Review
+
+The current naming (`stream`, `feed`, `transform`) is **verb-oriented** and
+describes the communication direction. However, from a **stream processing**
+perspective, these names may be confusing:
+
+| Current Name | Stream Semantics | Better Name? |
+|-------------|------------------|--------------|
+| `stream(msg)` → stream of items | **Produce** / **Emit** — actor generates items | `stream` is reasonable (producer pattern) |
+| `feed(input)` → single reply | **Reduce** / **Fold** — consume stream, produce aggregate | `reduce` or `fold` — standard stream terminology |
+| `transform(input)` → stream of items | **Map** / **FlatMap** — consume stream, produce stream | `transform` or `map_stream` |
+| `ask(msg)` → single reply | **Request-Reply** | `ask` is standard (Akka/Erlang) |
+
+**Proposed renaming for consideration:**
+
+```
+feed()      → reduce()      // consumes a stream, returns a single result
+stream()    → stream()      // produces a stream (no change, already clear)
+transform() → transform()   // input stream → output stream
+ask()       → ask()         // single request-reply (no change)
+tell()      → tell()        // fire-and-forget (no change)
+```
+
+The `reduce` rename better communicates the semantics: "feed a stream of
+items to the actor and reduce them to a single reply value." This aligns
+with `Iterator::fold()`, `Stream::fold()`, and MapReduce terminology.
+
+**Decision needed:** Whether to rename `feed` → `reduce` is a breaking API
+change. Options:
+
+1. **Rename now** (before v1.0) — clean API, one-time migration
+2. **Alias** — add `reduce()` as an alias, deprecate `feed()` over time
+3. **Keep `feed`** — it's already established in the codebase and tests
+
+**Recommendation:** Option 2 (alias + deprecate) — lets users migrate
+gradually without breaking existing code.
+
+---
+
 ## Not Planned / Out of Scope
 
 | Feature | Reason |
@@ -736,4 +845,3 @@ This phase brings coerce to feature parity with ractor/kameo.
 | Passivation | Not in design spec |
 | Security (TLS, auth) | Deferred to interceptors + application code |
 | CLI tools / dashboard | Not in design spec |
-| Bidirectional streaming | Composed from feed() + stream() at app level |
