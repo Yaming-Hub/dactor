@@ -86,7 +86,7 @@ impl Message for StreamNumbers {
 
 #[async_trait]
 impl ExpandHandler<StreamNumbers> for ConformanceStreamer {
-    async fn handle_stream(
+    async fn handle_expand(
         &mut self,
         msg: StreamNumbers,
         sender: StreamSender<u64>,
@@ -115,7 +115,7 @@ impl Actor for ConformanceAggregator {
 
 #[async_trait]
 impl ReduceHandler<i64, i64> for ConformanceAggregator {
-    async fn handle_feed(&mut self, mut rx: StreamReceiver<i64>, _ctx: &mut ActorContext) -> i64 {
+    async fn handle_reduce(&mut self, mut rx: StreamReceiver<i64>, _ctx: &mut ActorContext) -> i64 {
         let mut sum = 0i64;
         while let Some(v) = rx.recv().await {
             sum += v;
@@ -769,3 +769,4 @@ where
     let ask_result = actor.ask(GetCount, None);
     assert!(ask_result.is_err(), "ask after stop should return error");
 }
+

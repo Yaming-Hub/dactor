@@ -41,7 +41,7 @@ impl Actor for SlowProducer {
 
 #[async_trait]
 impl ExpandHandler<GetNumbers> for SlowProducer {
-    async fn handle_stream(
+    async fn handle_expand(
         &mut self,
         _msg: GetNumbers,
         sender: StreamSender<u32>,
@@ -133,3 +133,4 @@ async fn main() {
 
     println!("=== Done ===");
 }
+

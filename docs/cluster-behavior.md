@@ -1,7 +1,7 @@
 # Cluster Node Join/Leave Behavior
 
 > How dactor manages cluster membership changes — node discovery, joining,
-> leaving, and split-brain resolution.
+> leaving, and split-brain handling.
 
 ## Overview
 
@@ -232,13 +232,15 @@ t4    Cluster operational                    Application
 
 4. **Actor IDs change** — each node generates new ActorId counters on
    restart. Remote references held before the restart are invalid.
-   Applications should use actor naming (`runtime.lookup("my-actor")`)
+   Applications should use actor naming (`runtime.registry().lookup("my-actor")`)
    for stable references.
 
 ### Recommended Configuration
 
 ```rust
-// Use a discovery mechanism that handles simultaneous startup
+// Pseudocode — these discovery types are planned, not yet implemented.
+// Today, use StaticSeeds or manual connect_peer() calls.
+// See Phase 4 (R4) and ClusterDiscovery trait for the design.
 let discovery = RetryingDiscovery::new(
     DnsDiscovery::new("dactor.default.svc.cluster.local"),
     RetryConfig {

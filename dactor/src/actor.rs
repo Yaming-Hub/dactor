@@ -180,14 +180,14 @@ pub trait Handler<M: Message>: Actor {
     async fn handle(&mut self, msg: M, ctx: &mut ActorContext) -> M::Reply;
 }
 
-/// Implemented by actors that handle streaming requests.
+/// Implemented by actors that handle expand (server-streaming) requests.
 /// The handler receives the request and a `StreamSender` to push items into.
 /// When this method returns, the stream closes on the caller side.
 #[async_trait]
 pub trait ExpandHandler<M: Message>: Actor {
-    /// Handle a streaming request. Push items into `sender`.
+    /// Handle an expand request. Push items into `sender`.
     /// When this method returns, the stream closes.
-    async fn handle_stream(
+    async fn handle_expand(
         &mut self,
         msg: M,
         sender: StreamSender<M::Reply>,
@@ -195,7 +195,7 @@ pub trait ExpandHandler<M: Message>: Actor {
     );
 }
 
-/// Implemented by actors that handle client-streaming (feed) requests.
+/// Implemented by actors that handle reduce (client-streaming) requests.
 ///
 /// The handler receives a [`StreamReceiver`] from which it pulls
 /// caller-provided items. When the stream ends, the handler returns a
@@ -206,8 +206,8 @@ pub trait ExpandHandler<M: Message>: Actor {
 /// - `Reply` — the type returned after the actor consumes all items.
 #[async_trait]
 pub trait ReduceHandler<Item: Send + 'static, Reply: Send + 'static>: Actor {
-    /// Handle a feed request. Pull items from `receiver` and return a reply.
-    async fn handle_feed(
+    /// Handle a reduce request. Pull items from `receiver` and return a reply.
+    async fn handle_reduce(
         &mut self,
         receiver: StreamReceiver<Item>,
         ctx: &mut ActorContext,

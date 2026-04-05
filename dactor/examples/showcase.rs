@@ -71,7 +71,7 @@ impl Handler<GetStatus> for TaskProcessor {
 
 #[async_trait]
 impl ExpandHandler<StreamItems> for TaskProcessor {
-    async fn handle_stream(
+    async fn handle_expand(
         &mut self,
         _msg: StreamItems,
         sender: StreamSender<u32>,
@@ -87,7 +87,7 @@ impl ExpandHandler<StreamItems> for TaskProcessor {
 
 #[async_trait]
 impl ReduceHandler<u64, u64> for TaskProcessor {
-    async fn handle_feed(&mut self, mut rx: StreamReceiver<u64>, _ctx: &mut ActorContext) -> u64 {
+    async fn handle_reduce(&mut self, mut rx: StreamReceiver<u64>, _ctx: &mut ActorContext) -> u64 {
         let mut sum = 0u64;
         while let Some(n) = rx.recv().await {
             sum += n;
@@ -243,3 +243,4 @@ async fn main() {
 
     println!("\n=== Done ===");
 }
+

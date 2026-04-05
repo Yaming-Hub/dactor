@@ -34,7 +34,7 @@ impl Actor for LogServer {
 
 #[async_trait]
 impl ExpandHandler<GetLogs> for LogServer {
-    async fn handle_stream(
+    async fn handle_expand(
         &mut self,
         _msg: GetLogs,
         sender: StreamSender<String>,
@@ -67,7 +67,7 @@ impl Actor for Aggregator {
 
 #[async_trait]
 impl ReduceHandler<u64, u64> for Aggregator {
-    async fn handle_feed(
+    async fn handle_reduce(
         &mut self,
         mut receiver: StreamReceiver<u64>,
         _ctx: &mut ActorContext,
@@ -122,3 +122,4 @@ async fn main() {
 
     println!("=== Done ===");
 }
+

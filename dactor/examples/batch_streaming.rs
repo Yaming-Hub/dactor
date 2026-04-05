@@ -32,7 +32,7 @@ impl Actor for NumberServer {
 
 #[async_trait]
 impl ExpandHandler<GetNumbers> for NumberServer {
-    async fn handle_stream(
+    async fn handle_expand(
         &mut self,
         _msg: GetNumbers,
         sender: StreamSender<u64>,
@@ -62,7 +62,7 @@ impl Actor for Aggregator {
 
 #[async_trait]
 impl ReduceHandler<u64, u64> for Aggregator {
-    async fn handle_feed(
+    async fn handle_reduce(
         &mut self,
         mut receiver: StreamReceiver<u64>,
         _ctx: &mut ActorContext,
@@ -117,3 +117,4 @@ async fn main() {
 
     println!("\n=== Done ===");
 }
+

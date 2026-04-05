@@ -2847,7 +2847,7 @@ mod tests {
 
     #[async_trait]
     impl ExpandHandler<GetLogs> for LogServer {
-        async fn handle_stream(
+        async fn handle_expand(
             &mut self,
             _msg: GetLogs,
             sender: StreamSender<String>,
@@ -2931,7 +2931,7 @@ mod tests {
 
         #[async_trait]
         impl ExpandHandler<GetNumbers> for NumberStream {
-            async fn handle_stream(
+            async fn handle_expand(
                 &mut self,
                 msg: GetNumbers,
                 sender: StreamSender<u64>,
@@ -2979,7 +2979,7 @@ mod tests {
 
         #[async_trait]
         impl ExpandHandler<GetItems> for SlowStream {
-            async fn handle_stream(
+            async fn handle_expand(
                 &mut self,
                 _: GetItems,
                 sender: StreamSender<u64>,
@@ -3022,7 +3022,7 @@ mod tests {
 
         #[async_trait]
         impl ReduceHandler<u64, u64> for Summer {
-            async fn handle_feed(
+            async fn handle_reduce(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
                 _ctx: &mut ActorContext,
@@ -3060,7 +3060,7 @@ mod tests {
 
         #[async_trait]
         impl ReduceHandler<u64, u64> for Summer {
-            async fn handle_feed(
+            async fn handle_reduce(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
                 _ctx: &mut ActorContext,
@@ -3100,7 +3100,7 @@ mod tests {
 
         #[async_trait]
         impl ReduceHandler<u64, Vec<u64>> for Collector {
-            async fn handle_feed(
+            async fn handle_reduce(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
                 _ctx: &mut ActorContext,
@@ -3139,7 +3139,7 @@ mod tests {
 
         #[async_trait]
         impl ReduceHandler<u64, u64> for SlowConsumer {
-            async fn handle_feed(
+            async fn handle_reduce(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
                 _ctx: &mut ActorContext,
@@ -3272,7 +3272,7 @@ mod tests {
         }
         #[async_trait]
         impl ExpandHandler<StreamForever> for SlowStreamer {
-            async fn handle_stream(
+            async fn handle_expand(
                 &mut self,
                 _msg: StreamForever,
                 sender: StreamSender<u64>,
@@ -3317,7 +3317,7 @@ mod tests {
         }
         #[async_trait]
         impl ReduceHandler<u64, Vec<u64>> for FeedActor {
-            async fn handle_feed(
+            async fn handle_reduce(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
                 _ctx: &mut ActorContext,
@@ -3535,7 +3535,7 @@ mod tests {
 
             #[async_trait]
             impl ReduceHandler<u64, u64> for Summer {
-                async fn handle_feed(
+                async fn handle_reduce(
                     &mut self,
                     mut receiver: StreamReceiver<u64>,
                     _ctx: &mut ActorContext,
@@ -3893,3 +3893,4 @@ mod tests {
         assert_eq!(reply, "Hello, World!");
     }
 }
+

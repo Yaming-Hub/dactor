@@ -221,7 +221,7 @@ where
     M: Message,
 {
     async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) -> DispatchResult {
-        actor.handle_stream(self.msg, self.sender, ctx).await;
+        actor.handle_expand(self.msg, self.sender, ctx).await;
         DispatchResult::tell()
     }
 
@@ -268,7 +268,7 @@ where
     Reply: Send + 'static,
 {
     async fn dispatch(self: Box<Self>, actor: &mut A, ctx: &mut ActorContext) -> DispatchResult {
-        let reply = actor.handle_feed(self.receiver, ctx).await;
+        let reply = actor.handle_reduce(self.receiver, ctx).await;
         let reply_any: Box<dyn Any + Send> = Box::new(reply);
         let reply_tx = self.reply_tx;
         DispatchResult {
@@ -325,3 +325,4 @@ where
         self.cancel.clone()
     }
 }
+

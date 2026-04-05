@@ -761,7 +761,7 @@ mod stream_tests {
 
     #[async_trait]
     impl ExpandHandler<StreamN> for Streamer {
-        async fn handle_stream(
+        async fn handle_expand(
             &mut self,
             msg: StreamN,
             sender: StreamSender<u32>,
@@ -782,7 +782,7 @@ mod stream_tests {
 
     #[async_trait]
     impl ExpandHandler<StreamEmpty> for Streamer {
-        async fn handle_stream(
+        async fn handle_expand(
             &mut self,
             _msg: StreamEmpty,
             _sender: StreamSender<u32>,
@@ -853,7 +853,7 @@ mod feed_tests {
 
     #[async_trait]
     impl ReduceHandler<u64, u64> for Summer {
-        async fn handle_feed(
+        async fn handle_reduce(
             &mut self,
             mut receiver: StreamReceiver<u64>,
             _ctx: &mut ActorContext,
@@ -1138,3 +1138,4 @@ mod mailbox_tests {
         actor.stop();
     }
 }
+
