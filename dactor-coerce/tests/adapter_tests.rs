@@ -483,6 +483,23 @@ mod interceptor_tests {
 
     #[tokio::test]
     async fn test_inbound_reject_tell_silently_dropped() {
+        let count = Arc::new(AtomicU64::new(0));
+        let count_clone = count.clone();
+
+        // Use a counter actor to verify the handler was NOT called
+        struct CountActor(Arc<AtomicU64>);
+        impl dactor::actor::Actor for CountActor {
+            type Args = Arc<AtomicU64>;
+            type Deps = ();
+            fn create(args: Arc<AtomicU64>, _: ()) -> Self { CountActor(args) }
+        }
+        #[async_trait::async_trait]
+        impl dactor::actor::Handler<Fire> for CountActor {
+            async fn handle(&mut self, _msg: Fire, _ctx: &mut dactor::actor::ActorContext) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
         let options = SpawnOptions {
             interceptors: vec![Box::new(RejectInterceptor {
                 reason: "nope".into(),
@@ -491,11 +508,13 @@ mod interceptor_tests {
         };
 
         let runtime = CoerceRuntime::new();
-        let actor = runtime.spawn_with_options::<Echo>("echo-reject-tell", (), options);
+        let actor = runtime.spawn_with_options::<CountActor>("echo-reject-tell", count_clone, options);
 
         actor.tell(Fire(1)).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
         assert!(actor.is_alive());
+        assert_eq!(count.load(Ordering::SeqCst), 0, "handler should not have been called");
     }
 }
 
@@ -1015,5 +1034,48 @@ mod watch_tests {
             !terminated.load(Ordering::SeqCst),
             "watcher should NOT have received ChildTerminated after unwatch",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mailbox tests
+// ---------------------------------------------------------------------------
+
+mod mailbox_tests {
+    use super::*;
+    use dactor::mailbox::{MailboxConfig, OverflowStrategy};
+    use dactor::message::Message;
+    use dactor_coerce::SpawnOptions;
+
+    struct MailboxEcho;
+    impl dactor::actor::Actor for MailboxEcho {
+        type Args = ();
+        type Deps = ();
+        fn create(_: (), _: ()) -> Self { MailboxEcho }
+    }
+
+    struct MailboxPing(String);
+    impl Message for MailboxPing { type Reply = String; }
+
+    #[async_trait::async_trait]
+    impl dactor::actor::Handler<MailboxPing> for MailboxEcho {
+        async fn handle(&mut self, msg: MailboxPing, _ctx: &mut dactor::actor::ActorContext) -> String {
+            format!("pong:{}", msg.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bounded_mailbox_falls_back_to_unbounded() {
+        let runtime = CoerceRuntime::new();
+        let options = SpawnOptions {
+            interceptors: vec![],
+            mailbox: MailboxConfig::Bounded {
+                capacity: 5,
+                overflow: OverflowStrategy::DropNewest,
+            },
+        };
+        let actor = runtime.spawn_with_options::<MailboxEcho>("bounded-test", (), options);
+        let reply = actor.ask(MailboxPing("hi".into()), None).unwrap().await.unwrap();
+        assert_eq!(reply, "pong:hi");
     }
 }
