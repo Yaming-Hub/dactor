@@ -89,7 +89,7 @@ pub struct ActorContext {
     pub actor_id: ActorId,
     /// Human-readable name of the actor.
     pub actor_name: String,
-    /// How the current message was sent (Tell, Ask, Stream, Feed).
+    /// How the current message was sent (Tell, Ask, Expand, Reduce).
     /// `None` during on_start/on_stop (no message being processed).
     pub send_mode: Option<SendMode>,
     /// Headers attached to the current message.
@@ -184,7 +184,7 @@ pub trait Handler<M: Message>: Actor {
 /// The handler receives the request and a `StreamSender` to push items into.
 /// When this method returns, the stream closes on the caller side.
 #[async_trait]
-pub trait StreamHandler<M: Message>: Actor {
+pub trait ExpandHandler<M: Message>: Actor {
     /// Handle a streaming request. Push items into `sender`.
     /// When this method returns, the stream closes.
     async fn handle_stream(
@@ -205,7 +205,7 @@ pub trait StreamHandler<M: Message>: Actor {
 /// - `Item` — the type of items the caller streams to the actor.
 /// - `Reply` — the type returned after the actor consumes all items.
 #[async_trait]
-pub trait FeedHandler<Item: Send + 'static, Reply: Send + 'static>: Actor {
+pub trait ReduceHandler<Item: Send + 'static, Reply: Send + 'static>: Actor {
     /// Handle a feed request. Pull items from `receiver` and return a reply.
     async fn handle_feed(
         &mut self,
@@ -292,7 +292,7 @@ pub trait ActorRef<A: Actor>: Clone + Send + Sync + 'static {
     /// for remote actors). `None` means unbatched per-item delivery.
     ///
     /// Pass a [`CancellationToken`] to cooperatively cancel the stream.
-    fn stream<M>(
+    fn expand<M>(
         &self,
         msg: M,
         buffer: usize,
@@ -300,7 +300,7 @@ pub trait ActorRef<A: Actor>: Clone + Send + Sync + 'static {
         cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, ActorSendError>
     where
-        A: StreamHandler<M>,
+        A: ExpandHandler<M>,
         M: Message;
 
     /// Client-streaming (feed): stream items to the actor and receive a reply.
@@ -314,8 +314,8 @@ pub trait ActorRef<A: Actor>: Clone + Send + Sync + 'static {
     ///
     /// Pass a [`CancellationToken`] to cooperatively cancel the feed.
     ///
-    /// Usage: `let reply = actor.feed::<u64, u64>(input, 8, None, None)?.await?;`
-    fn feed<Item, Reply>(
+    /// Usage: `let reply = actor.reduce::<u64, u64>(input, 8, None, None)?.await?;`
+    fn reduce<Item, Reply>(
         &self,
         input: BoxStream<Item>,
         buffer: usize,
@@ -323,7 +323,7 @@ pub trait ActorRef<A: Actor>: Clone + Send + Sync + 'static {
         cancel: Option<CancellationToken>,
     ) -> Result<AskReply<Reply>, ActorSendError>
     where
-        A: FeedHandler<Item, Reply>,
+        A: ReduceHandler<Item, Reply>,
         Item: Send + 'static,
         Reply: Send + 'static;
 }

@@ -5,7 +5,7 @@
 //!
 //! ## Stream ordering guarantee (AM7)
 //!
-//! Stream and feed items (`SendMode::Stream` / `SendMode::Feed`) bypass
+//! Stream and feed items (`SendMode::Expand` / `SendMode::Reduce`) bypass
 //! the priority queue entirely and are always sent in exact enqueue order
 //! (FIFO). Only independent tell/ask messages are subject to priority
 //! scheduling.
@@ -201,7 +201,7 @@ impl OutboundPriorityQueue {
             return Err(envelope);
         }
         // Stream/Feed items bypass priority — strict FIFO ordering
-        if matches!(envelope.send_mode, SendMode::Stream | SendMode::Feed) {
+        if matches!(envelope.send_mode, SendMode::Expand | SendMode::Reduce) {
             self.stream_fifo.push_back(envelope);
         } else if self.is_comparer_mode() {
             let metadata = EnvelopeMetadata {
@@ -672,7 +672,7 @@ mod tests {
             },
             target_name: "test".into(),
             message_type: "test::StreamItem".into(),
-            send_mode: SendMode::Stream,
+            send_mode: SendMode::Expand,
             headers: WireHeaders::new(),
             body: vec![seq],
             request_id: None,
@@ -688,7 +688,7 @@ mod tests {
             },
             target_name: "test".into(),
             message_type: "test::FeedItem".into(),
-            send_mode: SendMode::Feed,
+            send_mode: SendMode::Reduce,
             headers: WireHeaders::new(),
             body: vec![seq],
             request_id: None,
@@ -708,7 +708,7 @@ mod tests {
         let mut stream_items = vec![];
         let mut tell_items = vec![];
         while let Some(e) = q.pop() {
-            if matches!(e.send_mode, SendMode::Stream) {
+            if matches!(e.send_mode, SendMode::Expand) {
                 stream_items.push(e.body[0]);
             } else {
                 tell_items.push(e.body[0]);
@@ -812,7 +812,7 @@ mod tests {
         let mut got_stream = false;
         let mut got_priority = false;
         while let Some(e) = q.pop() {
-            if e.send_mode == SendMode::Stream {
+            if e.send_mode == SendMode::Expand {
                 got_stream = true;
             } else {
                 got_priority = true;

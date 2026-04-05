@@ -47,7 +47,7 @@ explicit "library has no X" explanations.
 ### 2.3 Async streaming support
 **Request:** Support making a remote actor call that returns a stream of values.
 
-**Decision:** Added `StreamRef` → later `ActorRef<A>::stream()`. `StreamSender<R>`
+**Decision:** Added `StreamRef` → later `ActorRef<A>::expand()`. `StreamSender<R>`
 for the handler side, `BoxStream<R>` for the caller. Backpressure via bounded
 channel, cancellation via drop.
 
@@ -71,7 +71,7 @@ name automatically → `RuntimeError::Rejected { interceptor, reason }`.
 **Decision:** `on_complete` called exactly once per message. `Outcome` enum
 split into `TellSuccess`, `AskSuccess { reply: &dyn Any }`,
 `HandlerError { error: ActorError }`, `StreamCompleted`, `StreamCancelled`.
-Added `on_stream_item` for per-item observation.
+Added `on_expand_item` for per-item observation.
 
 ---
 
@@ -161,7 +161,7 @@ it to `RuntimeError::Rejected { interceptor, reason }` and
 **Request:** Can interceptors see tell/ask parameters and return values?
 
 **Decision:** `on_receive` gains `message: &dyn Any`. `on_complete` gains
-`reply: &dyn Any` in `AskSuccess`. `on_stream_item` gains `item: &dyn Any`.
+`reply: &dyn Any` in `AskSuccess`. `on_expand_item` gains `item: &dyn Any`.
 Downcasting via `downcast_ref::<ConcreteType>()`.
 
 ---
@@ -252,7 +252,7 @@ hierarchical cancel.
 **Request:** Instead of ask and ask_with, always add Option<CancellationToken>.
 
 **Decision:** Single `ask(msg, cancel: Option<CancellationToken>)` and
-`stream(msg, buffer, cancel: Option<CancellationToken>)`.
+`expand(msg, buffer, cancel: Option<CancellationToken>)`.
 
 ### 8.5 Remote cancellation
 **Request:** Can CancellationToken be serialized? How does remote actor know
@@ -404,7 +404,7 @@ dropped with actor. Dynamic: use `AtomicBool` wrapper.
 ### 15.2 Outbound interceptor reply/stream interception
 **Request:** Should OutboundInterceptor also intercept replies and stream items?
 
-**Decision:** Yes — added `on_reply(outcome)` and `on_stream_item(item)` to
+**Decision:** Yes — added `on_reply(outcome)` and `on_expand_item(item)` to
 `OutboundInterceptor`. Now symmetric with `InboundInterceptor`. Like HTTP
 client middleware seeing both request and response.
 

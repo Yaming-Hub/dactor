@@ -3,7 +3,7 @@
 //! Run with: cargo run --example batch_streaming --features test-support
 
 use async_trait::async_trait;
-use dactor::actor::{Actor, ActorContext, ActorRef, FeedHandler, StreamHandler};
+use dactor::actor::{Actor, ActorContext, ActorRef, ReduceHandler, ExpandHandler};
 use dactor::message::Message;
 use dactor::stream::{BatchConfig, StreamReceiver, StreamSender};
 use dactor::TestRuntime;
@@ -31,7 +31,7 @@ impl Actor for NumberServer {
 }
 
 #[async_trait]
-impl StreamHandler<GetNumbers> for NumberServer {
+impl ExpandHandler<GetNumbers> for NumberServer {
     async fn handle_stream(
         &mut self,
         _msg: GetNumbers,
@@ -61,7 +61,7 @@ impl Actor for Aggregator {
 }
 
 #[async_trait]
-impl FeedHandler<u64, u64> for Aggregator {
+impl ReduceHandler<u64, u64> for Aggregator {
     async fn handle_feed(
         &mut self,
         mut receiver: StreamReceiver<u64>,
@@ -87,11 +87,11 @@ async fn main() {
     let batch_config = BatchConfig::new(4, std::time::Duration::from_millis(5));
 
     // --- Batched server-streaming ---
-    println!("--- stream_batched: NumberServer (10 items, batch=4) ---");
+    println!("--- expand_batched: NumberServer (10 items, batch=4) ---");
     let server = runtime.spawn::<NumberServer>("numbers", 10);
 
     let mut stream = server
-        .stream(GetNumbers, 16, Some(batch_config.clone()), None)
+        .expand(GetNumbers, 16, Some(batch_config.clone()), None)
         .unwrap();
 
     let mut items = Vec::new();
@@ -102,13 +102,13 @@ async fn main() {
     assert_eq!(items, (1..=10).collect::<Vec<_>>());
 
     // --- Batched client-streaming ---
-    println!("\n--- feed_batched: Aggregator (5 items, batch=4) ---");
+    println!("\n--- reduce_batched: Aggregator (5 items, batch=4) ---");
     let aggregator = runtime.spawn::<Aggregator>("aggregator", ());
 
     let input = futures::stream::iter(vec![10u64, 20, 30, 40, 50]);
     let batch_config = BatchConfig::new(4, std::time::Duration::from_millis(5));
     let total = aggregator
-        .feed::<u64, u64>(Box::pin(input), 8, Some(batch_config), None)
+        .reduce::<u64, u64>(Box::pin(input), 8, Some(batch_config), None)
         .unwrap()
         .await
         .unwrap();

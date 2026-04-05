@@ -3,14 +3,14 @@
 //! Run with: cargo run --example streaming --features test-support
 
 use async_trait::async_trait;
-use dactor::actor::{Actor, ActorContext, ActorRef, FeedHandler, StreamHandler};
+use dactor::actor::{Actor, ActorContext, ActorRef, ReduceHandler, ExpandHandler};
 use dactor::message::Message;
 use dactor::stream::{StreamReceiver, StreamSender};
 use dactor::TestRuntime;
 use tokio_stream::StreamExt;
 
 // ===========================================================================
-// Part 1 — Server-streaming with StreamHandler
+// Part 1 — Server-streaming with ExpandHandler
 // ===========================================================================
 
 /// Request to stream all log entries.
@@ -33,7 +33,7 @@ impl Actor for LogServer {
 }
 
 #[async_trait]
-impl StreamHandler<GetLogs> for LogServer {
+impl ExpandHandler<GetLogs> for LogServer {
     async fn handle_stream(
         &mut self,
         _msg: GetLogs,
@@ -50,7 +50,7 @@ impl StreamHandler<GetLogs> for LogServer {
 }
 
 // ===========================================================================
-// Part 2 — Client-streaming with FeedHandler
+// Part 2 — Client-streaming with ReduceHandler
 // ===========================================================================
 
 /// Feed message: caller streams u64 items, actor returns the sum.
@@ -66,7 +66,7 @@ impl Actor for Aggregator {
 }
 
 #[async_trait]
-impl FeedHandler<u64, u64> for Aggregator {
+impl ReduceHandler<u64, u64> for Aggregator {
     async fn handle_feed(
         &mut self,
         mut receiver: StreamReceiver<u64>,
@@ -102,7 +102,7 @@ async fn main() {
         ],
     );
 
-    let mut stream = server.stream(GetLogs, 16, None, None).unwrap();
+    let mut stream = server.expand(GetLogs, 16, None, None).unwrap();
     while let Some(entry) = stream.next().await {
         println!("  [Client] log entry: {}", entry);
     }
@@ -114,7 +114,7 @@ async fn main() {
 
     let input = futures::stream::iter(vec![10u64, 20, 30, 40, 50]);
     let total = aggregator
-        .feed::<u64, u64>(Box::pin(input), 8, None, None)
+        .reduce::<u64, u64>(Box::pin(input), 8, None, None)
         .unwrap()
         .await
         .unwrap();

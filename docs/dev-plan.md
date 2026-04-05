@@ -218,7 +218,7 @@ persistence) gets an e2e test alongside its unit and adapter tests.
 - `interceptor.rs`: `InboundContext` struct
 - `interceptor.rs`: `Disposition` enum (Continue, Delay, Drop, Reject)
 - `interceptor.rs`: `Outcome` enum
-- `interceptor.rs`: `SendMode` enum (Tell, Ask, Stream, Feed)
+- `interceptor.rs`: `SendMode` enum (Tell, Ask, Expand, Reduce)
 - `SpawnConfig.inbound_interceptors` field
 - `ActorRuntime::add_inbound_interceptor()` for global interceptors
 - Runtime executes interceptor chain before handler dispatch
@@ -240,7 +240,7 @@ persistence) gets an e2e test alongside its unit and adapter tests.
 **Goal:** Implement `OutboundInterceptor` trait on the sender side.
 
 **Changes:**
-- `interceptor.rs`: `OutboundInterceptor` trait (`on_send`, `on_reply`, `on_stream_item`)
+- `interceptor.rs`: `OutboundInterceptor` trait (`on_send`, `on_reply`, `on_expand_item`)
 - `interceptor.rs`: `OutboundContext` struct
 - `ActorRuntime::add_outbound_interceptor()`
 - Runtime executes outbound chain before tell/ask/stream/feed
@@ -324,16 +324,16 @@ persistence) gets an e2e test alongside its unit and adapter tests.
 
 ### PR 13: Stream (Server-Streaming)
 
-**Goal:** `stream()` method for request → multiple response items.
+**Goal:** `expand()` method for request → multiple response items.
 
 **Changes:**
 - `stream.rs`: `StreamSender<T>`, `BoxStream<T>`, `StreamSendError`
-- `ActorRef::stream()` method
+- `ActorRef::expand()` method
 - Adapter: mpsc channel shim (both ractor and kameo)
 - Backpressure via bounded channel
 
 **Tests:**
-- Unit: `stream(GetLogs)` returns 10 items, verify all received
+- Unit: `expand(GetLogs)` returns 10 items, verify all received
 - Unit: Consumer drops stream early → `StreamSendError::ConsumerDropped`
 - Unit: Backpressure — slow consumer, verify sender suspends
 - Unit: Empty stream (handler sends nothing, drops tx)
@@ -345,12 +345,12 @@ persistence) gets an e2e test alongside its unit and adapter tests.
 
 ### PR 14: Feed (Client-Streaming)
 
-**Goal:** `feed()` method for stream-of-items → actor → optional reply.
+**Goal:** `reduce()` method for stream-of-items → actor → optional reply.
 
 **Changes:**
-- `stream.rs`: `StreamReceiver<T>`, `FeedMessage` trait, `FeedHandler<M>` trait
-- `ActorRef::feed()` method
-- `BatchConfig` for `stream_batched()` / `feed_batched()`
+- `stream.rs`: `StreamReceiver<T>`, `FeedMessage` trait, `ReduceHandler<M>` trait
+- `ActorRef::reduce()` method
+- `BatchConfig` for `expand_batched()` / `reduce_batched()`
 - Adapter: mpsc channel + drain task (both ractor and kameo)
 
 **Tests:**

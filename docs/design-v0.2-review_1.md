@@ -26,7 +26,7 @@ The `ActorError` design (§3.14) is sophisticated and production-ready:
 The `Envelope<M>` + `Headers` + `Interceptor` pipeline (§3.1, §3.2) is elegant:
 - **Type-keyed headers** (using `TypeId`) eliminate string-based lookups and reduce downcasting
 - **Opaque `HeaderValue` trait** allows external crates (like `dcontext`) to plug in tracing/correlation IDs without dactor knowing about them
-- **Interceptor traits** with `on_receive`, `on_complete`, `on_stream_item` give three distinct observation points, enabling metrics, logging, and tracing without handler modification
+- **Interceptor traits** with `on_receive`, `on_complete`, `on_expand_item` give three distinct observation points, enabling metrics, logging, and tracing without handler modification
 
 **1.5 Streaming Abstraction**
 The `StreamRef<M, R>` design (§3.5) is well-motivated:
@@ -114,7 +114,7 @@ What happens with many `tell()` to a slow actor with unbounded mailbox? OOM risk
 
 1. Define the complete `ActorContext` struct (headers, self_ref, actor_id, runtime access)
 2. Clarify interceptor failure semantics for streams — `Reject` should return `Err` immediately
-3. Add timeout support to `ask()` and `stream()`
+3. Add timeout support to `ask()` and `expand()`
 4. Document mailbox config interaction with overflow for priority queues
 5. Extend `MessageCodec` with version parameter for testing rolling deployments
 6. Add deterministic testing helpers (`assert_message_delivered`, `inspect_mailbox`)
@@ -258,7 +258,7 @@ What happens with many `tell()` to a slow actor with unbounded mailbox? OOM risk
 
 | # | Finding | Resolution | Detail |
 |---|---|:---:|---|
-| G1 | Dual `AskRef`/`StreamRef` vs `ActorRef<A>::ask()` — two mental models | ✅ Fixed (by §10.6) | The §10.6 decision resolved this: the public API is `ActorRef<A>::ask()` and `ActorRef<A>::stream()` directly. The old `AskRef`/`StreamRef` traits from §3.4/§3.5 are internal adapter implementation details, not user-facing. The consumer sees one `ActorRef<A>` with all methods. |
+| G1 | Dual `AskRef`/`StreamRef` vs `ActorRef<A>::ask()` — two mental models | ✅ Fixed (by §10.6) | The §10.6 decision resolved this: the public API is `ActorRef<A>::ask()` and `ActorRef<A>::expand()` directly. The old `AskRef`/`StreamRef` traits from §3.4/§3.5 are internal adapter implementation details, not user-facing. The consumer sees one `ActorRef<A>` with all methods. |
 | G2 | Typed codec boundary (`Codec<M: Serialize>`) better than raw bytes | ✅ Documented | §3.18 explains the design choice: raw `[u8]` matches real network layers and keeps `LinkConfig` simple. The `RemoteMessage` blanket impl provides compile-time safety at the send site. The codec layer is intentionally transport-level (bytes in, bytes out). |
 | G3 | Need mapping table from backend errors to `ErrorCode` | ✅ Fixed | Added error mapping table in §3.19 showing how each adapter maps ractor/kameo/coerce errors to `ErrorCode` variants (Internal, ActorNotFound, Unavailable, Timeout, ResourceExhausted, etc.). |
 | G4 | `#[non_exhaustive]` on `OverflowStrategy` / `ErrorCode` | ✅ Fixed | Added `#[non_exhaustive]` to both `OverflowStrategy` and `ErrorCode` enums. This allows adding variants in future minor versions without breaking downstream matches. |

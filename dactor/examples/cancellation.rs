@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dactor::actor::{cancel_after, Actor, ActorContext, ActorRef, Handler, StreamHandler};
+use dactor::actor::{cancel_after, Actor, ActorContext, ActorRef, Handler, ExpandHandler};
 use dactor::message::Message;
 use dactor::stream::StreamSender;
 use dactor::TestRuntime;
@@ -40,7 +40,7 @@ impl Actor for SlowProducer {
 }
 
 #[async_trait]
-impl StreamHandler<GetNumbers> for SlowProducer {
+impl ExpandHandler<GetNumbers> for SlowProducer {
     async fn handle_stream(
         &mut self,
         _msg: GetNumbers,
@@ -103,7 +103,7 @@ async fn main() {
     let producer = runtime.spawn::<SlowProducer>("producer", ());
 
     let token = cancel_after(Duration::from_millis(150));
-    let mut stream = producer.stream(GetNumbers, 16, None, Some(token)).unwrap();
+    let mut stream = producer.expand(GetNumbers, 16, None, Some(token)).unwrap();
 
     let mut received = Vec::new();
     while let Some(n) = stream.next().await {

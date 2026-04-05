@@ -25,9 +25,9 @@ pub enum SendMode {
     /// Request-reply: caller awaits a single response.
     Ask,
     /// Streaming request: handler pushes multiple items to a `StreamSender`.
-    Stream,
+    Expand,
     /// Batch feed: deliver pre-collected items without per-item replies.
-    Feed,
+    Reduce,
 }
 
 /// Metadata about an inbound message and its target actor.
@@ -42,7 +42,7 @@ pub struct InboundContext<'a> {
     pub actor_name: &'a str,
     /// The Rust type name of the message.
     pub message_type: &'static str,
-    /// How the message was sent (Tell, Ask, Stream, Feed).
+    /// How the message was sent (Tell, Ask, Expand, Reduce).
     pub send_mode: SendMode,
     /// Whether the message originated from a remote node.
     pub remote: bool,
@@ -118,7 +118,7 @@ pub struct DropNotice {
     pub message_type: &'static str,
     /// The interceptor that returned `Disposition::Drop`.
     pub interceptor_name: &'static str,
-    /// How the message was sent (Tell, Ask, Stream, Feed).
+    /// How the message was sent (Tell, Ask, Expand, Reduce).
     pub send_mode: SendMode,
     /// Context string describing where the drop happened
     /// (e.g., "outbound on_send", "stream reply", "feed item").
@@ -151,7 +151,7 @@ pub fn notify_drop(observer: &Option<Arc<dyn DropObserver>>, notice: DropNotice)
     }
 }
 
-/// Run outbound interceptors' `on_stream_item` for a single item.
+/// Run outbound interceptors' `on_expand_item` for a single item.
 /// Returns the first non-Continue disposition with the interceptor name.
 pub fn intercept_outbound_stream_item(
     interceptors: &[Box<dyn OutboundInterceptor>],
@@ -161,7 +161,7 @@ pub fn intercept_outbound_stream_item(
     item: &dyn Any,
 ) -> InterceptResult {
     for interceptor in interceptors {
-        let d = interceptor.on_stream_item(ctx, headers, seq, item);
+        let d = interceptor.on_expand_item(ctx, headers, seq, item);
         if !matches!(d, Disposition::Continue) {
             return InterceptResult {
                 disposition: d,
@@ -266,7 +266,7 @@ pub trait InboundInterceptor: Send + Sync + 'static {
     /// - `Delay(d)` — pause for `d` before forwarding (backpressure).
     /// - `Reject(reason)` — terminate the stream with an error.
     /// - `Retry(d)` — not meaningful for stream items; treated as `Drop`.
-    fn on_stream_item(
+    fn on_expand_item(
         &self,
         ctx: &InboundContext<'_>,
         headers: &Headers,
@@ -348,7 +348,7 @@ pub trait OutboundInterceptor: Send + Sync + 'static {
     /// - `Delay(d)` — pause for `d` before forwarding (backpressure).
     /// - `Reject(reason)` — terminate the stream with an error.
     /// - `Retry(d)` — not meaningful for stream items; treated as `Drop`.
-    fn on_stream_item(
+    fn on_expand_item(
         &self,
         ctx: &OutboundContext<'_>,
         headers: &Headers,
@@ -399,7 +399,7 @@ mod tests {
     fn test_send_mode_variants() {
         assert_eq!(SendMode::Tell, SendMode::Tell);
         assert_ne!(SendMode::Tell, SendMode::Ask);
-        assert_ne!(SendMode::Stream, SendMode::Feed);
+        assert_ne!(SendMode::Expand, SendMode::Reduce);
     }
 
     #[test]

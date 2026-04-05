@@ -18,7 +18,7 @@ Three independent reviewers analyzed the full document. Total issues found: **16
 
 | # | Reviewer | Issue | Resolution |
 |---|---|---|---|
-| 1 | Haiku, GPT | Line 1069 says "three communication patterns" but §4.12 adds `feed()` as a fourth pattern | ✅ Fixed: Updated to "four", added feed to mermaid diagram |
+| 1 | Haiku, GPT | Line 1069 says "three communication patterns" but §4.12 adds `reduce()` as a fourth pattern | ✅ Fixed: Updated to "four", added feed to mermaid diagram |
 
 ### IMPORTANT (6)
 
@@ -36,8 +36,8 @@ Three independent reviewers analyzed the full document. Total issues found: **16
 | # | Reviewer | Issue | Resolution |
 |---|---|---|---|
 | 8 | Haiku | No forward reference from pattern matrix (line 1385) to §4.12 Feed | ✅ Fixed: Added forward reference |
-| 9 | Haiku | `feed()` missing from adapter support tables (§14.3–14.5) | ✅ Fixed: Added feed() rows to all 4 adapter tables |
-| 10 | Haiku | `feed()` missing from cancellation outcomes table (§4.13.5) | ✅ Fixed: Added feed column to table |
+| 9 | Haiku | `reduce()` missing from adapter support tables (§14.3–14.5) | ✅ Fixed: Added reduce() rows to all 4 adapter tables |
+| 10 | Haiku | `reduce()` missing from cancellation outcomes table (§4.13.5) | ✅ Fixed: Added feed column to table |
 | 11 | GPT | ActorContext send_mode comment says "(Tell, Ask, Stream)" — omits Feed | ✅ Fixed: Updated to include Feed |
 | 12 | GPT | §9.1 serializer table omits feed items/request/reply | ✅ Fixed: Added 3 feed rows to table |
 | 13 | GPT | §9.1 MessageSerializer doc comment omits "feed" | ✅ Fixed: Added "feed" to list |
@@ -61,7 +61,7 @@ Three independent reviewers analyzed the full document. Total issues found: **16
 ## Verified Correct (All 3 Reviewers Agree)
 
 - ✅ `ActorRef<A>` consistently typed to actor (never `ActorRef<M>`)
-- ✅ `SendMode` enum has all 4 variants: Tell, Ask, Stream, Feed
+- ✅ `SendMode` enum has all 4 variants: Tell, Ask, Expand, Reduce
 - ✅ `Disposition` enum has all 4 variants: Continue, Delay, Drop, Reject
 - ✅ `ErrorCode` enum complete with all documented codes
 - ✅ `Priority` constants consistent: CRITICAL=0, HIGH=64, NORMAL=128, LOW=192, BACKGROUND=255

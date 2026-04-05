@@ -17,12 +17,12 @@ use futures::FutureExt;
 use tokio::sync::mpsc;
 
 use crate::actor::{
-    Actor, ActorContext, ActorError, ActorRef, AskReply, FeedHandler, Handler, StreamHandler,
+    Actor, ActorContext, ActorError, ActorRef, AskReply, ReduceHandler, Handler, ExpandHandler,
 };
 use crate::dead_letter::{DeadLetterEvent, DeadLetterHandler, DeadLetterReason};
 #[allow(unused_imports)]
 use crate::dispatch::DispatchResult;
-use crate::dispatch::{AskDispatch, BoxedDispatch, FeedDispatch, StreamDispatch, TypedDispatch};
+use crate::dispatch::{AskDispatch, BoxedDispatch, ReduceDispatch, ExpandDispatch, TypedDispatch};
 use crate::errors::{ActorSendError, ErrorAction, RuntimeError};
 #[allow(unused_imports)]
 use crate::interceptor::OutboundContext;
@@ -351,7 +351,7 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
         }
     }
 
-    fn stream<M>(
+    fn expand<M>(
         &self,
         msg: M,
         buffer: usize,
@@ -359,13 +359,13 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
         cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<M::Reply>, ActorSendError>
     where
-        A: StreamHandler<M>,
+        A: ExpandHandler<M>,
         M: Message,
     {
         let buffer = buffer.max(1);
         let pipeline = self.outbound_pipeline();
 
-        let result = pipeline.run_on_send(SendMode::Stream, &msg);
+        let result = pipeline.run_on_send(SendMode::Expand, &msg);
         match result.disposition {
             Disposition::Continue => {}
             Disposition::Delay(_) => {}
@@ -386,7 +386,7 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(buffer);
         let sender = StreamSender::new(tx);
-        let dispatch: BoxedDispatch<A> = Box::new(StreamDispatch {
+        let dispatch: BoxedDispatch<A> = Box::new(ExpandDispatch {
             msg,
             sender,
             cancel,
@@ -449,7 +449,7 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
         }
     }
 
-    fn feed<Item, Reply>(
+    fn reduce<Item, Reply>(
         &self,
         input: BoxStream<Item>,
         buffer: usize,
@@ -457,7 +457,7 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
         cancel: Option<CancellationToken>,
     ) -> Result<AskReply<Reply>, ActorSendError>
     where
-        A: FeedHandler<Item, Reply>,
+        A: ReduceHandler<Item, Reply>,
         Item: Send + 'static,
         Reply: Send + 'static,
     {
@@ -467,7 +467,7 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
         let (item_tx, item_rx) = tokio::sync::mpsc::channel(buffer);
         let receiver = StreamReceiver::new(item_rx);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let dispatch: BoxedDispatch<A> = Box::new(FeedDispatch {
+        let dispatch: BoxedDispatch<A> = Box::new(ReduceDispatch {
             receiver,
             reply_tx,
             cancel: cancel.clone(),
@@ -476,7 +476,7 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
 
         match batch_config {
             Some(batch_config) => {
-                crate::runtime_support::spawn_feed_batched_drain(
+                crate::runtime_support::spawn_reduce_batched_drain(
                     input,
                     item_tx,
                     buffer,
@@ -487,7 +487,7 @@ impl<A: Actor> ActorRef<A> for TestActorRef<A> {
                 );
             }
             None => {
-                crate::runtime_support::spawn_feed_drain(
+                crate::runtime_support::spawn_reduce_drain(
                     input,
                     item_tx,
                     cancel,
@@ -1008,7 +1008,7 @@ impl Default for TestRuntime {
 mod tests {
     use super::*;
     use crate::actor::ActorContext;
-    use crate::actor::{FeedHandler, StreamHandler};
+    use crate::actor::{ReduceHandler, ExpandHandler};
     use crate::message::Message;
     use crate::node::NodeId;
     use crate::stream::{StreamReceiver, StreamSender};
@@ -2846,7 +2846,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl StreamHandler<GetLogs> for LogServer {
+    impl ExpandHandler<GetLogs> for LogServer {
         async fn handle_stream(
             &mut self,
             _msg: GetLogs,
@@ -2869,7 +2869,7 @@ mod tests {
         let server = runtime
             .spawn::<LogServer>("logs", vec!["line1".into(), "line2".into(), "line3".into()]);
 
-        let mut stream = server.stream(GetLogs, 16, None, None).unwrap();
+        let mut stream = server.expand(GetLogs, 16, None, None).unwrap();
         let mut items = Vec::new();
         while let Some(item) = stream.next().await {
             items.push(item);
@@ -2885,7 +2885,7 @@ mod tests {
         let runtime = TestRuntime::new();
         let server = runtime.spawn::<LogServer>("logs", vec![]);
 
-        let mut stream = server.stream(GetLogs, 16, None, None).unwrap();
+        let mut stream = server.expand(GetLogs, 16, None, None).unwrap();
         assert!(stream.next().await.is_none());
     }
 
@@ -2897,7 +2897,7 @@ mod tests {
         let runtime = TestRuntime::new();
         let server = runtime.spawn::<LogServer>("logs", logs);
 
-        let mut stream = server.stream(GetLogs, 4, None, None).unwrap();
+        let mut stream = server.expand(GetLogs, 4, None, None).unwrap();
         let item1 = stream.next().await.unwrap();
         let item2 = stream.next().await.unwrap();
         assert_eq!(item1, "line-0");
@@ -2930,7 +2930,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl StreamHandler<GetNumbers> for NumberStream {
+        impl ExpandHandler<GetNumbers> for NumberStream {
             async fn handle_stream(
                 &mut self,
                 msg: GetNumbers,
@@ -2949,7 +2949,7 @@ mod tests {
         let actor = runtime.spawn::<NumberStream>("numbers", ());
 
         let stream = actor
-            .stream(GetNumbers { count: 100 }, 16, None, None)
+            .expand(GetNumbers { count: 100 }, 16, None, None)
             .unwrap();
         let items: Vec<u64> = tokio_stream::StreamExt::collect(stream).await;
 
@@ -2978,7 +2978,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl StreamHandler<GetItems> for SlowStream {
+        impl ExpandHandler<GetItems> for SlowStream {
             async fn handle_stream(
                 &mut self,
                 _: GetItems,
@@ -2995,7 +2995,7 @@ mod tests {
 
         let runtime = TestRuntime::new();
         let actor = runtime.spawn::<SlowStream>("slow", ());
-        let mut stream = actor.stream(GetItems, 1, None, None).unwrap();
+        let mut stream = actor.expand(GetItems, 1, None, None).unwrap();
 
         // Read slowly — backpressure should prevent buffer overflow
         let mut items = Vec::new();
@@ -3021,7 +3021,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl FeedHandler<u64, u64> for Summer {
+        impl ReduceHandler<u64, u64> for Summer {
             async fn handle_feed(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
@@ -3040,7 +3040,7 @@ mod tests {
 
         let input = futures::stream::iter(vec![10u64, 20, 30, 40, 50]);
         let reply = actor
-            .feed::<u64, u64>(Box::pin(input), 8, None, None)
+            .reduce::<u64, u64>(Box::pin(input), 8, None, None)
             .unwrap()
             .await
             .unwrap();
@@ -3059,7 +3059,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl FeedHandler<u64, u64> for Summer {
+        impl ReduceHandler<u64, u64> for Summer {
             async fn handle_feed(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
@@ -3078,7 +3078,7 @@ mod tests {
 
         let input = futures::stream::iter(Vec::<u64>::new());
         let reply = actor
-            .feed::<u64, u64>(Box::pin(input), 8, None, None)
+            .reduce::<u64, u64>(Box::pin(input), 8, None, None)
             .unwrap()
             .await
             .unwrap();
@@ -3099,7 +3099,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl FeedHandler<u64, Vec<u64>> for Collector {
+        impl ReduceHandler<u64, Vec<u64>> for Collector {
             async fn handle_feed(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
@@ -3119,7 +3119,7 @@ mod tests {
         let values: Vec<u64> = (0..100).collect();
         let input = futures::stream::iter(values.clone());
         let reply = actor
-            .feed::<u64, Vec<u64>>(Box::pin(input), 16, None, None)
+            .reduce::<u64, Vec<u64>>(Box::pin(input), 16, None, None)
             .unwrap()
             .await
             .unwrap();
@@ -3138,7 +3138,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl FeedHandler<u64, u64> for SlowConsumer {
+        impl ReduceHandler<u64, u64> for SlowConsumer {
             async fn handle_feed(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
@@ -3158,7 +3158,7 @@ mod tests {
 
         let input = futures::stream::iter(0u64..20);
         let reply = actor
-            .feed::<u64, u64>(Box::pin(input), 1, None, None)
+            .reduce::<u64, u64>(Box::pin(input), 1, None, None)
             .unwrap()
             .await
             .unwrap();
@@ -3271,7 +3271,7 @@ mod tests {
             type Reply = u64;
         }
         #[async_trait]
-        impl StreamHandler<StreamForever> for SlowStreamer {
+        impl ExpandHandler<StreamForever> for SlowStreamer {
             async fn handle_stream(
                 &mut self,
                 _msg: StreamForever,
@@ -3292,7 +3292,7 @@ mod tests {
         let runtime = TestRuntime::new();
         let actor = runtime.spawn::<SlowStreamer>("streamer", ());
         let token = cancel_after(Duration::from_millis(100));
-        let mut stream = actor.stream(StreamForever, 4, None, Some(token)).unwrap();
+        let mut stream = actor.expand(StreamForever, 4, None, Some(token)).unwrap();
 
         let mut items = Vec::new();
         while let Some(item) = stream.next().await {
@@ -3316,7 +3316,7 @@ mod tests {
             }
         }
         #[async_trait]
-        impl FeedHandler<u64, Vec<u64>> for FeedActor {
+        impl ReduceHandler<u64, Vec<u64>> for FeedActor {
             async fn handle_feed(
                 &mut self,
                 mut receiver: StreamReceiver<u64>,
@@ -3341,7 +3341,7 @@ mod tests {
 
         let token = cancel_after(Duration::from_millis(100));
         let result = actor
-            .feed::<u64, Vec<u64>>(Box::pin(input), 4, None, Some(token))
+            .reduce::<u64, Vec<u64>>(Box::pin(input), 4, None, Some(token))
             .unwrap()
             .await;
         // The operation was cancelled — either we get a partial result or an error
@@ -3498,7 +3498,7 @@ mod tests {
         // ── Batched stream/feed integration tests ─────────────────────────
 
         #[tokio::test]
-        async fn test_stream_batched_returns_items_in_order() {
+        async fn test_expand_batched_returns_items_in_order() {
             use crate::stream::BatchConfig;
             use tokio_stream::StreamExt;
 
@@ -3510,7 +3510,7 @@ mod tests {
 
             let batch_config = BatchConfig::new(2, Duration::from_secs(10));
             let mut stream = server
-                .stream(GetLogs, 16, Some(batch_config), None)
+                .expand(GetLogs, 16, Some(batch_config), None)
                 .unwrap();
             let mut items = Vec::new();
             while let Some(item) = stream.next().await {
@@ -3521,7 +3521,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_feed_batched_sum() {
+        async fn test_reduce_batched_sum() {
             use crate::stream::BatchConfig;
 
             struct Summer;
@@ -3534,7 +3534,7 @@ mod tests {
             }
 
             #[async_trait]
-            impl FeedHandler<u64, u64> for Summer {
+            impl ReduceHandler<u64, u64> for Summer {
                 async fn handle_feed(
                     &mut self,
                     mut receiver: StreamReceiver<u64>,
@@ -3554,7 +3554,7 @@ mod tests {
             let input = futures::stream::iter(vec![10u64, 20, 30, 40, 50]);
             let batch_config = BatchConfig::new(3, Duration::from_secs(10));
             let total = actor
-                .feed::<u64, u64>(Box::pin(input), 8, Some(batch_config), None)
+                .reduce::<u64, u64>(Box::pin(input), 8, Some(batch_config), None)
                 .unwrap()
                 .await
                 .unwrap();

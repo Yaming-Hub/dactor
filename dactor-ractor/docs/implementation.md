@@ -85,8 +85,8 @@ The `Dispatch<A>` trait has four concrete implementations:
 |--------------|---------|-----------------|
 | `TypedDispatch { msg }` | `tell()` | None (fire-and-forget) |
 | `AskDispatch { msg, reply_tx, cancel }` | `ask()` | `oneshot::Sender` |
-| `StreamDispatch { msg, sender, cancel }` | `stream()` | `mpsc::Sender` |
-| `FeedDispatch { receiver, reply_tx, cancel }` | `feed()` | `oneshot::Sender` |
+| `ExpandDispatch { msg, sender, cancel }` | `expand()` | `mpsc::Sender` |
+| `ReduceDispatch { receiver, reply_tx, cancel }` | `reduce()` | `oneshot::Sender` |
 
 ## Inbound Interceptor Pipeline
 
