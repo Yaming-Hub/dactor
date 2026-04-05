@@ -14,6 +14,7 @@ use dactor::node::{ActorId, NodeId};
 use dactor::system_actors::*;
 use dactor::type_registry::TypeRegistry;
 
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 /// Result type for spawn requests.
@@ -41,6 +42,7 @@ pub enum SpawnManagerMsg {
     RegisterFactory {
         type_name: String,
         factory: FactoryFn,
+        reply: oneshot::Sender<()>,
     },
     /// Query spawned actors list.
     GetSpawnedActors {
@@ -55,13 +57,15 @@ pub struct SpawnManagerActor;
 pub struct SpawnManagerState {
     manager: SpawnManager,
     node_id: NodeId,
-    next_local: std::sync::atomic::AtomicU64,
+    /// Shared ID counter — must be the same `Arc` used by the runtime
+    /// to prevent local/remote ActorId collisions.
+    next_local: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ractor::Actor for SpawnManagerActor {
     type Msg = SpawnManagerMsg;
     type State = SpawnManagerState;
-    type Arguments = (NodeId, TypeRegistry);
+    type Arguments = (NodeId, TypeRegistry, Arc<std::sync::atomic::AtomicU64>);
 
     async fn pre_start(
         &self,
@@ -71,7 +75,7 @@ impl ractor::Actor for SpawnManagerActor {
         Ok(SpawnManagerState {
             manager: SpawnManager::new(args.1),
             node_id: args.0,
-            next_local: std::sync::atomic::AtomicU64::new(1),
+            next_local: args.2,
         })
     }
 
@@ -105,11 +109,13 @@ impl ractor::Actor for SpawnManagerActor {
             SpawnManagerMsg::RegisterFactory {
                 type_name,
                 factory,
+                reply,
             } => {
                 state
                     .manager
                     .type_registry_mut()
                     .register_factory(type_name, factory);
+                let _ = reply.send(());
             }
             SpawnManagerMsg::GetSpawnedActors { reply } => {
                 let _ = reply.send(state.manager.spawned_actors().to_vec());
@@ -272,6 +278,11 @@ pub enum NodeDirectoryMsg {
     GetConnectedCount {
         reply: oneshot::Sender<usize>,
     },
+    /// Query peer info (address, status).
+    GetPeerInfo {
+        peer_id: NodeId,
+        reply: oneshot::Sender<Option<PeerInfo>>,
+    },
 }
 
 /// Native ractor actor wrapping [`NodeDirectory`].
@@ -318,6 +329,9 @@ impl ractor::Actor for NodeDirectoryActor {
             }
             NodeDirectoryMsg::GetConnectedCount { reply } => {
                 let _ = reply.send(state.connected_count());
+            }
+            NodeDirectoryMsg::GetPeerInfo { peer_id, reply } => {
+                let _ = reply.send(state.get_peer(&peer_id).cloned());
             }
         }
         Ok(())

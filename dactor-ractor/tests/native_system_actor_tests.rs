@@ -25,7 +25,7 @@ async fn na1_spawn_manager_actor_handles_request() {
 
     let node_id = NodeId("na-node".into());
     let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, SpawnManagerActor, (node_id.clone(), registry))
+        ractor::Actor::spawn(None, SpawnManagerActor, (node_id.clone(), registry, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1))))
             .await
             .expect("spawn failed");
 
@@ -67,7 +67,7 @@ async fn na1_spawn_manager_actor_unknown_type() {
     let registry = TypeRegistry::new();
     let node_id = NodeId("na-node".into());
     let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, SpawnManagerActor, (node_id, registry))
+        ractor::Actor::spawn(None, SpawnManagerActor, (node_id, registry, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1))))
             .await
             .expect("spawn failed");
 
@@ -102,20 +102,21 @@ async fn na1_spawn_manager_actor_register_factory() {
     let registry = TypeRegistry::new();
     let node_id = NodeId("na-node".into());
     let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, SpawnManagerActor, (node_id, registry))
+        ractor::Actor::spawn(None, SpawnManagerActor, (node_id, registry, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1))))
             .await
             .expect("spawn failed");
 
-    // Register factory via message
+    // Register factory via message — await reply for synchronization
+    let (reg_tx, reg_rx) = tokio::sync::oneshot::channel();
     actor_ref
         .cast(SpawnManagerMsg::RegisterFactory {
             type_name: "test::Unit".into(),
             factory: Box::new(|_| Ok(Box::new(()))),
+            reply: reg_tx,
         })
         .expect("send failed");
 
-    // Small delay to ensure message is processed
-    tokio::task::yield_now().await;
+    reg_rx.await.expect("registration should complete");
 
     // Now spawn should succeed
     let request = SpawnRequest {
@@ -414,15 +415,27 @@ async fn na4_node_directory_actor_reconnect_preserves_address() {
 
     tokio::task::yield_now().await;
 
-    // Should still be connected
+    // Should still be connected with preserved address
     let (tx, rx) = tokio::sync::oneshot::channel();
     actor_ref
         .cast(NodeDirectoryMsg::IsConnected {
-            peer_id: peer,
+            peer_id: peer.clone(),
             reply: tx,
         })
         .expect("send failed");
     assert!(rx.await.unwrap());
+
+    // Verify address was preserved
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    actor_ref
+        .cast(NodeDirectoryMsg::GetPeerInfo {
+            peer_id: peer,
+            reply: tx,
+        })
+        .expect("send failed");
+    let info = rx.await.unwrap().expect("peer should exist");
+    assert_eq!(info.address.as_deref(), Some("10.0.0.1:4697"),
+        "address should be preserved on reconnect without explicit address");
 
     actor_ref.stop(None);
 }
