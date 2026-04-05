@@ -457,4 +457,89 @@ fn with_node_id_initializes_all_system_actors() {
     assert_eq!(runtime.node_directory().peer_count(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// NR2: ClusterEvent emission on connect/disconnect
+// ---------------------------------------------------------------------------
 
+#[test]
+fn nr2_connect_peer_emits_node_joined() {
+    use dactor::{ClusterEvent, ClusterEvents};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mut runtime = KameoRuntime::new();
+    let joined_count = std::sync::Arc::new(AtomicU64::new(0));
+    let joined_clone = joined_count.clone();
+
+    runtime.cluster_events().subscribe(Box::new(move |event| {
+        if matches!(event, ClusterEvent::NodeJoined(_)) {
+            joined_clone.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    })).unwrap();
+
+    runtime.connect_peer(NodeId("peer-1".into()), None);
+    assert_eq!(joined_count.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[test]
+fn nr2_disconnect_peer_emits_node_left() {
+    use dactor::{ClusterEvent, ClusterEvents};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mut runtime = KameoRuntime::new();
+    let left_count = std::sync::Arc::new(AtomicU64::new(0));
+    let left_clone = left_count.clone();
+
+    runtime.cluster_events().subscribe(Box::new(move |event| {
+        if matches!(event, ClusterEvent::NodeLeft(_)) {
+            left_clone.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    })).unwrap();
+
+    let peer = NodeId("peer-1".into());
+    runtime.connect_peer(peer.clone(), None);
+    runtime.disconnect_peer(&peer);
+
+    assert_eq!(left_count.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[test]
+fn nr2_reconnect_emits_only_one_join() {
+    use dactor::{ClusterEvent, ClusterEvents};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mut runtime = KameoRuntime::new();
+    let joined_count = std::sync::Arc::new(AtomicU64::new(0));
+    let joined_clone = joined_count.clone();
+
+    runtime.cluster_events().subscribe(Box::new(move |event| {
+        if matches!(event, ClusterEvent::NodeJoined(_)) {
+            joined_clone.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    })).unwrap();
+
+    let peer = NodeId("peer-1".into());
+    runtime.connect_peer(peer.clone(), None);
+    runtime.connect_peer(peer.clone(), None);
+
+    assert_eq!(joined_count.load(AtomicOrdering::SeqCst), 1,
+        "reconnecting an already-connected peer should not emit NodeJoined again");
+}
+
+#[test]
+fn nr2_disconnect_unconnected_does_not_emit() {
+    use dactor::{ClusterEvent, ClusterEvents};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let mut runtime = KameoRuntime::new();
+    let left_count = std::sync::Arc::new(AtomicU64::new(0));
+    let left_clone = left_count.clone();
+
+    runtime.cluster_events().subscribe(Box::new(move |event| {
+        if matches!(event, ClusterEvent::NodeLeft(_)) {
+            left_clone.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    })).unwrap();
+
+    runtime.disconnect_peer(&NodeId("unknown".into()));
+    assert_eq!(left_count.load(AtomicOrdering::SeqCst), 0);
+}
