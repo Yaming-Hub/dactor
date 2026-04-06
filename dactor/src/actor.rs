@@ -384,8 +384,10 @@ pub trait ActorRef<A: Actor>: Clone + Send + Sync + 'static {
     ///
     /// `buffer` controls the internal channel capacity (backpressure).
     ///
-    /// Pass `batch_config` to enable batching on the output stream (reduces
-    /// per-item overhead for remote actors). `None` means unbatched delivery.
+    /// Pass `batch_config` to enable batching on the output stream.  Batching
+    /// groups output items into vectors by `max_items` or `max_delay`,
+    /// amortizing serialization and network costs for remote actors.
+    /// `None` means unbatched per-item delivery.
     ///
     /// Pass a [`CancellationToken`] to cooperatively cancel the transform.
     ///

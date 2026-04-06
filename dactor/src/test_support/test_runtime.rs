@@ -3558,6 +3558,45 @@ mod tests {
         assert_eq!(output, vec![60]);
     }
 
+    #[tokio::test]
+    async fn test_transform_batched_preserves_order() {
+        use crate::stream::BatchConfig;
+        use tokio_stream::StreamExt;
+
+        struct Doubler;
+        impl Actor for Doubler {
+            type Args = ();
+            type Deps = ();
+            fn create(_: (), _: ()) -> Self {
+                Doubler
+            }
+        }
+
+        #[async_trait]
+        impl TransformHandler<i32, i32> for Doubler {
+            async fn handle_transform(
+                &mut self,
+                item: i32,
+                sender: &StreamSender<i32>,
+                _ctx: &mut ActorContext,
+            ) {
+                let _ = sender.send(item * 2).await;
+            }
+        }
+
+        let runtime = TestRuntime::new();
+        let actor = runtime.spawn::<Doubler>("doubler-batched", ()).await.unwrap();
+
+        let input = Box::pin(futures::stream::iter(vec![1, 2, 3, 4, 5]));
+        let batch_config = BatchConfig::new(2, Duration::from_secs(10));
+        let output: Vec<i32> = actor
+            .transform::<i32, i32>(input, 8, Some(batch_config), None)
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(output, vec![2, 4, 6, 8, 10], "batched transform should preserve order");
+    }
+
     // ── Cancellation tests ──────────────────────────────
 
     #[tokio::test]
