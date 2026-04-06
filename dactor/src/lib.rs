@@ -103,7 +103,7 @@ pub use actor::ReduceHandler;
 pub use actor::{Actor, ActorContext, ActorError, ActorRef, SpawnConfig};
 pub use actor::{AskReply, Handler, ExpandHandler, TransformHandler};
 pub use async_trait::async_trait;
-pub use broadcast::{BroadcastReceipt, BroadcastRef, BroadcastTellResult, TellOutcome};
+pub use broadcast::{BroadcastReceipt, BroadcastRef, BroadcastTellResult, BroadcastTellOutcome};
 #[cfg(feature = "serde")]
 pub use batched_transport::{
     is_batch_envelope, unpack_batch, BatchedTransportSender, WireEnvelopeBatch, BATCH_MESSAGE_TYPE,
