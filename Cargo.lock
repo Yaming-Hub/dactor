@@ -218,6 +218,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "dactor",
+ "dactor-test-harness",
  "futures",
  "ractor",
  "serde_json",
@@ -225,12 +226,14 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "dactor-test-harness"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "dactor",
  "dashmap",
  "prost",

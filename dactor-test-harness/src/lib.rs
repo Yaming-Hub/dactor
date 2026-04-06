@@ -9,10 +9,12 @@
 pub mod cluster;
 pub mod events;
 pub mod fault;
+pub mod handler;
 pub mod node;
 pub mod protocol;
 
 pub use cluster::{TestCluster, TestClusterBuilder};
 pub use events::EventStream;
 pub use fault::FaultInjector;
+pub use handler::CommandHandler;
 pub use node::{TestNode, TestNodeConfig};

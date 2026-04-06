@@ -20,6 +20,12 @@ service TestNodeService {
 
     // Custom application commands
     rpc CustomCommand(CustomRequest) returns (CustomResponse);
+
+    // Actor management
+    rpc SpawnActor(SpawnActorRequest) returns (SpawnActorResponse);
+    rpc TellActor(TellActorRequest) returns (TellActorResponse);
+    rpc AskActor(AskActorRequest) returns (AskActorResponse);
+    rpc StopActor(StopActorRequest) returns (StopActorResponse);
 }
 
 message Empty {}
@@ -71,4 +77,48 @@ message CustomRequest {
 
 message CustomResponse {
     bytes payload = 1;
+}
+
+message SpawnActorRequest {
+    string actor_type = 1;
+    string actor_name = 2;
+    bytes args = 3;
+}
+
+message SpawnActorResponse {
+    bool success = 1;
+    string actor_id = 2;
+    string error = 3;
+}
+
+message TellActorRequest {
+    string actor_name = 1;
+    string message_type = 2;
+    bytes payload = 3;
+}
+
+message TellActorResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message AskActorRequest {
+    string actor_name = 1;
+    string message_type = 2;
+    bytes payload = 3;
+}
+
+message AskActorResponse {
+    bool success = 1;
+    bytes payload = 2;
+    string error = 3;
+}
+
+message StopActorRequest {
+    string actor_name = 1;
+}
+
+message StopActorResponse {
+    bool success = 1;
+    string error = 2;
 }

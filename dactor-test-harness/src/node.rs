@@ -6,6 +6,7 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
 use crate::fault::FaultInjector;
+use crate::handler::CommandHandler;
 use crate::protocol::test_node_service_server::{TestNodeService, TestNodeServiceServer};
 use crate::protocol::*;
 
@@ -31,6 +32,7 @@ pub struct TestNode {
     shutdown_flag: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
     actor_count: Arc<AtomicU32>,
+    handler: Option<Arc<dyn CommandHandler>>,
 }
 
 impl TestNode {
@@ -44,6 +46,22 @@ impl TestNode {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             actor_count: Arc::new(AtomicU32::new(0)),
+            handler: None,
+        }
+    }
+
+    /// Create a TestNode with a command handler for actor management.
+    pub fn with_handler(config: TestNodeConfig, handler: Arc<dyn CommandHandler>) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
+        Self {
+            config,
+            start_time: Instant::now(),
+            fault_injector: Arc::new(FaultInjector::new()),
+            event_tx,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(Notify::new()),
+            actor_count: Arc::new(AtomicU32::new(0)),
+            handler: Some(handler),
         }
     }
 
@@ -91,11 +109,20 @@ impl TestNodeService for TestNode {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<NodeInfoResponse>, Status> {
+        let actor_count = if let Some(ref handler) = self.handler {
+            handler.actor_count()
+        } else {
+            self.actor_count.load(Ordering::Relaxed)
+        };
         Ok(Response::new(NodeInfoResponse {
             node_id: self.config.node_id.clone(),
             uptime_ms: self.start_time.elapsed().as_millis() as u64,
-            adapter: "none".to_string(),
-            actor_count: self.actor_count.load(Ordering::Relaxed),
+            adapter: if self.handler.is_some() {
+                "ractor".to_string()
+            } else {
+                "none".to_string()
+            },
+            actor_count,
         }))
     }
 
@@ -152,7 +179,7 @@ impl TestNodeService for TestNode {
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .filter_map(|result| result.ok())
             .filter(move |event| event_types.is_empty() || event_types.contains(&event.event_type))
-            .map(|event| Ok(event));
+            .map(Ok);
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -165,5 +192,144 @@ impl TestNodeService for TestNode {
             "custom command '{}' not registered",
             req.command_type
         )))
+    }
+
+    async fn spawn_actor(
+        &self,
+        request: Request<SpawnActorRequest>,
+    ) -> Result<Response<SpawnActorResponse>, Status> {
+        let handler = self
+            .handler
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("no command handler registered"))?;
+        let req = request.into_inner();
+        match handler
+            .spawn_actor(&req.actor_type, &req.actor_name, &req.args)
+            .await
+        {
+            Ok(actor_id) => {
+                self.emit_event(
+                    "actor_spawned",
+                    &serde_json::json!({
+                        "actor_type": req.actor_type,
+                        "actor_name": req.actor_name,
+                        "actor_id": actor_id,
+                    })
+                    .to_string(),
+                );
+                Ok(Response::new(SpawnActorResponse {
+                    success: true,
+                    actor_id,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(SpawnActorResponse {
+                success: false,
+                actor_id: String::new(),
+                error: e,
+            })),
+        }
+    }
+
+    async fn tell_actor(
+        &self,
+        request: Request<TellActorRequest>,
+    ) -> Result<Response<TellActorResponse>, Status> {
+        let handler = self
+            .handler
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("no command handler registered"))?;
+        let req = request.into_inner();
+
+        // Check for active fault injection
+        if self
+            .fault_injector
+            .has_fault("partition", &req.actor_name)
+        {
+            return Ok(Response::new(TellActorResponse {
+                success: false,
+                error: "partition: message delivery blocked".to_string(),
+            }));
+        }
+
+        match handler
+            .tell_actor(&req.actor_name, &req.message_type, &req.payload)
+            .await
+        {
+            Ok(()) => Ok(Response::new(TellActorResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(TellActorResponse {
+                success: false,
+                error: e,
+            })),
+        }
+    }
+
+    async fn ask_actor(
+        &self,
+        request: Request<AskActorRequest>,
+    ) -> Result<Response<AskActorResponse>, Status> {
+        let handler = self
+            .handler
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("no command handler registered"))?;
+        let req = request.into_inner();
+
+        // Check for active fault injection
+        if self
+            .fault_injector
+            .has_fault("partition", &req.actor_name)
+        {
+            return Ok(Response::new(AskActorResponse {
+                success: false,
+                payload: Vec::new(),
+                error: "partition: message delivery blocked".to_string(),
+            }));
+        }
+
+        match handler
+            .ask_actor(&req.actor_name, &req.message_type, &req.payload)
+            .await
+        {
+            Ok(payload) => Ok(Response::new(AskActorResponse {
+                success: true,
+                payload,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(AskActorResponse {
+                success: false,
+                payload: Vec::new(),
+                error: e,
+            })),
+        }
+    }
+
+    async fn stop_actor(
+        &self,
+        request: Request<StopActorRequest>,
+    ) -> Result<Response<StopActorResponse>, Status> {
+        let handler = self
+            .handler
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("no command handler registered"))?;
+        let req = request.into_inner();
+        match handler.stop_actor(&req.actor_name).await {
+            Ok(()) => {
+                self.emit_event(
+                    "actor_stopped",
+                    &serde_json::json!({ "actor_name": req.actor_name }).to_string(),
+                );
+                Ok(Response::new(StopActorResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(StopActorResponse {
+                success: false,
+                error: e,
+            })),
+        }
     }
 }

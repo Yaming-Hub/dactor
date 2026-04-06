@@ -118,6 +118,82 @@ impl TestCluster {
         Ok(response.into_inner().payload)
     }
 
+    /// Spawn an actor on a node.
+    pub async fn spawn_actor(
+        &mut self,
+        node_id: &str,
+        actor_type: &str,
+        actor_name: &str,
+        args: &[u8],
+    ) -> Result<SpawnActorResponse, Box<dyn std::error::Error>> {
+        let handle = self.nodes.get_mut(node_id).ok_or("node not found")?;
+        let client = handle.client.as_mut().ok_or("not connected")?;
+        let response = client
+            .spawn_actor(SpawnActorRequest {
+                actor_type: actor_type.to_string(),
+                actor_name: actor_name.to_string(),
+                args: args.to_vec(),
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Send a fire-and-forget message to an actor on a node.
+    pub async fn tell_actor(
+        &mut self,
+        node_id: &str,
+        actor_name: &str,
+        message_type: &str,
+        payload: &[u8],
+    ) -> Result<TellActorResponse, Box<dyn std::error::Error>> {
+        let handle = self.nodes.get_mut(node_id).ok_or("node not found")?;
+        let client = handle.client.as_mut().ok_or("not connected")?;
+        let response = client
+            .tell_actor(TellActorRequest {
+                actor_name: actor_name.to_string(),
+                message_type: message_type.to_string(),
+                payload: payload.to_vec(),
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Send a request-reply message to an actor on a node.
+    pub async fn ask_actor(
+        &mut self,
+        node_id: &str,
+        actor_name: &str,
+        message_type: &str,
+        payload: &[u8],
+    ) -> Result<AskActorResponse, Box<dyn std::error::Error>> {
+        let handle = self.nodes.get_mut(node_id).ok_or("node not found")?;
+        let client = handle.client.as_mut().ok_or("not connected")?;
+        let response = client
+            .ask_actor(AskActorRequest {
+                actor_name: actor_name.to_string(),
+                message_type: message_type.to_string(),
+                payload: payload.to_vec(),
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Stop an actor on a node.
+    pub async fn stop_actor(
+        &mut self,
+        node_id: &str,
+        actor_name: &str,
+    ) -> Result<StopActorResponse, Box<dyn std::error::Error>> {
+        let handle = self.nodes.get_mut(node_id).ok_or("node not found")?;
+        let client = handle.client.as_mut().ok_or("not connected")?;
+        let response = client
+            .stop_actor(StopActorRequest {
+                actor_name: actor_name.to_string(),
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
     /// Graceful shutdown of a specific node.
     pub async fn shutdown_node(&mut self, node_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(handle) = self.nodes.get_mut(node_id) {
