@@ -741,7 +741,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         &self,
         input: BoxStream<InputItem>,
         buffer: usize,
-        _batch_config: Option<BatchConfig>,
+        batch_config: Option<BatchConfig>,
         cancel: Option<CancellationToken>,
     ) -> Result<BoxStream<OutputItem>, ActorSendError>
     where
@@ -751,7 +751,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
     {
         let buffer = buffer.max(1);
         let (item_tx, item_rx) = tokio::sync::mpsc::channel(buffer);
-        let (output_tx, output_rx) = tokio::sync::mpsc::channel(buffer);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(buffer);
         let receiver = StreamReceiver::new(item_rx);
         let sender = StreamSender::new(output_tx);
         let dispatch: Box<dyn Dispatch<A>> = Box::new(TransformDispatch::new(
@@ -770,13 +770,58 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
             std::any::type_name::<InputItem>(),
         );
 
-        Ok(wrap_stream_with_interception(
-            output_rx,
-            buffer,
-            pipeline,
-            std::any::type_name::<OutputItem>(),
-            SendMode::Transform,
-        ))
+        match batch_config {
+            Some(batch_config) => {
+                let (batch_tx, batch_rx) =
+                    tokio::sync::mpsc::channel::<Vec<OutputItem>>(buffer);
+                let reader = BatchReader::new(batch_rx);
+                let batch_delay = batch_config.max_delay;
+                tokio::spawn(async move {
+                    let mut writer = BatchWriter::new(batch_tx, batch_config);
+                    loop {
+                        if writer.buffered_count() > 0 {
+                            let deadline = tokio::time::Instant::now() + batch_delay;
+                            tokio::select! {
+                                biased;
+                                item = output_rx.recv() => match item {
+                                    Some(item) => {
+                                        if writer.push(item).await.is_err() { break; }
+                                    }
+                                    None => break,
+                                },
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    if writer.check_deadline().await.is_err() { break; }
+                                }
+                            }
+                        } else {
+                            match output_rx.recv().await {
+                                Some(item) => {
+                                    if writer.push(item).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    let _ = writer.flush().await;
+                });
+                Ok(wrap_batched_stream_with_interception(
+                    reader,
+                    buffer,
+                    pipeline,
+                    std::any::type_name::<OutputItem>(),
+                    SendMode::Transform,
+                ))
+            }
+            None => Ok(wrap_stream_with_interception(
+                output_rx,
+                buffer,
+                pipeline,
+                std::any::type_name::<OutputItem>(),
+                SendMode::Transform,
+            )),
+        }
     }
 }
 
