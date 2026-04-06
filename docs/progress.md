@@ -4,25 +4,61 @@
 
 ---
 
-## Current Status (PR #95)
+## Current Status (PR #104)
 - Phase 3: ✅ Complete (features, examples, conformance, batching)
 - Phase 4: ✅ Complete — R1-R6, R3b, R6b-c, S1-S4, SE1-SE5, C1-C5, P1-P3 all done
 - Phase 6: ✅ Complete (supervision, pools, timers, on_reply, AM1-AM7 all done)
 - Phase 7: ✅ Complete (metrics, dead letters, circuit breaker, drop observer; O4 dropped)
-- Phase 8: ✅ NR1-NR3 done; NR4 (processing groups) remaining
+- Phase 8: ✅ Complete (NR1-NR4: registry, cluster events, processing groups)
 - Phase 9: ✅ NA1-NA9 done (native system actors + runtime auto-start); NA10 (transport routing) remaining
 - Phase 10: ✅ Complete (JH1-JH5: lifecycle handles, await_stop, panic propagation)
 - Phase 11: ✅ Complete (AS1-AS5,AS7: async spawn, Result return, removed std::thread bridge)
-- Phase 12: ✅ CP1-CP8,CP10 done (coerce real actors, parity tests); CP9 (mailbox config) remaining
-- Phase 13: TF1-TF3,TF5-TF7 done (TransformHandler, N→M streaming); TF4 (batch) remaining
-- Phase 14: BC1-BC4 done (BroadcastRef, tell, ask, receipts); BC5-BC9 remaining
-- Zero clippy warnings, 682+ tests, all workspace tests pass
+- Phase 12: ✅ Complete (CP1-CP10: coerce real actors, parity tests, mailbox config)
+- Phase 13: ✅ Complete (TF1-TF7: TransformHandler, N→M streaming, batch support)
+- Phase 14: ✅ Complete (BC1-BC9: BroadcastRef, tell/ask, receipts, pool integration, dead letters, tests)
+- AP6: ✅ Done (LeastLoaded pool routing + pending_messages trait method)
+- Zero clippy warnings, 714+ tests, all workspace tests pass
 - Build: `cargo clippy --workspace --exclude dactor-test-harness --all-targets --all-features -- -D warnings`
 - Test: `cargo test --workspace --exclude dactor-test-harness --features test-support` (exclude test-harness due to protoc permission issue)
 - Next: see "Pending Work" section below
 
+### Session 2026-04-06 Summary (PRs #96, #98-#103)
+- **BC1-BC5** (#96): BroadcastRef — tell/ask with timeout, receipts, dynamic membership
+- *PR #97 closed (superseded by #96 + #98)*
+- **BC5b** (#98): BroadcastRef review fixes — #[must_use], TellOutcome rename, RuntimeError::Send normalization, Default, contains()
+- **BC6-BC8** (#99): Pool integration (to_broadcast), interceptor docs, dead letter routing with DeadLetterHandler
+- **AP6** (#100): LeastLoaded pool routing — pending_messages() on ActorRef trait, two-pass tie-breaking
+- **TF4** (#101): Transform batch support — Option<BatchConfig> on ActorRef::transform() across all adapters
+- **CP9** (#102): Coerce bounded mailbox — BoundedMailboxSender, forwarding task, send_dispatch() helper
+- **NR4** (#103): ProcessingGroup — named actor groups with HashMap-backed O(1) join/leave, to_broadcast(), prune_dead()
+
+### Key Design Decisions Made This Session
+- BroadcastRef is owned (non-shared), not Arc-wrapped — callers use &mut self for membership
+- BroadcastReceipt has 4 variants: Ok, Timeout, SendError, ReplyError — separates send vs handler errors
+- Dead letter handler is optional Arc<dyn DeadLetterHandler> with catch_unwind for panic safety
+- LeastLoaded uses two-pass algorithm: find min, collect candidates, round-robin among ties
+- pending_messages() defaults to 0 on ActorRef trait — adapters override when mailbox depth is available
+- Coerce bounded mailbox uses front-buffer pattern: bounded mpsc → forwarder task → coerce unbounded
+- ProcessingGroup uses HashMap<ActorId, R> for O(1) membership; iteration order is not guaranteed
+- All PRs reviewed by 4 AI models (GPT-5.4, Gemini/Goldeneye, Claude Haiku 4.5, Claude Sonnet 4.5)
+
+### Multi-Model Review Process
+Every PR was reviewed by 4 AI models. Key bugs caught:
+- LeastLoaded tie-breaking only triggered when ALL workers tied (fixed: round-robin among all min-load candidates)
+- emit_dead_letter hardcoded SendMode::Tell for ask paths (fixed: pass SendMode parameter)
+- Coerce expand/reduce/transform bypassed bounded mailbox channel (fixed: send_dispatch() helper)
+- is_alive() only checked bounded channel, not inner actor validity (fixed: check both)
+- BroadcastRef struct doc said "silently ignored" for duplicate joins but BroadcastRef doesn't deduplicate (fixed)
+
+### Pending Work for Next Session
+1. **NA10**: Transport routing — WireEnvelope system messages to native actor mailboxes
+2. **SE6**: Protobuf system serialization
+3. **T1-T11**: E2E integration tests (blocked by protoc permission)
+
+### Documentation Updated This Session
+- `dactor-coerce/docs/implementation.md` — bounded mailbox parity table + limitations update
+
 ### Session 2026-04-05 Summary (PRs #80-#95)
-- **SA1-SA4** (#80): RactorRuntime system actor wiring — SpawnManager, WatchManager, CancelManager, NodeDirectory
 - **SA5-SA8** (#81): KameoRuntime system actor wiring
 - **SA10** (#82): CoerceRuntime system actor wiring + dual ID counter fix
 - **NA1-NA4** (#83): Native ractor system actors — real ractor::Actor impls with mailboxes
@@ -71,16 +107,9 @@ Findings were consolidated, addressed, and verified before merge. Key patterns f
 - &'static str in conformance helpers required by Rust async closure lifetime rules
 
 ### Pending Work for Next Session
-1. **In-progress (PR #95)**: Rename reduce/expand type params to InputItem/OutputItem + ExpandHandler refactor (M::Reply → explicit OutputItem)
-2. **NR4**: Processing groups — actor group pub/sub
-3. **NA10**: Transport routing — WireEnvelope system messages to native actor mailboxes
-4. **SE6**: Protobuf system serialization
-5. **TF4**: Transform batch support
-6. **BC1-BC9**: Broadcast — BroadcastRef, tell/ask with timeout, receipts
-7. **T1-T11**: E2E integration tests (blocked by protoc permission)
-8. **CP9**: Coerce mailbox config wiring
-9. **AP6**: LeastLoaded pool routing
-10. **Phase 10 JH4/JH5**: Consider renaming ReduceHandler<Item,Reply> → ReduceHandler<InputItem,Reply> for full consistency
+1. **NA10**: Transport routing — WireEnvelope system messages to native actor mailboxes
+2. **SE6**: Protobuf system serialization
+3. **T1-T11**: E2E integration tests (blocked by protoc permission)
 
 ### Documentation Created This Session
 - `docs/cluster-behavior.md` — K8s/EKS/VMSS autoscale, simultaneous restart, graceful shutdown, split-brain
@@ -414,7 +443,7 @@ Wire persistence traits into actor lifecycle (recovery, snapshots, durable state
 | AP3 | PoolRouting | §4.14 | RoundRobin, Random, KeyBased | ✅ PR #45 |
 | AP4 | Keyed trait | §4.14 | Extract routing keys for key-based routing | ✅ PR #45 |
 | AP5 | TestRuntime::spawn_pool() | §4.14 | Spawn N local workers | ✅ PR #45 |
-| AP6 | LeastLoaded routing | §4.14 | Route to worker with fewest queued messages | 🔲 Needs per-worker load tracking |
+| AP6 | LeastLoaded routing | §4.14 | Route to worker with fewest queued messages | ✅ PR #100 |
 | AP7 | Distributed pool | §4.14 | Workers across nodes via remote ActorRef (Phase 4) | 🔲 Depends on R3 |
 | AP8 | Virtual actor pool (v2) | §4.14 | Redesign pool as virtual router actor (see below) | 🔲 Design proposed |
 
@@ -543,7 +572,7 @@ impl<A: Actor> ActorRef<A> for PoolActorRef<A> {
 | NR1 | Actor naming & registry | §8.3 | runtime.lookup(name) for named actor discovery | ✅ PR #58 |
 | NR2 | ClusterEvent enum | §10.1, §10.4 | NodeJoined, NodeLeft push events | ✅ PR #86 (ractor, kameo; coerce deferred — stub) |
 | NR3 | Cluster event handlers | §10.4 | Actors subscribe to membership changes | ✅ PR #86 (ractor, kameo; coerce deferred — stub) |
-| NR4 | Processing groups | §2.2 | Actor group pub/sub (ractor pg, coerce sharding) |
+| NR4 | Processing groups | §2.2 | Actor group pub/sub (ractor pg, coerce sharding) | ✅ PR #103 |
 
 ---
 
@@ -747,7 +776,7 @@ This phase brings coerce to feature parity with ractor/kameo.
 | CP6 | Runtime auto-start | `start_system_actors()` spawns native coerce system actors | Medium | ✅ PR #90 |
 | CP7 | Interceptor pipeline | Ensure inbound/outbound interceptor pipelines work with real coerce actors (not just TestRuntime delegation) | Medium | ✅ Done |
 | CP8 | Watch/unwatch | Wire coerce's actor lifecycle into WatchManager for real DeathWatch notifications | Medium | ✅ Done |
-| CP9 | Mailbox config | Wire coerce's mailbox options (bounded/unbounded) instead of ignoring MailboxConfig | Low | 🔲 Not started |
+| CP9 | Mailbox config | Wire coerce's mailbox options (bounded/unbounded) instead of ignoring MailboxConfig | Low | ✅ PR #102 |
 | CP10 | Comprehensive tests | Adapter tests, system actor tests, lifecycle tests, conformance suite — all on real coerce runtime | High | ✅ Done |
 
 ### Design Notes
@@ -759,7 +788,8 @@ This phase brings coerce to feature parity with ractor/kameo.
   interceptor pipelines, watch/unwatch, and comprehensive tests all work on
   real coerce actors. All 41 tests pass (16 conformance + 24 system actor + 1 doc).
 - **CP5-CP6 complete** — native coerce system actors with runtime auto-start.
-- **CP9 remains** — bounded mailbox support (coerce uses unbounded internally).
+- **CP9 complete** (PR #102) — bounded mailbox via front-buffer `mpsc` channel
+  in front of coerce's unbounded internal mailbox.
 - **Limitation:** dactor actors used with the coerce adapter must be `Send + Sync`
   (required by `coerce::actor::Actor`). This is satisfied by most actors.
 
@@ -924,8 +954,10 @@ pub enum BroadcastReceipt<R> {
     Ok { actor_id: ActorId, reply: R },
     /// Actor did not reply within the timeout.
     Timeout { actor_id: ActorId },
-    /// Actor was unreachable or stopped.
-    Error { actor_id: ActorId, error: ActorSendError },
+    /// A send or transport-level failure prevented delivery to the actor.
+    SendError { actor_id: ActorId, error: ActorSendError },
+    /// The actor processed the message but the reply resolved to an error.
+    ReplyError { actor_id: ActorId, error: RuntimeError },
 }
 ```
 
@@ -933,15 +965,15 @@ pub enum BroadcastReceipt<R> {
 
 | # | Feature | Description | Status |
 |---|---------|-------------|--------|
-| BC1 | BroadcastRef<A> | A reference to a group of actors of the same type. Holds `Vec<Arc<dyn ErasedActorRef<A>>>` (type-erased to avoid object-safety issues with `ActorRef<A>` generic methods). | ✅ PR #96 |
-| BC2 | `broadcast.tell(msg)` | Fire-and-forget: clone and send `msg` to all actors. Requires `M: Clone`. Errors on individual actors are logged but don't fail the broadcast. | ✅ PR #96 |
+| BC1 | BroadcastRef<A> | A reference to a group of actors of the same type. Holds `Vec<R>` of actor references with `PhantomData<A>`. | ✅ PR #96 |
+| BC2 | `broadcast.tell(msg)` | Fire-and-forget: clone and send `msg` to all actors. Requires `M: Clone`. Returns `BroadcastTellResult` with per-actor outcomes. | ✅ PR #96 |
 | BC3 | `broadcast.ask(msg, timeout)` | Request-reply: clone and send `msg` to all actors, collect `BroadcastReceipt<R>` within timeout. Uses `tokio::time::timeout` per actor. | ✅ PR #96 |
-| BC4 | BroadcastReceipt<R> | Per-actor result enum: Ok, Timeout, Error. | ✅ PR #96 |
-| BC5 | Dynamic group membership | `group.add(actor_ref)`, `group.remove(actor_id)`. Owned (non-shared) `&mut self` API. Thread-safe shared membership (e.g. `Arc<RwLock>`) is a separate feature. | 🔲 Not started |
-| BC6 | Integration with actor pools | `PoolRef` can expose a `BroadcastRef` for sending to all workers. | 🔲 Not started |
-| BC7 | Interceptor support | Outbound interceptors run once per target actor (not once for the whole broadcast). | 🔲 Not started |
-| BC8 | Dead letter routing | Actors that are stopped get their messages routed to the dead letter handler. | 🔲 Not started |
-| BC9 | Tests | Broadcast tell/ask, partial failure, timeout, empty group, dynamic membership. | 🔲 Not started |
+| BC4 | BroadcastReceipt<R> | Per-actor result enum: Ok, Timeout, SendError, ReplyError. | ✅ PR #96,#98 |
+| BC5 | Dynamic group membership | `group.add(actor_ref)`, `group.remove(actor_id)`. Owned (non-shared) `&mut self` API. Thread-safe shared membership (e.g. `Arc<RwLock>`) is a separate feature. | ✅ PR #96 |
+| BC6 | Integration with actor pools | `PoolRef` can expose a `BroadcastRef` for sending to all workers. | ✅ PR #99 |
+| BC7 | Interceptor support | Outbound interceptors run once per target actor (not once for the whole broadcast). | ✅ PR #99 |
+| BC8 | Dead letter routing | Actors that are stopped get their messages routed to the dead letter handler. | ✅ PR #99 |
+| BC9 | Tests | Broadcast tell/ask, partial failure, timeout, empty group, dynamic membership. | ✅ PR #96-#99 |
 
 ### Design Notes
 
