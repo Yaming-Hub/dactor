@@ -41,6 +41,8 @@ pub mod dead_letter;
 pub mod dispatch;
 /// Error types for actor operations.
 pub mod errors;
+/// Named processing groups for actor pub/sub.
+pub mod group;
 /// Inbound and outbound message interceptors.
 pub mod interceptor;
 /// Mailbox capacity and overflow configuration.
@@ -93,6 +95,7 @@ pub mod prelude {
     pub use crate::clock::*;
     pub use crate::cluster::*;
     pub use crate::errors::*;
+    pub use crate::group::*;
     pub use crate::node::*;
     pub use crate::timer::*;
 }
@@ -104,6 +107,7 @@ pub use actor::{Actor, ActorContext, ActorError, ActorRef, SpawnConfig};
 pub use actor::{AskReply, Handler, ExpandHandler, TransformHandler};
 pub use async_trait::async_trait;
 pub use broadcast::{BroadcastReceipt, BroadcastRef, BroadcastTellResult, BroadcastTellOutcome};
+pub use group::ProcessingGroup;
 #[cfg(feature = "serde")]
 pub use batched_transport::{
     is_batch_envelope, unpack_batch, BatchedTransportSender, WireEnvelopeBatch, BATCH_MESSAGE_TYPE,
