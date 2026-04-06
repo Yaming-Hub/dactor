@@ -45,6 +45,7 @@ pub enum PoolRouting {
     /// Requires the underlying [`ActorRef`] to implement
     /// [`pending_messages()`](ActorRef::pending_messages).  Adapters that
     /// return `0` (the default) effectively degrade to round-robin.
+    /// **Use when workers have variable processing times or bursty load.**
     LeastLoaded,
 }
 
@@ -190,26 +191,41 @@ impl<A: Actor, R: ActorRef<A>> PoolRef<A, R> {
     }
 
     /// Select the worker with the fewest pending messages.
-    /// Breaks ties with round-robin to avoid thundering-herd on the same worker.
+    ///
+    /// When multiple workers tie at the minimum load, round-robin among
+    /// them to avoid thundering-herd on a single worker.
+    ///
+    /// **Performance:** O(n) scan per message where n = pool size.
+    /// For large pools (>100 workers), consider `RoundRobin` or `Random`.
+    ///
+    /// **Concurrency:** Load snapshots are taken without synchronization
+    /// and may become stale before the message is sent.  This is inherent
+    /// to lock-free load balancing and acceptable in practice.
     fn least_loaded_index(&self) -> usize {
-        let mut min_load = usize::MAX;
-        let mut min_idx = 0;
-        let mut tie_count = 0u64;
-        for (i, w) in self.workers.iter().enumerate() {
-            let load = w.pending_messages();
-            if load < min_load {
-                min_load = load;
-                min_idx = i;
-                tie_count = 1;
-            } else if load == min_load {
-                tie_count += 1;
-            }
+        // First pass: find the minimum load
+        let min_load = self
+            .workers
+            .iter()
+            .map(|w| w.pending_messages())
+            .min()
+            .unwrap_or(0);
+
+        // Collect indices of all workers tied at the minimum
+        let candidates: Vec<usize> = self
+            .workers
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.pending_messages() == min_load)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Round-robin among tied candidates
+        if candidates.len() == 1 {
+            candidates[0]
+        } else {
+            let idx = self.counter.fetch_add(1, Ordering::Relaxed);
+            candidates[(idx as usize) % candidates.len()]
         }
-        // If all workers have the same load, fall back to round-robin
-        if tie_count == self.workers.len() as u64 {
-            return self.round_robin_index();
-        }
-        min_idx
     }
 
     /// Select a worker reference based on the current routing strategy
@@ -746,7 +762,7 @@ mod tests {
 
         // Send 6 messages quickly — with slow handlers, they queue up
         for _ in 0..6 {
-            let _ = pool.tell(SlowPing);
+            pool.tell(SlowPing).unwrap();
         }
 
         // Give a tiny moment for sends to land
@@ -762,6 +778,14 @@ mod tests {
         assert!(
             total_pending > 0,
             "some messages should be pending due to slow handlers, got {:?}",
+            loads
+        );
+
+        // Verify load is distributed — at least 2 workers have messages
+        let workers_with_messages = loads.iter().filter(|&&l| l > 0).count();
+        assert!(
+            workers_with_messages > 1,
+            "messages should be distributed across workers, got loads: {:?}",
             loads
         );
     }

@@ -299,9 +299,10 @@ pub trait ActorRef<A: Actor>: Clone + Send + Sync + 'static {
 
     /// Approximate number of messages pending in the actor's mailbox.
     ///
-    /// Used by [`PoolRouting::LeastLoaded`](crate::pool::PoolRouting::LeastLoaded)
-    /// to route to the least-busy worker.  Returns `0` by default; adapters
-    /// that can query their mailbox depth should override this.
+    /// This is a best-effort snapshot that may be stale immediately after
+    /// reading.  Used by [`PoolRouting::LeastLoaded`](crate::pool::PoolRouting::LeastLoaded)
+    /// to route to the least-busy worker.  Returns `0` by default;
+    /// adapters that can query their mailbox depth should override this.
     fn pending_messages(&self) -> usize {
         0
     }
