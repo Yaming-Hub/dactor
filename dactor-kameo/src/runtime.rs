@@ -515,10 +515,15 @@ impl<A: Actor + 'static> ActorRef<A> for KameoActorRef<A> {
 
         let dispatch: Box<dyn Dispatch<A>> = Box::new(TypedDispatch { msg });
         self.send_dispatch(dispatch).map_err(|e| {
+                let reason = if e.0.contains("full") {
+                    DeadLetterReason::MailboxFull
+                } else {
+                    DeadLetterReason::ActorStopped
+                };
                 self.notify_dead_letter(
                     std::any::type_name::<M>(),
                     SendMode::Tell,
-                    DeadLetterReason::ActorStopped,
+                    reason,
                 );
                 ActorSendError(e.to_string())
             })
@@ -570,10 +575,15 @@ impl<A: Actor + 'static> ActorRef<A> for KameoActorRef<A> {
             cancel,
         });
         self.send_dispatch(dispatch).map_err(|e| {
+                let reason = if e.0.contains("full") {
+                    DeadLetterReason::MailboxFull
+                } else {
+                    DeadLetterReason::ActorStopped
+                };
                 self.notify_dead_letter(
                     std::any::type_name::<M>(),
                     SendMode::Ask,
-                    DeadLetterReason::ActorStopped,
+                    reason,
                 );
                 ActorSendError(e.to_string())
             })?;
