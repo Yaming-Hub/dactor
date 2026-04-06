@@ -43,18 +43,18 @@ use generated::*;
 // Size limit
 // ---------------------------------------------------------------------------
 
-/// Maximum allowed size for a system message protobuf payload (1 MB).
+/// Maximum allowed size for a system message protobuf payload (4 MB).
 ///
 /// Enforced before decoding to prevent allocation-based DoS from untrusted
 /// peers. Application messages are not affected — they use separate
 /// [`MessageSerializer`](crate::remote::MessageSerializer) implementations.
-pub const MAX_SYSTEM_MSG_SIZE: usize = 1024 * 1024;
+pub const MAX_SYSTEM_MSG_SIZE: usize = 4 * 1024 * 1024;
 
-/// Maximum allowed size for a WireEnvelope protobuf frame (4 MB).
+/// Maximum allowed size for a WireEnvelope protobuf frame (64 MB).
 ///
 /// Larger than system message limit because the body may contain a serialized
 /// application message of arbitrary size.
-pub const MAX_WIRE_ENVELOPE_SIZE: usize = 4 * 1024 * 1024;
+pub const MAX_WIRE_ENVELOPE_SIZE: usize = 64 * 1024 * 1024;
 
 fn check_size(bytes: &[u8], limit: usize, what: &str) -> Result<(), SerializationError> {
     if bytes.len() > limit {
