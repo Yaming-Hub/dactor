@@ -11,6 +11,12 @@ use dactor_coerce::CoerceRuntime;
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn conformance_multiple_handlers() {
+    let runtime = CoerceRuntime::new();
+    test_multiple_handlers(|name, init| runtime.spawn::<ConformanceMultiHandler>(name, init)).await;
+}
+
+#[tokio::test]
 async fn conformance_message_ordering_under_load() {
     let runtime = CoerceRuntime::new();
     test_message_ordering_under_load(|name, init| runtime.spawn::<ConformanceCounter>(name, init))
