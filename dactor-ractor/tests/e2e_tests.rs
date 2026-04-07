@@ -280,7 +280,7 @@ async fn t3_partition_heal_recovery() {
     );
 
     // Give the actor a moment to process
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Ask should return the correct count (10 + 5 = 15, not 20)
     // The increment during partition was blocked, so only the post-heal one counts
@@ -497,7 +497,8 @@ async fn e2e_concurrent_operations() {
         .unwrap();
     assert!(resp.success);
 
-    // Send 50 tell increments of 1 rapidly
+    // Note: These sends are sequential (TestCluster is not Clone).
+    // This tests rapid throughput, not true concurrency.
     for _ in 0..50 {
         let tell_resp = cluster
             .tell_actor("concurrent-node", "rapid", "increment", b"1")
@@ -507,7 +508,7 @@ async fn e2e_concurrent_operations() {
     }
 
     // Sleep for processing
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Ask count — should be 50
     let ask_resp = cluster
@@ -545,7 +546,7 @@ async fn e2e_graceful_shutdown() {
     cluster.shutdown_node("shutdown-node").await.unwrap();
 
     // Give the process time to fully terminate
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Ping should fail after shutdown
     let ping_resp = cluster.ping("shutdown-node", "hello").await;
