@@ -4,10 +4,10 @@
 
 ---
 
-## Current Status (PR #117)
+## Current Status (PR #121)
 - Phase 3: ✅ Complete (features, examples, conformance, batching, E2E tests)
 - Phase 4: ✅ Complete — R1-R6, R3b, R6b-c, S1-S4, SA1-SA10, SE1-SE6, C1-C5, P1-P3 all done
-- Phase 6: ✅ Complete (supervision, pools, timers, on_reply, AM1-AM7 all done)
+- Phase 6: ✅ Complete (supervision, pools, timers, on_reply, AM1-AM7, AP7-AP8 all done)
 - Phase 7: ✅ Complete (metrics, dead letters, circuit breaker, drop observer; O4 dropped)
 - Phase 8: ✅ Complete (NR1-NR4: registry, cluster events, processing groups)
 - Phase 9: ✅ Complete (NA1-NA10: native system actors, runtime auto-start, transport routing)
@@ -17,6 +17,8 @@
 - Phase 13: ✅ Complete (TF1-TF7: TransformHandler, N→M streaming, batch support wired in all adapters)
 - Phase 14: ✅ Complete (BC1-BC9: BroadcastRef, tell/ask, receipts, pool integration, dead letters, tests)
 - AP6: ✅ Done (LeastLoaded pool routing + pending_messages trait method)
+- AP7: ✅ Done (distributed pool with WorkerRef)
+- AP8: ✅ Done (virtual actor pool with single-threaded router)
 - Bounded mailbox: ✅ All 3 adapters + TestRuntime; shared BoundedMailboxSender in runtime_support
 - T1-T11: ✅ Complete (E2E integration tests + corner cases + version migration)
 - SE6: ✅ Complete (protobuf system serialization)
@@ -26,13 +28,18 @@
 - Test: `cargo test --workspace --exclude dactor-test-harness --features test-support`
 - E2E: `cargo test -p dactor-ractor --test e2e_tests --features test-harness` (+ kameo, coerce)
 
-### Session 2026-04-06/07 Summary (PRs #111-#116)
+### Session 2026-04-06/07 Summary (PRs #111-#121)
 - **NA10** (#111): Transport routing — SystemMessageRouter trait, route_system_envelope for all 3 adapters, wire protocol stability tests (31 new tests)
 - **SE6** (#112): Protobuf system serialization — proto/system.proto schemas, prost encode/decode, removed serializer param from trait, size limits + validation (26 proto unit tests)
 - **T1-T3** (#113): Ractor E2E integration tests — extended test harness with SpawnActor/TellActor/AskActor/StopActor RPCs, CommandHandler trait, test-node-ractor binary (3 E2E tests)
 - **T4-T6** (#114): Kameo + Coerce E2E tests — test-node-kameo and test-node-coerce binaries, KameoCommandHandler + CoerceCommandHandler (3 E2E tests)
 - **T7-T10** (#115): Cross-adapter corner case tests — wired conformance suite to coerce (7 tests: ordering, stop, concurrent asks, slow consumer, multiple handlers)
 - **T11** (#116): Version migration and rejection tests — 7 tests covering all receive_envelope_body_versioned code paths with panicking handlers
+- **Progress** (#117): Update progress.md for session
+- **README** (#118): Clean up review artifact + update README (coerce status, new features, test counts)
+- **Docs** (#119): Mark ExpandHandler refactor done + update pending section
+- **AP7** (#120): Distributed pool — WorkerRef enum wrapping local/remote refs for mixed pools
+- **AP8** (#121): Virtual actor pool — VirtualPoolRef with single-threaded router task, bounded channel, backpressure
 
 ### Key Design Decisions Made This Session
 - Wire protocol constants are frozen strings with regression test (not Rust paths)
@@ -47,6 +54,11 @@
 - stop_actor returns Err on 1s timeout, spawn_actor rejects duplicate names
 - All binaries bind to 127.0.0.1 (not 0.0.0.0) for security
 - Version migration tests use panicking handlers to prove skip behavior
+- WorkerRef<A, L> enum wraps Local or Remote refs; PoolRef<A, WorkerRef<A, L>> = distributed pool
+- WorkerRef requires A: Sync (inherited from RemoteActorRef); streaming on remote is documented limitation
+- VirtualPoolRef uses bounded mpsc channel (default 1024) with try_send backpressure
+- VirtualPoolRef routes via boxed closures erasing generic message types
+- VirtualPoolRef::stop() sets alive=false immediately before queuing Stop command
 
 ### Multi-Model Review Process
 Every PR was reviewed by 4 AI models (GPT-5.4, Gemini/Goldeneye, Claude Haiku 4.5, Claude Sonnet 4.5). Key bugs caught:
@@ -64,6 +76,8 @@ All planned work items from the v0.2 dev plan have been implemented:
 - ✅ NA10: Transport routing
 - ✅ SE6: Protobuf system serialization
 - ✅ T1-T11: E2E integration tests + corner cases + version migration
+- ✅ AP7: Distributed pool (WorkerRef)
+- ✅ AP8: Virtual actor pool (VirtualPoolRef)
 
 ### Documentation Updated This Session
 - `dactor-coerce/docs/implementation.md` — bounded mailbox parity table + limitations update
@@ -117,11 +131,7 @@ Findings were consolidated, addressed, and verified before merge. Key patterns f
 - &'static str in conformance helpers required by Rust async closure lifetime rules
 
 ### Pending Work for Next Session
-All v0.2 planned work items are now complete.
-
-Stretch goals (future):
-- **AP7**: Distributed pool — workers across nodes via remote ActorRef
-- **AP8**: Virtual actor pool — redesign pool as virtual router actor
+All v0.2 planned work items and stretch goals are now complete.
 
 ### Documentation Created This Session
 - `docs/cluster-behavior.md` — K8s/EKS/VMSS autoscale, simultaneous restart, graceful shutdown, split-brain
@@ -456,13 +466,13 @@ Wire persistence traits into actor lifecycle (recovery, snapshots, durable state
 | AP4 | Keyed trait | §4.14 | Extract routing keys for key-based routing | ✅ PR #45 |
 | AP5 | TestRuntime::spawn_pool() | §4.14 | Spawn N local workers | ✅ PR #45 |
 | AP6 | LeastLoaded routing | §4.14 | Route to worker with fewest queued messages | ✅ PR #100 |
-| AP7 | Distributed pool | §4.14 | Workers across nodes via remote ActorRef (Phase 4) | 🔲 Depends on R3 |
-| AP8 | Virtual actor pool (v2) | §4.14 | Redesign pool as virtual router actor (see below) | 🔲 Design proposed |
+| AP7 | Distributed pool | §4.14 | Workers across nodes via remote ActorRef (Phase 4) | ✅ PR #120 (WorkerRef) |
+| AP8 | Virtual actor pool (v2) | §4.14 | Redesign pool as virtual router actor (see below) | ✅ PR #121 (VirtualPoolRef) |
 
-#### AP8: Virtual Actor Pool (Proposed Redesign)
+#### AP8: Virtual Actor Pool (Implemented — PR #121)
 
-The current `PoolRef` is a passive data structure (Vec of refs + atomic counter)
-that routes from the caller's thread. This has several limitations:
+`PoolRef` is a passive data structure (Vec of refs + atomic counter)
+that routes from the caller's thread. `VirtualPoolRef` addresses its limitations:
 
 1. **Metrics contention** — pool workers share one `ActorMetricsHandle`; multiple
    worker tasks contend on its Mutex.
