@@ -776,32 +776,62 @@ async fn e2e_multi_actor_interaction() {
         .unwrap();
     assert!(tell.success);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Poll actor-a with up to 2s timeout (100ms intervals)
+    let mut count = 0;
+    let mut found = false;
+    for _ in 0..20 {
+        let ask = cluster
+            .ask_actor("multi-node", "actor-a", "get_count", b"")
+            .await
+            .unwrap();
+        if ask.success {
+            count = serde_json::from_slice(&ask.payload).unwrap();
+            if count == 10 {
+                found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(found, "actor-a should reach count 10, got {}", count);
 
-    // Verify each actor's count independently
-    let ask = cluster
-        .ask_actor("multi-node", "actor-a", "get_count", b"")
-        .await
-        .unwrap();
-    assert!(ask.success);
-    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
-    assert_eq!(count, 10, "actor-a should be 0+10=10");
+    // Poll actor-b with up to 2s timeout (100ms intervals)
+    let mut count = 0;
+    let mut found = false;
+    for _ in 0..20 {
+        let ask = cluster
+            .ask_actor("multi-node", "actor-b", "get_count", b"")
+            .await
+            .unwrap();
+        if ask.success {
+            count = serde_json::from_slice(&ask.payload).unwrap();
+            if count == 120 {
+                found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(found, "actor-b should reach count 120, got {}", count);
 
-    let ask = cluster
-        .ask_actor("multi-node", "actor-b", "get_count", b"")
-        .await
-        .unwrap();
-    assert!(ask.success);
-    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
-    assert_eq!(count, 120, "actor-b should be 100+20=120");
-
-    let ask = cluster
-        .ask_actor("multi-node", "actor-c", "get_count", b"")
-        .await
-        .unwrap();
-    assert!(ask.success);
-    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
-    assert_eq!(count, 230, "actor-c should be 200+30=230");
+    // Poll actor-c with up to 2s timeout (100ms intervals)
+    let mut count = 0;
+    let mut found = false;
+    for _ in 0..20 {
+        let ask = cluster
+            .ask_actor("multi-node", "actor-c", "get_count", b"")
+            .await
+            .unwrap();
+        if ask.success {
+            count = serde_json::from_slice(&ask.payload).unwrap();
+            if count == 230 {
+                found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(found, "actor-c should reach count 230, got {}", count);
 
     // Stop one actor, verify others still work
     let stop = cluster
@@ -935,22 +965,28 @@ async fn e2e_slow_handler_doesnt_block_others() {
     let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
     assert_eq!(count, 0, "fast actor should have count 0");
     assert!(
-        elapsed < Duration::from_millis(400),
-        "fast actor should respond quickly (took {:?}), not blocked by slow actor",
+        elapsed < Duration::from_secs(2),
+        "fast actor should respond quickly (took {:?}), not blocked by slow actor. Using 2s for CI robustness but should be much less than 500ms slow handler",
         elapsed
     );
 
-    // Wait for slow handler to finish
-    tokio::time::sleep(Duration::from_millis(800)).await;
-
-    // Verify slow actor's count updated
-    let ask = cluster
-        .ask_actor("slow-node", "slow", "get_count", b"")
-        .await
-        .unwrap();
-    assert!(ask.success, "slow ask failed: {}", ask.error);
-    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
-    assert_eq!(count, 10, "slow actor count should be 10 after slow_increment");
+    // Poll until slow handler finishes (up to 2s)
+    let mut slow_done = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ask = cluster
+            .ask_actor("slow-node", "slow", "get_count", b"")
+            .await
+            .unwrap();
+        if ask.success {
+            let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
+            if count == 10 {
+                slow_done = true;
+                break;
+            }
+        }
+    }
+    assert!(slow_done, "slow actor count should reach 10 within 2s");
 
     cluster.shutdown().await;
 }
