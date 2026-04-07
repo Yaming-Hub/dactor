@@ -1,7 +1,7 @@
-//! Ractor-backed test node binary for E2E integration tests.
+//! Kameo-backed test node binary for E2E integration tests.
 //!
-//! Runs a [`TestNode`] gRPC server with a [`RactorCommandHandler`] that
-//! manages a simple counter actor via the `dactor-ractor` runtime.
+//! Runs a [`TestNode`] gRPC server with a [`KameoCommandHandler`] that
+//! manages a simple counter actor via the `dactor-kameo` runtime.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -12,12 +12,12 @@ use async_trait::async_trait;
 use dactor::actor::{Actor, ActorContext, ActorRef, Handler};
 use dactor::message::Message;
 use dactor::supervision::ChildTerminated;
-use dactor_ractor::{RactorActorRef, RactorRuntime};
+use dactor_kameo::{KameoActorRef, KameoRuntime};
 use dactor_test_harness::handler::CommandHandler;
 use dactor_test_harness::node::{TestNode, TestNodeConfig};
 
 // ---------------------------------------------------------------------------
-// Counter actor — the test actor used by T1–T3 E2E tests
+// Counter actor — the test actor used by T4–T5 E2E tests
 // ---------------------------------------------------------------------------
 
 struct CounterActor {
@@ -74,17 +74,17 @@ impl Handler<ChildTerminated> for CounterActor {
 }
 
 // ---------------------------------------------------------------------------
-// RactorCommandHandler — bridges gRPC commands to the ractor runtime
+// KameoCommandHandler — bridges gRPC commands to the kameo runtime
 // ---------------------------------------------------------------------------
 
-struct RactorCommandHandler {
-    runtime: RactorRuntime,
-    actors: Mutex<HashMap<String, RactorActorRef<CounterActor>>>,
+struct KameoCommandHandler {
+    runtime: KameoRuntime,
+    actors: Mutex<HashMap<String, KameoActorRef<CounterActor>>>,
     live_count: AtomicU32,
 }
 
-impl RactorCommandHandler {
-    fn new(runtime: RactorRuntime) -> Self {
+impl KameoCommandHandler {
+    fn new(runtime: KameoRuntime) -> Self {
         Self {
             runtime,
             actors: Mutex::new(HashMap::new()),
@@ -94,9 +94,9 @@ impl RactorCommandHandler {
 }
 
 #[async_trait]
-impl CommandHandler for RactorCommandHandler {
+impl CommandHandler for KameoCommandHandler {
     fn adapter_name(&self) -> &str {
-        "ractor"
+        "kameo"
     }
 
     async fn spawn_actor(
@@ -201,6 +201,7 @@ impl CommandHandler for RactorCommandHandler {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        // Actor didn't terminate in time — still decrement since we removed from map
         self.live_count.fetch_sub(1, Ordering::Relaxed);
         Err(format!("actor '{}' did not terminate within 1s", actor_name))
     }
@@ -224,8 +225,8 @@ async fn main() {
         .parse()
         .expect("invalid port");
 
-    let runtime = RactorRuntime::with_node_id(dactor::node::NodeId(node_id.clone()));
-    let handler = Arc::new(RactorCommandHandler::new(runtime));
+    let runtime = KameoRuntime::with_node_id(dactor::node::NodeId(node_id.clone()));
+    let handler = Arc::new(KameoCommandHandler::new(runtime));
 
     let config = TestNodeConfig::from_args(&node_id, port);
     let node = TestNode::with_handler(config, handler);

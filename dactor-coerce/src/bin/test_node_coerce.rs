@@ -1,7 +1,7 @@
-//! Ractor-backed test node binary for E2E integration tests.
+//! Coerce-backed test node binary for E2E integration tests.
 //!
-//! Runs a [`TestNode`] gRPC server with a [`RactorCommandHandler`] that
-//! manages a simple counter actor via the `dactor-ractor` runtime.
+//! Runs a [`TestNode`] gRPC server with a [`CoerceCommandHandler`] that
+//! manages a simple counter actor via the `dactor-coerce` runtime.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -12,12 +12,12 @@ use async_trait::async_trait;
 use dactor::actor::{Actor, ActorContext, ActorRef, Handler};
 use dactor::message::Message;
 use dactor::supervision::ChildTerminated;
-use dactor_ractor::{RactorActorRef, RactorRuntime};
+use dactor_coerce::{CoerceActorRef, CoerceRuntime};
 use dactor_test_harness::handler::CommandHandler;
 use dactor_test_harness::node::{TestNode, TestNodeConfig};
 
 // ---------------------------------------------------------------------------
-// Counter actor — the test actor used by T1–T3 E2E tests
+// Counter actor — the test actor used by T6 E2E tests
 // ---------------------------------------------------------------------------
 
 struct CounterActor {
@@ -74,17 +74,17 @@ impl Handler<ChildTerminated> for CounterActor {
 }
 
 // ---------------------------------------------------------------------------
-// RactorCommandHandler — bridges gRPC commands to the ractor runtime
+// CoerceCommandHandler — bridges gRPC commands to the coerce runtime
 // ---------------------------------------------------------------------------
 
-struct RactorCommandHandler {
-    runtime: RactorRuntime,
-    actors: Mutex<HashMap<String, RactorActorRef<CounterActor>>>,
+struct CoerceCommandHandler {
+    runtime: CoerceRuntime,
+    actors: Mutex<HashMap<String, CoerceActorRef<CounterActor>>>,
     live_count: AtomicU32,
 }
 
-impl RactorCommandHandler {
-    fn new(runtime: RactorRuntime) -> Self {
+impl CoerceCommandHandler {
+    fn new(runtime: CoerceRuntime) -> Self {
         Self {
             runtime,
             actors: Mutex::new(HashMap::new()),
@@ -94,9 +94,9 @@ impl RactorCommandHandler {
 }
 
 #[async_trait]
-impl CommandHandler for RactorCommandHandler {
+impl CommandHandler for CoerceCommandHandler {
     fn adapter_name(&self) -> &str {
-        "ractor"
+        "coerce"
     }
 
     async fn spawn_actor(
@@ -224,8 +224,8 @@ async fn main() {
         .parse()
         .expect("invalid port");
 
-    let runtime = RactorRuntime::with_node_id(dactor::node::NodeId(node_id.clone()));
-    let handler = Arc::new(RactorCommandHandler::new(runtime));
+    let runtime = CoerceRuntime::with_node_id(dactor::node::NodeId(node_id.clone()));
+    let handler = Arc::new(CoerceCommandHandler::new(runtime));
 
     let config = TestNodeConfig::from_args(&node_id, port);
     let node = TestNode::with_handler(config, handler);
