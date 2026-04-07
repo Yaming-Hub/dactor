@@ -672,11 +672,25 @@ mod tests {
 
     #[test]
     fn test_version_match_skips_migration() {
+        // When versions match, no migration is attempted — even if a handler exists.
         let mut registry = crate::type_registry::TypeRegistry::new();
         registry.register("test::Same", |bytes: &[u8]| Ok(Box::new(bytes.to_vec())));
 
-        let version_handlers: std::collections::HashMap<String, Box<dyn MessageVersionHandler>> =
-            std::collections::HashMap::new();
+        struct PanicMigrator;
+        impl MessageVersionHandler for PanicMigrator {
+            fn message_type(&self) -> &'static str {
+                "test::Same"
+            }
+            fn migrate(&self, _payload: &[u8], _from: u32, _to: u32) -> Option<Vec<u8>> {
+                panic!("migrate should not be called when versions match");
+            }
+        }
+
+        let mut version_handlers: std::collections::HashMap<
+            String,
+            Box<dyn MessageVersionHandler>,
+        > = std::collections::HashMap::new();
+        version_handlers.insert("test::Same".into(), Box::new(PanicMigrator));
 
         let envelope = WireEnvelope {
             target: ActorId {
@@ -696,7 +710,7 @@ mod tests {
             &envelope,
             &registry,
             &version_handlers,
-            Some(2), // same version
+            Some(2), // same version — handler must NOT be called
         )
         .unwrap();
         let val = any.downcast::<Vec<u8>>().unwrap();
