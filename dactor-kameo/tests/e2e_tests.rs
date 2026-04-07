@@ -683,3 +683,274 @@ async fn e2e_node_crash_detection() {
 
     cluster.shutdown().await;
 }
+
+// =========================================================================
+// E2E — Large payload echo round-trip
+// =========================================================================
+
+#[tokio::test]
+async fn e2e_large_payload() {
+    let binary = require_binary();
+    if !std::path::Path::new(&binary).exists() {
+        return;
+    }
+
+    let mut cluster = TestCluster::builder()
+        .node("large-node", &binary, &[], 50114)
+        .build()
+        .await;
+
+    // Spawn actor
+    let resp = cluster
+        .spawn_actor("large-node", "counter", "echo-actor", b"0")
+        .await
+        .unwrap();
+    assert!(resp.success, "spawn failed: {}", resp.error);
+
+    // Send a 100KB payload via echo ask
+    let payload = vec![42u8; 100_000];
+    let ask_resp = cluster
+        .ask_actor("large-node", "echo-actor", "echo", &payload)
+        .await
+        .unwrap();
+    assert!(ask_resp.success, "echo ask failed: {}", ask_resp.error);
+    assert_eq!(
+        ask_resp.payload, payload,
+        "echo response should match the 100KB payload exactly"
+    );
+
+    cluster.shutdown().await;
+}
+
+// =========================================================================
+// E2E — Multi-actor interaction and isolation
+// =========================================================================
+
+#[tokio::test]
+async fn e2e_multi_actor_interaction() {
+    let binary = require_binary();
+    if !std::path::Path::new(&binary).exists() {
+        return;
+    }
+
+    let mut cluster = TestCluster::builder()
+        .node("multi-node", &binary, &[], 50115)
+        .build()
+        .await;
+
+    // Spawn 3 actors with different initial counts
+    let resp_a = cluster
+        .spawn_actor("multi-node", "counter", "actor-a", b"0")
+        .await
+        .unwrap();
+    assert!(resp_a.success, "spawn actor-a failed: {}", resp_a.error);
+
+    let resp_b = cluster
+        .spawn_actor("multi-node", "counter", "actor-b", b"100")
+        .await
+        .unwrap();
+    assert!(resp_b.success, "spawn actor-b failed: {}", resp_b.error);
+
+    let resp_c = cluster
+        .spawn_actor("multi-node", "counter", "actor-c", b"200")
+        .await
+        .unwrap();
+    assert!(resp_c.success, "spawn actor-c failed: {}", resp_c.error);
+
+    // Tell each to increment by different amounts
+    let tell = cluster
+        .tell_actor("multi-node", "actor-a", "increment", b"10")
+        .await
+        .unwrap();
+    assert!(tell.success);
+
+    let tell = cluster
+        .tell_actor("multi-node", "actor-b", "increment", b"20")
+        .await
+        .unwrap();
+    assert!(tell.success);
+
+    let tell = cluster
+        .tell_actor("multi-node", "actor-c", "increment", b"30")
+        .await
+        .unwrap();
+    assert!(tell.success);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify each actor's count independently
+    let ask = cluster
+        .ask_actor("multi-node", "actor-a", "get_count", b"")
+        .await
+        .unwrap();
+    assert!(ask.success);
+    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
+    assert_eq!(count, 10, "actor-a should be 0+10=10");
+
+    let ask = cluster
+        .ask_actor("multi-node", "actor-b", "get_count", b"")
+        .await
+        .unwrap();
+    assert!(ask.success);
+    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
+    assert_eq!(count, 120, "actor-b should be 100+20=120");
+
+    let ask = cluster
+        .ask_actor("multi-node", "actor-c", "get_count", b"")
+        .await
+        .unwrap();
+    assert!(ask.success);
+    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
+    assert_eq!(count, 230, "actor-c should be 200+30=230");
+
+    // Stop one actor, verify others still work
+    let stop = cluster
+        .stop_actor("multi-node", "actor-b")
+        .await
+        .unwrap();
+    assert!(stop.success, "stop actor-b failed: {}", stop.error);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // actor-a and actor-c should still respond
+    let ask = cluster
+        .ask_actor("multi-node", "actor-a", "get_count", b"")
+        .await
+        .unwrap();
+    assert!(ask.success, "actor-a should still work after actor-b stopped");
+
+    let ask = cluster
+        .ask_actor("multi-node", "actor-c", "get_count", b"")
+        .await
+        .unwrap();
+    assert!(ask.success, "actor-c should still work after actor-b stopped");
+
+    // actor-b should be gone
+    let ask = cluster
+        .ask_actor("multi-node", "actor-b", "get_count", b"")
+        .await
+        .unwrap();
+    assert!(!ask.success, "actor-b should be gone after stop");
+
+    cluster.shutdown().await;
+}
+
+// =========================================================================
+// E2E — Rapid spawn/stop cycle (resource cleanup)
+// =========================================================================
+
+#[tokio::test]
+async fn e2e_rapid_spawn_stop_cycle() {
+    let binary = require_binary();
+    if !std::path::Path::new(&binary).exists() {
+        return;
+    }
+
+    let mut cluster = TestCluster::builder()
+        .node("rapid-node", &binary, &[], 50116)
+        .build()
+        .await;
+
+    // Rapidly spawn and stop 5 actors in sequence
+    for i in 0..5 {
+        let name = format!("cycle-actor-{}", i);
+        let resp = cluster
+            .spawn_actor("rapid-node", "counter", &name, b"0")
+            .await
+            .unwrap();
+        assert!(resp.success, "spawn {} failed: {}", name, resp.error);
+
+        let stop = cluster.stop_actor("rapid-node", &name).await.unwrap();
+        assert!(stop.success, "stop {} failed: {}", name, stop.error);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Verify actor_count is 0
+    let info = cluster.get_node_info("rapid-node").await.unwrap();
+    assert_eq!(info.actor_count, 0, "all actors should be cleaned up");
+
+    // Spawn a final actor and verify it works normally
+    let resp = cluster
+        .spawn_actor("rapid-node", "counter", "final-actor", b"42")
+        .await
+        .unwrap();
+    assert!(resp.success, "final spawn failed: {}", resp.error);
+
+    let ask = cluster
+        .ask_actor("rapid-node", "final-actor", "get_count", b"")
+        .await
+        .unwrap();
+    assert!(ask.success, "final ask failed: {}", ask.error);
+    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
+    assert_eq!(count, 42, "final actor should work normally");
+
+    cluster.shutdown().await;
+}
+
+// =========================================================================
+// E2E — Slow handler doesn't block other actors
+// =========================================================================
+
+#[tokio::test]
+async fn e2e_slow_handler_doesnt_block_others() {
+    let binary = require_binary();
+    if !std::path::Path::new(&binary).exists() {
+        return;
+    }
+
+    let mut cluster = TestCluster::builder()
+        .node("slow-node", &binary, &[], 50117)
+        .build()
+        .await;
+
+    // Spawn two actors
+    let resp = cluster
+        .spawn_actor("slow-node", "counter", "slow", b"0")
+        .await
+        .unwrap();
+    assert!(resp.success, "spawn slow failed: {}", resp.error);
+
+    let resp = cluster
+        .spawn_actor("slow-node", "counter", "fast", b"0")
+        .await
+        .unwrap();
+    assert!(resp.success, "spawn fast failed: {}", resp.error);
+
+    // Tell "slow" to slow_increment (500ms delay)
+    let tell = cluster
+        .tell_actor("slow-node", "slow", "slow_increment", b"10")
+        .await
+        .unwrap();
+    assert!(tell.success, "slow_increment tell failed: {}", tell.error);
+
+    // Immediately ask "fast" for count — should respond quickly
+    let start = std::time::Instant::now();
+    let ask = cluster
+        .ask_actor("slow-node", "fast", "get_count", b"")
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(ask.success, "fast ask failed: {}", ask.error);
+    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
+    assert_eq!(count, 0, "fast actor should have count 0");
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "fast actor should respond quickly (took {:?}), not blocked by slow actor",
+        elapsed
+    );
+
+    // Wait for slow handler to finish
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Verify slow actor's count updated
+    let ask = cluster
+        .ask_actor("slow-node", "slow", "get_count", b"")
+        .await
+        .unwrap();
+    assert!(ask.success, "slow ask failed: {}", ask.error);
+    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
+    assert_eq!(count, 10, "slow actor count should be 10 after slow_increment");
+
+    cluster.shutdown().await;
+}

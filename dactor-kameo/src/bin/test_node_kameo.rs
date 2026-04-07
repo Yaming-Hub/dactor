@@ -47,6 +47,37 @@ impl Handler<Increment> for CounterActor {
     }
 }
 
+// Tell message: set the counter directly
+struct SetCount {
+    value: i64,
+}
+impl Message for SetCount {
+    type Reply = ();
+}
+
+#[async_trait]
+impl Handler<SetCount> for CounterActor {
+    async fn handle(&mut self, msg: SetCount, _ctx: &mut ActorContext) {
+        self.count = msg.value;
+    }
+}
+
+// Tell message: increment after a delay (for concurrency testing)
+struct SlowIncrement {
+    amount: i64,
+}
+impl Message for SlowIncrement {
+    type Reply = ();
+}
+
+#[async_trait]
+impl Handler<SlowIncrement> for CounterActor {
+    async fn handle(&mut self, msg: SlowIncrement, _ctx: &mut ActorContext) {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        self.count += msg.amount;
+    }
+}
+
 // Ask message: get the current count
 struct GetCount;
 impl Message for GetCount {
@@ -57,6 +88,19 @@ impl Message for GetCount {
 impl Handler<GetCount> for CounterActor {
     async fn handle(&mut self, _msg: GetCount, _ctx: &mut ActorContext) -> i64 {
         self.count
+    }
+}
+
+// Ask message: echo back payload bytes
+struct Echo(Vec<u8>);
+impl Message for Echo {
+    type Reply = Vec<u8>;
+}
+
+#[async_trait]
+impl Handler<Echo> for CounterActor {
+    async fn handle(&mut self, msg: Echo, _ctx: &mut ActorContext) -> Vec<u8> {
+        msg.0
     }
 }
 
@@ -158,6 +202,20 @@ impl CommandHandler for KameoCommandHandler {
                     .tell(Increment { amount })
                     .map_err(|e| format!("tell failed: {}", e))
             }
+            "set_count" => {
+                let value: i64 =
+                    serde_json::from_slice(payload).map_err(|e| format!("bad payload: {}", e))?;
+                actor_ref
+                    .tell(SetCount { value })
+                    .map_err(|e| format!("tell failed: {}", e))
+            }
+            "slow_increment" => {
+                let amount: i64 =
+                    serde_json::from_slice(payload).map_err(|e| format!("bad payload: {}", e))?;
+                actor_ref
+                    .tell(SlowIncrement { amount })
+                    .map_err(|e| format!("tell failed: {}", e))
+            }
             _ => Err(format!("unknown message type: {}", message_type)),
         }
     }
@@ -166,7 +224,7 @@ impl CommandHandler for KameoCommandHandler {
         &self,
         actor_name: &str,
         message_type: &str,
-        _payload: &[u8],
+        payload: &[u8],
     ) -> Result<Vec<u8>, String> {
         let actor_ref = {
             let actors = self.actors.lock().await;
@@ -183,6 +241,12 @@ impl CommandHandler for KameoCommandHandler {
                     .map_err(|e| format!("ask failed: {}", e))?;
                 let count = reply.await.map_err(|e| format!("reply failed: {}", e))?;
                 serde_json::to_vec(&count).map_err(|e| format!("serialize failed: {}", e))
+            }
+            "echo" => {
+                let reply = actor_ref
+                    .ask(Echo(payload.to_vec()), None)
+                    .map_err(|e| format!("ask failed: {}", e))?;
+                reply.await.map_err(|e| format!("reply failed: {}", e))
             }
             _ => Err(format!("unknown message type: {}", message_type)),
         }
