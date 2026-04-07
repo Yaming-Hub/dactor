@@ -1116,17 +1116,23 @@ async fn e2e_inter_actor_forwarding() {
         .unwrap();
     assert!(tell.success, "forward_increment failed: {}", tell.error);
 
-    // Sleep briefly for message propagation
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Ask "target" for get_count — should be 7
-    let ask = cluster
-        .ask_actor("fwd-node", "target", "get_count", b"")
-        .await
-        .unwrap();
-    assert!(ask.success, "ask target failed: {}", ask.error);
-    let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
-    assert_eq!(count, 7, "target should have been incremented to 7");
+    // Poll until target count reaches expected value (up to 2s)
+    let mut forwarded = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ask = cluster
+            .ask_actor("fwd-node", "target", "get_count", b"")
+            .await
+            .unwrap();
+        if ask.success {
+            let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
+            if count == 7 {
+                forwarded = true;
+                break;
+            }
+        }
+    }
+    assert!(forwarded, "target should have received forwarded increment within 2s");
 
     // Ask "source" for get_count — should still be 0
     let ask = cluster
@@ -1250,18 +1256,24 @@ async fn e2e_actor_state_snapshot() {
         assert!(tell.success);
     }
 
-    // Brief sleep for message propagation
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Ask get_state — verify JSON has count=3 and correct name
-    let ask = cluster
-        .ask_actor("state-node", "snap1", "get_state", b"")
-        .await
-        .unwrap();
-    assert!(ask.success, "get_state failed: {}", ask.error);
-    let state: serde_json::Value = serde_json::from_slice(&ask.payload).unwrap();
-    assert_eq!(state["count"], 3, "count should be 3");
-    assert_eq!(state["name"], "snap1", "name should be snap1");
+    // Poll until count reaches 3 (up to 2s)
+    let mut snapshot_ok = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ask = cluster
+            .ask_actor("state-node", "snap1", "get_state", b"")
+            .await
+            .unwrap();
+        if ask.success {
+            let state: serde_json::Value = serde_json::from_slice(&ask.payload).unwrap();
+            if state["count"] == 3 {
+                assert_eq!(state["name"], "snap1", "name should be snap1");
+                snapshot_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(snapshot_ok, "count should have reached 3 within 2s");
 
     // Increment 2 more times
     for _ in 0..2 {
@@ -1272,18 +1284,24 @@ async fn e2e_actor_state_snapshot() {
         assert!(tell.success);
     }
 
-    // Brief sleep for message propagation
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Ask get_state again — verify count=5
-    let ask = cluster
-        .ask_actor("state-node", "snap1", "get_state", b"")
-        .await
-        .unwrap();
-    assert!(ask.success, "get_state failed: {}", ask.error);
-    let state: serde_json::Value = serde_json::from_slice(&ask.payload).unwrap();
-    assert_eq!(state["count"], 5, "count should be 5 after 2 more increments");
-    assert_eq!(state["name"], "snap1", "name should still be snap1");
+    // Poll until count reaches 5 (up to 2s)
+    let mut snapshot_ok = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ask = cluster
+            .ask_actor("state-node", "snap1", "get_state", b"")
+            .await
+            .unwrap();
+        if ask.success {
+            let state: serde_json::Value = serde_json::from_slice(&ask.payload).unwrap();
+            if state["count"] == 5 {
+                assert_eq!(state["name"], "snap1", "name should still be snap1");
+                snapshot_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(snapshot_ok, "count should have reached 5 within 2s");
 
     cluster.shutdown().await;
 }

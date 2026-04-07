@@ -329,37 +329,41 @@ impl CommandHandler for CoerceCommandHandler {
                 .ok_or_else(|| format!("actor '{}' not found", actor_name))?
         };
         actor_ref.stop();
+        let mut stopped = false;
         for _ in 0..100 {
             if !actor_ref.is_alive() {
-                self.live_count.fetch_sub(1, Ordering::Relaxed);
-
-                // Collect watcher refs, then drop lock before notifying
-                let watcher_refs: Vec<_> = {
-                    let watches = self.watches.lock().await;
-                    let actors = self.actors.lock().await;
-                    watches
-                        .iter()
-                        .filter(|(_, target)| target == actor_name)
-                        .filter_map(|(watcher, _)| actors.get(watcher).cloned())
-                        .collect()
-                };
-                for watcher_ref in watcher_refs {
-                    let _ = watcher_ref.tell(ChildTerminated {
-                        child_id: dactor::node::ActorId {
-                            node: dactor::node::NodeId("local".into()),
-                            local: 0,
-                        },
-                        child_name: actor_name.to_string(),
-                        reason: None,
-                    });
-                }
-
-                return Ok(());
+                stopped = true;
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        // Always decrement — actor was removed from map above
         self.live_count.fetch_sub(1, Ordering::Relaxed);
-        Err(format!("actor '{}' did not terminate within 1s", actor_name))
+
+        if stopped {
+            let watcher_refs: Vec<_> = {
+                let actors = self.actors.lock().await;
+                let watches = self.watches.lock().await;
+                watches
+                    .iter()
+                    .filter(|(_, target)| target == actor_name)
+                    .filter_map(|(watcher, _)| actors.get(watcher).cloned())
+                    .collect()
+            };
+            for watcher_ref in watcher_refs {
+                let _ = watcher_ref.tell(ChildTerminated {
+                    child_id: dactor::node::ActorId {
+                        node: dactor::node::NodeId("local".into()),
+                        local: 0,
+                    },
+                    child_name: actor_name.to_string(),
+                    reason: None,
+                });
+            }
+            Ok(())
+        } else {
+            Err(format!("actor '{}' did not terminate within 1s", actor_name))
+        }
     }
 
     async fn watch_actor(&self, watcher_name: &str, target_name: &str) -> Result<(), String> {
