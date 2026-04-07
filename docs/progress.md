@@ -94,7 +94,7 @@ All planned work items from the v0.2 dev plan have been implemented:
 - on_stop() panics caught via catch_unwind, propagated through await_stop() as Err(String)
 - Streaming API renamed for cardinality semantics: stream→expand(1→N), feed→reduce(N→1)
 - TransformHandler is the 5th call pattern completing: tell(1→0), ask(1→1), expand(1→N), reduce(N→1), transform(N→M)
-- ExpandHandler to be refactored: M::Reply → explicit OutputItem generic (pending)
+- ExpandHandler refactored: M::Reply → explicit OutputItem generic (completed)
 - Coerce adapter upgraded from TestRuntime stub to real coerce-rs actors (coerce 0.8.11)
 - DactorMsg uses Mutex<Option<Box<dyn Dispatch>>> for Sync safety in coerce (not unsafe impl)
 - ClusterEvent emission uses catch_unwind for subscriber panic isolation
@@ -117,7 +117,11 @@ Findings were consolidated, addressed, and verified before merge. Key patterns f
 - &'static str in conformance helpers required by Rust async closure lifetime rules
 
 ### Pending Work for Next Session
-All v0.2 planned work items are now complete. See "All Work Complete" section above.
+All v0.2 planned work items are now complete.
+
+Stretch goals (future):
+- **AP7**: Distributed pool — workers across nodes via remote ActorRef
+- **AP8**: Virtual actor pool — redesign pool as virtual router actor
 
 ### Documentation Created This Session
 - `docs/cluster-behavior.md` — K8s/EKS/VMSS autoscale, simultaneous restart, graceful shutdown, split-brain
