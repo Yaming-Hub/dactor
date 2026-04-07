@@ -796,12 +796,26 @@ mod tests {
     #[test]
     fn test_version_none_on_sender_skips_migration() {
         // When the sender doesn't set a version (None), no migration is attempted
-        // regardless of the receiver's expected version.
+        // regardless of the receiver's expected version — even if a handler exists.
         let mut registry = crate::type_registry::TypeRegistry::new();
         registry.register("test::OptionalVersion", |bytes: &[u8]| Ok(Box::new(bytes.to_vec())));
 
-        let version_handlers: std::collections::HashMap<String, Box<dyn MessageVersionHandler>> =
-            std::collections::HashMap::new();
+        // Register a panicking handler to prove it's never called
+        struct PanicMigrator;
+        impl MessageVersionHandler for PanicMigrator {
+            fn message_type(&self) -> &'static str {
+                "test::OptionalVersion"
+            }
+            fn migrate(&self, _payload: &[u8], _from: u32, _to: u32) -> Option<Vec<u8>> {
+                panic!("migrate should not be called when sender has no version");
+            }
+        }
+
+        let mut version_handlers: std::collections::HashMap<
+            String,
+            Box<dyn MessageVersionHandler>,
+        > = std::collections::HashMap::new();
+        version_handlers.insert("test::OptionalVersion".into(), Box::new(PanicMigrator));
 
         let envelope = WireEnvelope {
             target: ActorId {
@@ -860,6 +874,54 @@ mod tests {
         .unwrap();
         let val = any.downcast::<Vec<u8>>().unwrap();
         assert_eq!(*val, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn test_version_none_on_receiver_skips_migration() {
+        // When receiver has no version expectation (None) but sender has a
+        // version, no migration is attempted — even if a handler exists.
+        let mut registry = crate::type_registry::TypeRegistry::new();
+        registry.register("test::ReceiverNone", |bytes: &[u8]| Ok(Box::new(bytes.to_vec())));
+
+        struct PanicMigrator;
+        impl MessageVersionHandler for PanicMigrator {
+            fn message_type(&self) -> &'static str {
+                "test::ReceiverNone"
+            }
+            fn migrate(&self, _payload: &[u8], _from: u32, _to: u32) -> Option<Vec<u8>> {
+                panic!("migrate should not be called when receiver has no version expectation");
+            }
+        }
+
+        let mut version_handlers: std::collections::HashMap<
+            String,
+            Box<dyn MessageVersionHandler>,
+        > = std::collections::HashMap::new();
+        version_handlers.insert("test::ReceiverNone".into(), Box::new(PanicMigrator));
+
+        let envelope = WireEnvelope {
+            target: ActorId {
+                node: NodeId("n".into()),
+                local: 1,
+            },
+            target_name: "test".into(),
+            message_type: "test::ReceiverNone".into(),
+            send_mode: SendMode::Tell,
+            headers: WireHeaders::new(),
+            body: vec![11, 22, 33],
+            request_id: None,
+            version: Some(3), // sender has v3
+        };
+
+        let any = receive_envelope_body_versioned(
+            &envelope,
+            &registry,
+            &version_handlers,
+            None, // receiver has no version expectation
+        )
+        .unwrap();
+        let val = any.downcast::<Vec<u8>>().unwrap();
+        assert_eq!(*val, vec![11, 22, 33]);
     }
 
     #[test]
