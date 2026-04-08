@@ -367,3 +367,207 @@ async fn test_multiple_actors_independent_persistence() {
     assert_eq!(recovered_b.value, 95);
     assert_eq!(recovered_b.last_sequence_id(), SequenceId(2));
 }
+
+// ── Negative / error / edge-case tests ─────────────────
+
+#[tokio::test]
+async fn test_deserialize_corrupted_event_fails() {
+    let storage = InMemoryStorage::new();
+    let pid = PersistenceId::new("Counter", "corrupt-ev");
+
+    // Write a valid event first, then a corrupted one.
+    // This tests that valid events are NOT partially applied before the
+    // corrupt one aborts recovery.
+    let mut setup = CounterActor::new("corrupt-ev");
+    setup.persist(CounterEvent::Add(100), &storage).await.unwrap();
+
+    // Write corrupted entry at seq 2 (wrong length → deserialize_event returns Err).
+    storage
+        .write_event(&pid, SequenceId(2), "garbage", &[0xFF, 0xFF])
+        .await
+        .unwrap();
+
+    let mut actor = CounterActor::new("corrupt-ev");
+    let result = recover_event_sourced(&mut actor, &storage, &storage).await;
+    assert!(result.is_err(), "recovery should fail on corrupted event payload");
+    // Actor state should remain unchanged — valid event before the corrupt
+    // one must NOT be partially applied.
+    assert_eq!(actor.value, 0, "actor state should not change on failed recovery");
+}
+
+#[tokio::test]
+async fn test_deserialize_corrupted_snapshot_fails() {
+    let storage = InMemoryStorage::new();
+    let pid = PersistenceId::new("Counter", "corrupt-snap");
+
+    // Write a valid event so the journal isn't empty.
+    let mut actor = CounterActor::new("corrupt-snap");
+    actor.persist(CounterEvent::Add(1), &storage).await.unwrap();
+
+    // Write a corrupted snapshot directly (wrong length → restore_snapshot returns Err).
+    storage
+        .save_snapshot(&pid, SequenceId(1), &[0xDE, 0xAD])
+        .await
+        .unwrap();
+
+    let mut recovered = CounterActor::new("corrupt-snap");
+    let result = recover_event_sourced(&mut recovered, &storage, &storage).await;
+    assert!(result.is_err(), "recovery should fail on corrupted snapshot payload");
+    // Actor state should remain unchanged (default)
+    assert_eq!(recovered.value, 0, "actor state should not change on failed recovery");
+}
+
+#[tokio::test]
+async fn test_durable_state_corrupted_payload() {
+    let storage = InMemoryStorage::new();
+    let pid = PersistenceId::new("Config", "corrupt-cfg");
+
+    // Write non-UTF-8 bytes directly — ConfigActor::restore_state expects valid UTF-8.
+    storage
+        .save_state(&pid, &[0xFF, 0xFE, 0x80])
+        .await
+        .unwrap();
+
+    let mut actor = ConfigActor::new("corrupt-cfg");
+    let result = recover_durable_state(&mut actor, &storage).await;
+    assert!(result.is_err(), "recovery should fail on non-UTF-8 state payload");
+    // Actor state should remain unchanged (default)
+    assert_eq!(actor.data, "", "actor state should not change on failed recovery");
+}
+
+#[tokio::test]
+async fn test_persist_batch_empty() {
+    let storage = InMemoryStorage::new();
+    let mut actor = CounterActor::new("empty-batch");
+
+    let seq = actor
+        .persist_batch(vec![], &storage)
+        .await
+        .unwrap();
+
+    // No state change, returns current (initial) sequence.
+    assert_eq!(seq, SequenceId(0));
+    assert_eq!(actor.value, 0);
+
+    // Journal should have no entries.
+    let pid = actor.persistence_id();
+    let entries = storage.read_events(&pid, SequenceId(1)).await.unwrap();
+    assert!(entries.is_empty(), "no entries should be written for an empty batch");
+}
+
+#[tokio::test]
+async fn test_durable_state_delete_then_recover() {
+    let storage = InMemoryStorage::new();
+
+    // Save some state.
+    let mut actor = ConfigActor::new("del-cfg");
+    actor.data = "important-data".to_string();
+    DurableState::save_state(&actor, &storage as &dyn StateStorage)
+        .await
+        .unwrap();
+
+    // Delete the state.
+    let pid = actor.persistence_id();
+    storage.delete_state(&pid).await.unwrap();
+
+    // Recover should yield fresh/default (empty) state.
+    let mut recovered = ConfigActor::new("del-cfg");
+    recover_durable_state(&mut recovered, &storage).await.unwrap();
+    assert_eq!(recovered.data, "", "after delete, recovery should yield default state");
+}
+
+#[tokio::test]
+async fn test_snapshot_cleanup_preserves_later_events() {
+    let storage = InMemoryStorage::new();
+    let mut actor = CounterActor::new("snap-cleanup");
+
+    // Persist 10 events: Add(1) through Add(10).
+    for i in 1..=10 {
+        actor
+            .persist(CounterEvent::Add(i), &storage)
+            .await
+            .unwrap();
+    }
+    // value = 1+2+…+10 = 55
+    assert_eq!(actor.value, 55);
+
+    // Save a snapshot at seq 5 with value=15 (1+2+3+4+5) directly via storage.
+    let pid = PersistenceId::new("Counter", "snap-cleanup");
+    let snapshot_value: i64 = 15;
+    storage
+        .save_snapshot(&pid, SequenceId(5), &snapshot_value.to_le_bytes())
+        .await
+        .unwrap();
+
+    // Delete events up to seq 5 (old events).
+    storage.delete_events_to(&pid, SequenceId(5)).await.unwrap();
+
+    // Verify events 6-10 still exist.
+    let remaining = storage.read_events(&pid, SequenceId(1)).await.unwrap();
+    assert_eq!(remaining.len(), 5, "events 6-10 should remain");
+    assert_eq!(remaining[0].sequence_id, SequenceId(6));
+
+    // Recover: snapshot(15 at seq 5) + replay events 6-10 → 15 + 6+7+8+9+10 = 55.
+    let mut recovered = CounterActor::new("snap-cleanup");
+    recover_event_sourced(&mut recovered, &storage, &storage)
+        .await
+        .unwrap();
+    assert_eq!(recovered.value, 55);
+    assert_eq!(recovered.last_sequence_id(), SequenceId(10));
+}
+
+#[tokio::test]
+async fn test_durable_state_overwrite() {
+    let storage = InMemoryStorage::new();
+
+    // Save v1.
+    let mut actor = ConfigActor::new("overwrite");
+    actor.data = "v1".to_string();
+    DurableState::save_state(&actor, &storage as &dyn StateStorage)
+        .await
+        .unwrap();
+
+    // Save v2 (overwrites v1).
+    actor.data = "v2".to_string();
+    DurableState::save_state(&actor, &storage as &dyn StateStorage)
+        .await
+        .unwrap();
+
+    // Recover should return v2.
+    let mut recovered = ConfigActor::new("overwrite");
+    recover_durable_state(&mut recovered, &storage).await.unwrap();
+    assert_eq!(recovered.data, "v2");
+}
+
+#[tokio::test]
+async fn test_recovery_from_snapshot_without_events() {
+    let storage = InMemoryStorage::new();
+    let mut actor = CounterActor::new("snap-only");
+
+    // Persist 5 events.
+    for i in 1..=5 {
+        actor
+            .persist(CounterEvent::Add(i * 3), &storage)
+            .await
+            .unwrap();
+    }
+    // value = 3+6+9+12+15 = 45
+    assert_eq!(actor.value, 45);
+
+    // Snapshot at seq 5.
+    actor.snapshot(&storage).await.unwrap();
+
+    // Delete ALL events.
+    let pid = actor.persistence_id();
+    storage.delete_events_to(&pid, SequenceId(5)).await.unwrap();
+    let remaining = storage.read_events(&pid, SequenceId(1)).await.unwrap();
+    assert!(remaining.is_empty());
+
+    // Recover — snapshot only, no events to replay.
+    let mut recovered = CounterActor::new("snap-only");
+    recover_event_sourced(&mut recovered, &storage, &storage)
+        .await
+        .unwrap();
+    assert_eq!(recovered.value, 45);
+    assert_eq!(recovered.last_sequence_id(), SequenceId(5));
+}
