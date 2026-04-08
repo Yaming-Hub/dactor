@@ -160,7 +160,7 @@ All v0.2 planned work items and stretch goals are now complete.
 
 **Deliverable:** `docs/usage-guide.md` (or `GUIDE.md` at workspace root) — a standalone guide suitable for crates.io documentation and GitHub landing page.
 
-**Status:** 🔲 Not started
+**Status:** ✅ Done
 
 ---
 

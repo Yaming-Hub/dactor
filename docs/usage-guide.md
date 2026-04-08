@@ -771,7 +771,10 @@ The `Disposition` enum controls what happens after an interceptor runs:
 | Variant | Effect |
 |---------|--------|
 | `Disposition::Continue` | Proceed to the next interceptor or handler |
+| `Disposition::Delay(duration)` | Delay the message by the specified duration before proceeding |
 | `Disposition::Drop` | Silently discard the message |
+| `Disposition::Reject(reason)` | Reject the message with a reason string |
+| `Disposition::Retry(duration)` | Return immediately with a retry hint; the caller decides when to resend |
 
 When a message is dropped, the `DropObserver` (if registered) is notified.
 
@@ -786,7 +789,7 @@ use dactor::interceptor::{DropNotice, DropObserver};
 struct MetricsDropObserver;
 
 impl DropObserver for MetricsDropObserver {
-    fn on_drop(&self, notice: &DropNotice) {
+    fn on_drop(&self, notice: DropNotice) {
         println!(
             "Message dropped by '{}': {} → {}",
             notice.interceptor_name, notice.message_type, notice.target_name
@@ -813,8 +816,8 @@ dactor ships with several production-ready interceptors:
 
 ### Lifecycle Hooks
 
-Every actor has three lifecycle hooks, all with default no-op
-implementations:
+Every actor has three lifecycle hooks. `on_start` and `on_stop` default
+to no-ops; `on_error` defaults to returning `ErrorAction::Stop`:
 
 ```rust,ignore
 #[async_trait]
@@ -886,8 +889,8 @@ use std::time::Duration;
 let strategy = OneForOne::new(3, Duration::from_secs(60));
 ```
 
-If the restart limit is exceeded, the strategy escalates (returns
-`SupervisionAction::Escalate`).
+If the restart limit is exceeded, the strategy stops the actor (returns
+`SupervisionAction::Stop`).
 
 ### DeathWatch
 
@@ -1152,7 +1155,7 @@ use dactor::remote::WireEnvelope;
 // - target: ActorId of the destination actor
 // - target_name: human-readable name
 // - message_type: Rust type name for deserialization dispatch
-// - send_mode: Tell, Ask, Expand, or Reduce
+// - send_mode: Tell, Ask, Expand, Reduce, or Transform
 // - headers: serialized headers (WireHeaders)
 // - body: serialized message payload
 // - request_id: UUID for correlating ask replies (None for tell)
@@ -1233,12 +1236,27 @@ impl Transport for MyTransport {
         todo!()
     }
 
-    async fn send_with_reply(
+    async fn send_request(
         &self,
         target_node: &NodeId,
         envelope: WireEnvelope,
-    ) -> Result<Vec<u8>, TransportError> {
-        // Send and wait for reply bytes
+    ) -> Result<WireEnvelope, TransportError> {
+        // Send and wait for a reply envelope
+        todo!()
+    }
+
+    async fn is_reachable(&self, node: &NodeId) -> bool {
+        // Check if a node is reachable
+        todo!()
+    }
+
+    async fn connect(&self, node: &NodeId) -> Result<(), TransportError> {
+        // Establish a connection to a remote node
+        todo!()
+    }
+
+    async fn disconnect(&self, node: &NodeId) -> Result<(), TransportError> {
+        // Disconnect from a remote node
         todo!()
     }
 }
@@ -1291,8 +1309,8 @@ a simple configuration-based discovery mechanism:
 use dactor::remote::StaticSeeds;
 
 let seeds = StaticSeeds::new(vec![
-    "node-1.example.com:9001".parse().unwrap(),
-    "node-2.example.com:9001".parse().unwrap(),
+    "node-1.example.com:9001".to_string(),
+    "node-2.example.com:9001".to_string(),
 ]);
 ```
 
@@ -1386,9 +1404,13 @@ Closed → (failures exceed threshold) → Open → (timeout expires) → HalfOp
 ```rust,ignore
 use dactor::circuit_breaker::{CircuitBreakerInterceptor, CircuitState};
 
-// Transitions to Open after 5 consecutive failures,
+// Transitions to Open after 5 errors within 60 seconds,
 // tries HalfOpen after 30 seconds
-let breaker = CircuitBreakerInterceptor::new(5, Duration::from_secs(30));
+let breaker = CircuitBreakerInterceptor::new(
+    5,                          // trip after 5 errors
+    Duration::from_secs(60),    // within a 60-second window
+    Duration::from_secs(30),    // stay open for 30 seconds
+);
 ```
 
 ### Rate Limiting
@@ -1572,14 +1594,28 @@ with fault injection for integration testing:
 ```rust,ignore
 use dactor_mock::MockCluster;
 
-let mut cluster = MockCluster::new(3); // 3 simulated nodes
+let mut cluster = MockCluster::new(&["node-1", "node-2", "node-3"]);
 
-// Spawn actors on specific nodes
-let actor = cluster.spawn_on(0, "counter", args).await?;
+// Access a specific node's runtime to spawn actors
+let node = cluster.node("node-1");
+let actor = node.runtime.spawn::<MyActor>("counter", args, deps).await;
 
-// Simulate network partition
-cluster.partition(0, 1); // node 0 can't reach node 1
-cluster.heal(0, 1);      // restore connectivity
+// Simulate node crash (removes node and updates peers)
+cluster.crash_node("node-2");
+
+// Restart a crashed node (fresh state, reconnects to peers)
+cluster.restart_node("node-2");
+
+// Use the MockNetwork for partition simulation
+let network = cluster.network();
+network.partition(
+    &NodeId("node-1".into()),
+    &NodeId("node-2".into()),
+);
+network.remove_partition(
+    &NodeId("node-1".into()),
+    &NodeId("node-2".into()),
+);
 ```
 
 ### gRPC Test Harness for E2E Tests
