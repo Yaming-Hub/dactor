@@ -102,3 +102,7 @@ required-features = ["test-support"]
 [[example]]
 name = "showcase"
 required-features = ["test-support"]
+
+[[example]]
+name = "task_queue"
+required-features = ["test-support", "metrics"]
