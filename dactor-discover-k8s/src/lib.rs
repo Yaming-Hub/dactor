@@ -163,7 +163,7 @@ impl KubernetesDiscovery {
             if let Some(ports) = &container.ports {
                 for p in ports {
                     if p.name.as_deref() == Some(port_name) {
-                        return Some(p.container_port as u16);
+                        return u16::try_from(p.container_port).ok();
                     }
                 }
             }

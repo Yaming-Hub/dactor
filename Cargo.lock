@@ -348,8 +348,6 @@ dependencies = [
  "dactor",
  "k8s-openapi",
  "kube",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
 ]
