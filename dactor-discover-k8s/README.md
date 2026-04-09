@@ -11,6 +11,27 @@ This crate provides two Kubernetes-native implementations of dactor's `ClusterDi
 | `KubernetesDiscovery` | Kubernetes API pod listing | Fine-grained control, label-based filtering |
 | `HeadlessServiceDiscovery` | DNS resolution of a headless `Service` | Simple setups, no RBAC needed |
 
+## How dactor uses discovery
+
+The `ClusterDiscovery` trait provides a `discover()` method that returns peer node addresses. The dactor runtime uses this as follows:
+
+1. **On startup**: The runtime calls `discover()` to find initial peers and connects via `AdapterCluster::connect()`.
+2. **Periodic polling**: The application calls `discover()` periodically (e.g., every 10s) to detect topology changes — pods scaling up/down, rolling restarts.
+3. **Diff and reconcile**: Compare discovered peers with connected nodes. Connect new peers, disconnect removed ones.
+4. **Events**: `ClusterEventEmitter` fires `NodeJoined`/`NodeLeft` events for actor subscriptions.
+
+```rust,ignore
+// Example: periodic discovery loop
+loop {
+    let peers = discovery.discover();
+    // reconcile with known_peers, connect/disconnect as needed
+    tokio::time::sleep(Duration::from_secs(10)).await;
+}
+```
+
+> **Note:** PUB4 (planned) will make ClusterDiscovery async with Result return type.
+> A built-in polling/reconciliation loop may be added to dactor core in a future release.
+
 ## Quick Start
 
 ### API-based discovery

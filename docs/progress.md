@@ -204,6 +204,89 @@ All v0.2 planned work items and stretch goals are now complete.
 
 **Status:** 🔲 Not started
 
+---
+
+#### PUB4: Async ClusterDiscovery API with Result
+
+**Goal:** Update the `ClusterDiscovery` trait to be async-native and return `Result`.
+
+The current `ClusterDiscovery` trait is synchronous and infallible:
+```rust
+pub trait ClusterDiscovery: Send + Sync + 'static {
+    fn discover(&self) -> Vec<String>;
+}
+```
+
+This has two problems:
+1. Forces cloud discovery crates to use `block_on` workarounds for async APIs
+2. Errors are silently swallowed — callers can't distinguish "no peers" from "API failure"
+
+**New trait design:**
+```rust
+#[async_trait]
+pub trait ClusterDiscovery: Send + Sync + 'static {
+    async fn discover(&self) -> Result<Vec<String>, DiscoveryError>;
+}
+```
+
+The dactor core (adapter runtimes) should log and ignore discovery errors
+gracefully — a failed discovery attempt should not crash the node, just
+retry on the next cycle.
+
+**Changes:**
+- Add `DiscoveryError` type to dactor core
+- Update `ClusterDiscovery` trait: `async fn discover() -> Result<Vec<String>, DiscoveryError>`
+- Update `StaticSeeds` implementation (infallible → always Ok)
+- Update all adapter runtimes to handle `Result` (log errors, retry)
+- Update `dactor-discover-k8s`: remove `block_on` workaround, return proper errors
+- Update `dactor-discover-aws`: remove `block_on` workaround, return proper errors
+- Update usage guide and docs
+
+**Status:** 🔲 Not started
+
+---
+
+#### PUB5: Rolling Upgrade & Version Compatibility Design
+
+**Goal:** Design and document the complete version compatibility story for dactor clusters during rolling upgrades.
+
+**Problem:** In production, clusters undergo rolling upgrades where nodes run different versions simultaneously. This creates compatibility challenges:
+
+1. **Application message schema changes** — Sender v1, receiver v2 (or vice versa)
+   - Backward-compatible: added optional fields (serde defaults handle it)
+   - Breaking: renamed/removed fields, changed types
+   - `MessageVersionHandler` exists but needs clear upgrade playbook
+
+2. **dactor framework version upgrades** — Different nodes running different dactor versions
+   - Wire protocol changes (WireEnvelope, protobuf system messages)
+   - SystemMessageRouter compatibility across versions
+   - Proto field numbering guarantees (frozen fields)
+
+3. **Adapter version mismatches** — e.g., ractor 0.15 on node-1, ractor 0.16 on node-2
+   - Native transport protocol changes
+   - Actor ID format changes
+   - Mailbox protocol changes
+
+**Scenarios to design for:**
+- **Green/Blue deployment**: Two complete versions running simultaneously
+- **Rolling restart**: Nodes upgraded one at a time, mixed versions during transition
+- **Canary deployment**: Small % of traffic to new version
+- **Rollback**: New version has bugs, revert to old version mid-deployment
+
+**Design deliverables:**
+- Version negotiation protocol (handshake on connect)
+- Wire protocol version header in WireEnvelope
+- Compatibility matrix documentation (which versions can talk to which)
+- `MessageVersionHandler` upgrade playbook with examples
+- Framework version compatibility guarantees (semver policy for wire format)
+- Graceful degradation: what happens when versions are incompatible
+  (reject connection? drop messages? error events?)
+- Testing strategy: how to test mixed-version clusters
+
+**Output:** Design document `docs/version-compatibility.md`
+
+**Status:** 🔲 Not started
+
 ### Documentation Created This Session
 - `docs/cluster-behavior.md` — K8s/EKS/VMSS autoscale, simultaneous restart, graceful shutdown, split-brain
 - `dactor-ractor/docs/implementation.md` — ractor adapter architecture + limitations
