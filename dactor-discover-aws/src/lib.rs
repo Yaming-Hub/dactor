@@ -543,25 +543,27 @@ mod tests {
 
     #[test]
     fn current_region_returns_none_when_unset() {
+        // NOTE: env var tests must not race. This test only removes vars,
+        // which is safe if no other test is concurrently setting them.
+        // The set_var tests are consolidated below.
         std::env::remove_var("AWS_REGION");
         std::env::remove_var("AWS_DEFAULT_REGION");
         assert!(current_region().is_none());
     }
 
     #[test]
-    fn current_region_prefers_aws_region() {
+    fn current_region_preference_order() {
+        // Consolidated test: avoids env var race between parallel tests.
+        // Step 1: AWS_REGION takes precedence over AWS_DEFAULT_REGION
         std::env::set_var("AWS_REGION", "us-east-1");
         std::env::set_var("AWS_DEFAULT_REGION", "eu-west-1");
         assert_eq!(current_region(), Some("us-east-1".to_string()));
-        std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_DEFAULT_REGION");
-    }
 
-    #[test]
-    fn current_region_falls_back_to_default_region() {
+        // Step 2: Falls back to AWS_DEFAULT_REGION when AWS_REGION absent
         std::env::remove_var("AWS_REGION");
-        std::env::set_var("AWS_DEFAULT_REGION", "ap-southeast-1");
-        assert_eq!(current_region(), Some("ap-southeast-1".to_string()));
+        assert_eq!(current_region(), Some("eu-west-1".to_string()));
+
+        // Cleanup
         std::env::remove_var("AWS_DEFAULT_REGION");
     }
 
