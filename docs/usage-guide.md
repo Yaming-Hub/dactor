@@ -1306,17 +1306,24 @@ cluster.unsubscribe(sub_id)?;
 
 ### Cluster Discovery
 
-`ClusterDiscovery` defines how nodes find each other. `StaticSeeds` provides
-a simple configuration-based discovery mechanism:
+`ClusterDiscovery` defines how nodes find each other. It's an async trait
+returning `Result<Vec<String>, DiscoveryError>`:
 
 ```rust,ignore
-use dactor::remote::StaticSeeds;
+use dactor::remote::{ClusterDiscovery, StaticSeeds};
 
 let seeds = StaticSeeds::new(vec![
     "node-1.example.com:9001".to_string(),
     "node-2.example.com:9001".to_string(),
 ]);
+
+// Async discovery — returns Result
+let peers = seeds.discover().await?;
 ```
+
+For cloud environments, use platform-specific crates:
+- `dactor-discover-k8s` — Kubernetes (AKS, EKS, GKE)
+- `dactor-discover-aws` — AWS Auto Scaling / EC2 tags
 
 ### System Actors
 

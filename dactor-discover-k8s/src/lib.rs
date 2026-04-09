@@ -272,13 +272,19 @@ impl HeadlessServiceDiscovery {
 impl ClusterDiscovery for HeadlessServiceDiscovery {
     async fn discover(&self) -> Result<Vec<String>, DiscoveryError> {
         let dns = self.dns_name();
-        let lookup = format!("{dns}:{}", self.port);
-        match lookup.to_socket_addrs() {
-            Ok(addrs) => Ok(addrs.map(|a| a.to_string()).collect()),
-            Err(e) => Err(DiscoveryError::new(format!(
-                "DNS resolution failed for {dns}: {e}"
-            ))),
-        }
+        let port = self.port;
+        // Use spawn_blocking to avoid blocking the async runtime with DNS lookup.
+        let addrs = tokio::task::spawn_blocking(move || {
+            let lookup = format!("{dns}:{port}");
+            lookup.to_socket_addrs()
+        })
+        .await
+        .map_err(|e| DiscoveryError::new(format!("DNS lookup task failed: {e}")))?
+        .map_err(|e| DiscoveryError::new(format!(
+            "DNS resolution failed for {}: {e}", self.dns_name()
+        )))?;
+
+        Ok(addrs.map(|a| a.to_string()).collect())
     }
 }
 
