@@ -625,16 +625,53 @@ pub enum RejectionReason {
 
 ### Phase 4: Application Version in Runtime Configuration
 
+The `app_version` is **your application's release version** — not a dactor
+framework version. You set it when building the runtime so that dactor can
+include it in the connect handshake for operational visibility.
+
+**Why it exists:** During rolling upgrades (Category 2), a cluster will
+temporarily contain nodes running different application versions. The
+`app_version` lets operators see exactly which versions are active in the
+cluster — how many nodes are on v2.3.0 vs v2.3.1, whether the rollout is
+complete, or whether a rollback is needed.
+
+**Important:** The `app_version` is purely informational. It does **not**
+affect connection acceptance or message routing. Two nodes with different
+`app_version` values can always cluster together (assuming the wire protocol
+version matches). Message compatibility is determined separately by
+`WireEnvelope.version` and `MessageVersionHandler`.
+
 **Extend runtime builder:**
 
 ```rust
 impl DactorRuntimeBuilder {
+    /// Set the application version for this node.
+    ///
+    /// This is YOUR application's release version (e.g., "2.3.1"),
+    /// not the dactor framework version. It is included in the connect
+    /// handshake and exposed in ClusterState for operational visibility
+    /// during rolling upgrades.
+    ///
+    /// Typical usage: set to the same value as your Cargo.toml version
+    /// or your CI/CD build tag.
     pub fn app_version(mut self, version: &str) -> Self {
         self.app_version = Some(version.to_string());
         self
     }
 }
+
+// Example:
+let runtime = DactorRuntime::builder()
+    .app_version("2.3.1")    // your app's release version
+    .build();
 ```
+
+**Where `app_version` appears at runtime:**
+
+- **Connect handshake** — exchanged between peers on connection
+- **`ClusterState`** — queryable for dashboards and monitoring
+- **Log messages** — logged when peers with different app versions connect
+- **Metrics labels** — enables version-aware monitoring during rollouts
 
 **Include in `ClusterState`:**
 
@@ -643,16 +680,29 @@ pub struct ClusterState {
     pub local_node: NodeId,
     pub nodes: Vec<NodeId>,
     pub is_leader: bool,
-    pub app_version: Option<String>,
-    pub wire_version: String,
+    pub app_version: Option<String>,     // this node's app version
+    pub wire_version: String,             // DACTOR_PROTOCOL_VERSION
     pub peer_versions: HashMap<NodeId, PeerVersionInfo>,
 }
 
 pub struct PeerVersionInfo {
     pub wire_version: String,
-    pub app_version: Option<String>,
+    pub app_version: Option<String>,     // peer's app version
     pub adapter: String,
 }
+```
+
+**Operational example during rolling restart:**
+
+```
+ClusterState:
+  local_node: node-3 (app_version: "2.3.1")
+  peers:
+    node-1: app_version "2.3.0"  ← not yet upgraded
+    node-2: app_version "2.3.1"  ← upgraded
+    node-4: app_version "2.3.0"  ← not yet upgraded
+  
+  Rollout progress: 2/4 nodes on v2.3.1 (50%)
 ```
 
 ### Phase 5: MessageVersionHandler Playbook
@@ -961,9 +1011,117 @@ handle the error gracefully (e.g., retry after the target node is upgraded).
 | Incompatible wire version | `NodeRejected { reason: IncompatibleProtocol }` |
 | Incompatible adapter | `NodeRejected { reason: IncompatibleAdapter }` |
 | Handshake timeout | `NodeRejected { reason: ConnectionFailed }` |
+| System message deserialization failure | `NodeRejected { reason: ProtocolError }` |
 | App version mismatch | *None* — accepted with log warning |
 | Message version mismatch | *None* — handled at message level |
 | Unknown message type | *None* — handled at message level |
+
+### Scenario: System Message Deserialization Failure
+
+**What happens:** Two nodes successfully connect (handshake passes) but a
+system-level protobuf message (SpawnRequest, WatchRequest, CancelRequest,
+ConnectPeer, etc.) fails to deserialize on the receiving side.
+
+This can occur when:
+- The handshake was corrupted or skipped (e.g., direct TCP without handshake)
+- A minor wire version bump added new required fields to a system message
+  but the receiver is on an older minor version that doesn't know about them
+- Protobuf schema evolution went wrong (reused field numbers, changed types)
+
+**Behavior:**
+
+```
+1. Node-A sends system WireEnvelope (e.g., SYSTEM_MSG_TYPE_SPAWN)
+2. Node-B calls proto::decode_spawn_request(&envelope.body)
+3. Deserialization fails → RoutingError returned
+4. Node-B logs: "system message deserialization failed: decode SpawnRequest: ..."
+5. Node-B emits ClusterEvent::NodeRejected {
+       node_id: "node-a",
+       reason: ProtocolError,
+       detail: "system message deserialization failed"
+   }
+6. Node-B disconnects from Node-A
+```
+
+**Why this is Category 1:** System messages are the foundation of cluster
+coordination. If they can't be deserialized, nodes cannot manage actors,
+watches, or peer membership. The connection must be severed.
+
+**Key distinction from application message failure:** Application message
+deserialization failures (Category 2) are handled per-message — the actor
+gets an error, the cluster continues. System message failures indicate
+fundamental protocol incompatibility — the connection must be terminated.
+
+**Implementation in SystemMessageRouter:**
+
+```rust
+async fn route_system_envelope(&self, envelope: WireEnvelope) 
+    -> Result<RoutingOutcome, RoutingError> 
+{
+    // If ANY system message fails to decode, this is a protocol error.
+    // The transport layer should:
+    // 1. Log the error with full context
+    // 2. Emit ClusterEvent::NodeRejected { reason: ProtocolError }
+    // 3. Disconnect the peer
+    // 4. NOT retry (protocol mismatch won't resolve without redeployment)
+}
+```
+
+### Core dactor Protocol Version
+
+The dactor framework maintains a **core protocol version** as a compile-time
+constant. This version is separate from the crate version (`Cargo.toml`
+version) — it tracks only changes to the wire format.
+
+```rust
+// In dactor/src/remote.rs (or dactor/src/lib.rs)
+
+/// Core dactor protocol version for inter-node communication.
+///
+/// This version is included in the connect handshake and determines
+/// whether two nodes can form a cluster.
+///
+/// ⚠️  WIRE PROTOCOL — increment carefully:
+/// - MAJOR: breaking wire change → nodes cannot cluster (Category 1)
+/// - MINOR: backward-compatible addition → nodes can cluster
+/// - PATCH: no wire changes
+///
+/// This is NOT the crate version (Cargo.toml). A crate version bump
+/// does not necessarily change the protocol version. Only changes to
+/// WireEnvelope structure, system message protobuf schemas, or
+/// handshake format require a protocol version bump.
+pub const DACTOR_PROTOCOL_VERSION: (u32, u32, u32) = (0, 2, 0);
+
+/// Check if two protocol versions are compatible for clustering.
+pub fn protocol_compatible(local: (u32, u32, u32), remote: (u32, u32, u32)) -> bool {
+    local.0 == remote.0  // same MAJOR version required
+}
+```
+
+**What bumps each component:**
+
+| Component | Bumped When | Example Change |
+|-----------|------------|----------------|
+| **MAJOR** | WireEnvelope structure changes, protobuf system message schema breaks, handshake format changes | New required field in WireEnvelope, removed system message type |
+| **MINOR** | New optional protobuf field, new system message type, new ClusterEvent variant | Added `ConnectPeer.metadata` optional field |
+| **PATCH** | Internal bug fixes, performance improvements, no wire changes | Fixed deserialization edge case |
+
+**Relationship to other versions:**
+
+```
+dactor crate version (Cargo.toml):  0.2.0 → 0.2.1 → 0.3.0 → 1.0.0
+                                      │         │        │        │
+protocol version:                   0.2.0    0.2.0    0.2.1    1.0.0
+                                    (same)   (patch)  (minor)  (MAJOR)
+
+Node compatibility:                   ✅       ✅       ✅       ❌
+                                   (identical) (same)  (compat) (Category 1)
+```
+
+A crate can have many releases (0.2.0, 0.2.1, 0.2.2) that all share
+the same protocol version (0.2.0), as long as no wire format changes
+are made. Only when the wire format actually changes does the protocol
+version bump.
 
 ---
 
