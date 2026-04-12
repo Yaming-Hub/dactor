@@ -182,6 +182,9 @@ pub use system_actors::{
     WatchRequest,
 };
 pub use system_actors::{
+    validate_handshake, HandshakeRequest, HandshakeResponse, RejectionReason,
+};
+pub use system_actors::{
     is_system_message_type, SYSTEM_MSG_TYPE_CANCEL, SYSTEM_MSG_TYPE_CONNECT_PEER,
     SYSTEM_MSG_TYPE_DISCONNECT_PEER, SYSTEM_MSG_TYPE_SPAWN, SYSTEM_MSG_TYPE_UNWATCH,
     SYSTEM_MSG_TYPE_WATCH,
