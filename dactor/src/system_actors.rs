@@ -469,6 +469,127 @@ impl Default for NodeDirectory {
 }
 
 // ---------------------------------------------------------------------------
+// Handshake types (version compatibility)
+// ---------------------------------------------------------------------------
+
+/// Information sent by a node when initiating a version handshake.
+///
+/// Both nodes exchange a `HandshakeRequest` during connection setup.
+/// The receiving node compares the request against its own configuration
+/// and returns a [`HandshakeResponse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandshakeRequest {
+    /// The node's identity.
+    pub node_id: NodeId,
+    /// The wire protocol version this node speaks.
+    pub wire_version: crate::version::WireVersion,
+    /// The application version, if configured. Informational only — does
+    /// not affect compatibility.
+    pub app_version: Option<String>,
+    /// The actor framework adapter (e.g. "ractor", "kameo", "coerce").
+    pub adapter: String,
+}
+
+/// The result of a version handshake.
+///
+/// Returned by the remote node after comparing its own configuration
+/// against the incoming [`HandshakeRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandshakeResponse {
+    /// The remote node accepted the handshake. The cluster can proceed.
+    Accepted {
+        /// The remote node's identity.
+        node_id: NodeId,
+        /// The remote node's wire protocol version.
+        wire_version: crate::version::WireVersion,
+        /// The remote node's application version, if configured.
+        app_version: Option<String>,
+        /// The remote node's adapter name.
+        adapter: String,
+    },
+    /// The remote node rejected the handshake.
+    Rejected {
+        /// The remote node's identity.
+        node_id: NodeId,
+        /// The remote node's wire protocol version.
+        wire_version: crate::version::WireVersion,
+        /// Why the handshake was rejected.
+        reason: RejectionReason,
+        /// Human-readable detail message.
+        detail: String,
+    },
+}
+
+/// Reason a version handshake was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionReason {
+    /// The remote node's wire protocol MAJOR version differs. Nodes cannot
+    /// form a cluster (Category 1 — infrastructure-level change).
+    IncompatibleProtocol,
+    /// The remote node uses a different actor framework adapter. Mixed-adapter
+    /// clusters are rejected by default.
+    IncompatibleAdapter,
+}
+
+impl std::fmt::Display for RejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RejectionReason::IncompatibleProtocol => write!(f, "incompatible wire protocol"),
+            RejectionReason::IncompatibleAdapter => write!(f, "incompatible adapter"),
+        }
+    }
+}
+
+/// Validate a remote node's [`HandshakeRequest`] against local configuration.
+///
+/// Returns a [`HandshakeResponse`] indicating whether the connection is accepted.
+///
+/// The check order is:
+/// 1. Wire protocol compatibility (same MAJOR version)
+/// 2. Adapter match (must be the same adapter)
+pub fn validate_handshake(
+    local: &HandshakeRequest,
+    remote: &HandshakeRequest,
+) -> HandshakeResponse {
+    // Check wire protocol compatibility first
+    if !local.wire_version.is_compatible(&remote.wire_version) {
+        return HandshakeResponse::Rejected {
+            node_id: local.node_id.clone(),
+            wire_version: local.wire_version,
+            reason: RejectionReason::IncompatibleProtocol,
+            detail: format!(
+                "wire version {remote} is incompatible with local {local} \
+                 (different MAJOR version)",
+                remote = remote.wire_version,
+                local = local.wire_version,
+            ),
+        };
+    }
+
+    // Check adapter match
+    if local.adapter != remote.adapter {
+        return HandshakeResponse::Rejected {
+            node_id: local.node_id.clone(),
+            wire_version: local.wire_version,
+            reason: RejectionReason::IncompatibleAdapter,
+            detail: format!(
+                "adapter \"{remote}\" does not match local \"{local}\"",
+                remote = remote.adapter,
+                local = local.adapter,
+            ),
+        };
+    }
+
+    // All checks passed
+    HandshakeResponse::Accepted {
+        node_id: local.node_id.clone(),
+        wire_version: local.wire_version,
+        app_version: local.app_version.clone(),
+        adapter: local.adapter.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -804,6 +925,113 @@ mod tests {
             SYSTEM_MSG_TYPE_DISCONNECT_PEER,
             "dactor::system_actors::DisconnectPeer",
             "SYSTEM_MSG_TYPE_DISCONNECT_PEER is a wire protocol value — do not change"
+        );
+    }
+
+    // -- Handshake validation tests --
+
+    fn make_handshake_request(
+        node_id: &str,
+        wire: &str,
+        adapter: &str,
+        app_version: Option<&str>,
+    ) -> HandshakeRequest {
+        HandshakeRequest {
+            node_id: NodeId(node_id.into()),
+            wire_version: crate::version::WireVersion::parse(wire).unwrap(),
+            app_version: app_version.map(|s| s.into()),
+            adapter: adapter.into(),
+        }
+    }
+
+    #[test]
+    fn handshake_same_version_and_adapter_accepted() {
+        let local = make_handshake_request("node-a", "0.2.0", "ractor", None);
+        let remote = make_handshake_request("node-b", "0.2.0", "ractor", None);
+        let resp = validate_handshake(&local, &remote);
+        assert!(matches!(resp, HandshakeResponse::Accepted { .. }));
+    }
+
+    #[test]
+    fn handshake_same_major_different_minor_accepted() {
+        let local = make_handshake_request("node-a", "0.2.0", "ractor", None);
+        let remote = make_handshake_request("node-b", "0.3.0", "ractor", None);
+        let resp = validate_handshake(&local, &remote);
+        assert!(matches!(resp, HandshakeResponse::Accepted { .. }));
+    }
+
+    #[test]
+    fn handshake_different_major_rejected() {
+        let local = make_handshake_request("node-a", "0.2.0", "ractor", None);
+        let remote = make_handshake_request("node-b", "1.0.0", "ractor", None);
+        let resp = validate_handshake(&local, &remote);
+        match resp {
+            HandshakeResponse::Rejected { reason, detail, .. } => {
+                assert_eq!(reason, RejectionReason::IncompatibleProtocol);
+                assert!(detail.contains("MAJOR"));
+            }
+            _ => panic!("expected Rejected"),
+        }
+    }
+
+    #[test]
+    fn handshake_different_adapter_rejected() {
+        let local = make_handshake_request("node-a", "0.2.0", "ractor", None);
+        let remote = make_handshake_request("node-b", "0.2.0", "kameo", None);
+        let resp = validate_handshake(&local, &remote);
+        match resp {
+            HandshakeResponse::Rejected { reason, detail, .. } => {
+                assert_eq!(reason, RejectionReason::IncompatibleAdapter);
+                assert!(detail.contains("kameo"));
+                assert!(detail.contains("ractor"));
+            }
+            _ => panic!("expected Rejected"),
+        }
+    }
+
+    #[test]
+    fn handshake_protocol_checked_before_adapter() {
+        let local = make_handshake_request("node-a", "0.2.0", "ractor", None);
+        let remote = make_handshake_request("node-b", "1.0.0", "kameo", None);
+        let resp = validate_handshake(&local, &remote);
+        // Protocol mismatch should be reported even though adapter also differs
+        match resp {
+            HandshakeResponse::Rejected { reason, .. } => {
+                assert_eq!(reason, RejectionReason::IncompatibleProtocol);
+            }
+            _ => panic!("expected Rejected"),
+        }
+    }
+
+    #[test]
+    fn handshake_accepted_carries_local_info() {
+        let local = make_handshake_request("node-a", "0.2.0", "ractor", Some("1.0.0"));
+        let remote = make_handshake_request("node-b", "0.2.0", "ractor", Some("2.0.0"));
+        match validate_handshake(&local, &remote) {
+            HandshakeResponse::Accepted {
+                node_id,
+                wire_version,
+                app_version,
+                adapter,
+            } => {
+                assert_eq!(node_id, NodeId("node-a".into()));
+                assert_eq!(wire_version.to_string(), "0.2.0");
+                assert_eq!(app_version.as_deref(), Some("1.0.0"));
+                assert_eq!(adapter, "ractor");
+            }
+            _ => panic!("expected Accepted"),
+        }
+    }
+
+    #[test]
+    fn rejection_reason_display() {
+        assert_eq!(
+            RejectionReason::IncompatibleProtocol.to_string(),
+            "incompatible wire protocol"
+        );
+        assert_eq!(
+            RejectionReason::IncompatibleAdapter.to_string(),
+            "incompatible adapter"
         );
     }
 }

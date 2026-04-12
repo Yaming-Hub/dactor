@@ -105,6 +105,43 @@ message DisconnectPeerProto {
 }
 
 // ---------------------------------------------------------------------------
+// Handshake (version compatibility)
+// ---------------------------------------------------------------------------
+
+message HandshakeRequestProto {
+    string node_id = 1;
+    string wire_version = 2;
+    optional string app_version = 3;
+    string adapter = 4;
+}
+
+enum RejectionReasonProto {
+    REJECTION_REASON_INCOMPATIBLE_PROTOCOL = 0;
+    REJECTION_REASON_INCOMPATIBLE_ADAPTER = 1;
+}
+
+message HandshakeResponseProto {
+    oneof result {
+        HandshakeAcceptedProto accepted = 1;
+        HandshakeRejectedProto rejected = 2;
+    }
+}
+
+message HandshakeAcceptedProto {
+    string node_id = 1;
+    string wire_version = 2;
+    optional string app_version = 3;
+    string adapter = 4;
+}
+
+message HandshakeRejectedProto {
+    string node_id = 1;
+    string wire_version = 2;
+    RejectionReasonProto reason = 3;
+    string detail = 4;
+}
+
+// ---------------------------------------------------------------------------
 // WireEnvelope framing
 // ---------------------------------------------------------------------------
 

@@ -25,8 +25,8 @@ use crate::interceptor::SendMode;
 use crate::node::{ActorId, NodeId};
 use crate::remote::{SerializationError, WireEnvelope, WireHeaders};
 use crate::system_actors::{
-    CancelRequest, CancelResponse, SpawnRequest, SpawnResponse, UnwatchRequest, WatchNotification,
-    WatchRequest,
+    CancelRequest, CancelResponse, HandshakeRequest, HandshakeResponse, RejectionReason,
+    SpawnRequest, SpawnResponse, UnwatchRequest, WatchNotification, WatchRequest,
 };
 
 // Include prost-generated types from build.rs.
@@ -362,6 +362,166 @@ pub fn decode_disconnect_peer(bytes: &[u8]) -> Result<NodeId, SerializationError
         return Err(SerializationError::new("DisconnectPeer: node_id must not be empty"));
     }
     Ok(NodeId(proto.node_id))
+}
+
+// ---------------------------------------------------------------------------
+// Handshake
+// ---------------------------------------------------------------------------
+
+/// Encode a [`HandshakeRequest`] to protobuf bytes.
+pub fn encode_handshake_request(req: &HandshakeRequest) -> Vec<u8> {
+    let proto = HandshakeRequestProto {
+        node_id: req.node_id.0.clone(),
+        wire_version: req.wire_version.to_string(),
+        app_version: req.app_version.clone(),
+        adapter: req.adapter.clone(),
+    };
+    proto.encode_to_vec()
+}
+
+/// Decode a [`HandshakeRequest`] from protobuf bytes.
+pub fn decode_handshake_request(bytes: &[u8]) -> Result<HandshakeRequest, SerializationError> {
+    check_size(bytes, MAX_SYSTEM_MSG_SIZE, "HandshakeRequest")?;
+    let proto = HandshakeRequestProto::decode(bytes)
+        .map_err(|e| SerializationError::new(format!("decode HandshakeRequest: {e}")))?;
+    if proto.node_id.is_empty() {
+        return Err(SerializationError::new(
+            "HandshakeRequest: node_id must not be empty",
+        ));
+    }
+    if proto.wire_version.is_empty() {
+        return Err(SerializationError::new(
+            "HandshakeRequest: wire_version must not be empty",
+        ));
+    }
+    if proto.adapter.is_empty() {
+        return Err(SerializationError::new(
+            "HandshakeRequest: adapter must not be empty",
+        ));
+    }
+    let wire_version =
+        crate::version::WireVersion::parse(&proto.wire_version).map_err(|e| {
+            SerializationError::new(format!("HandshakeRequest: invalid wire_version: {e}"))
+        })?;
+    Ok(HandshakeRequest {
+        node_id: NodeId(proto.node_id),
+        wire_version,
+        app_version: proto.app_version,
+        adapter: proto.adapter,
+    })
+}
+
+/// Encode a [`HandshakeResponse`] to protobuf bytes.
+pub fn encode_handshake_response(resp: &HandshakeResponse) -> Vec<u8> {
+    let proto = match resp {
+        HandshakeResponse::Accepted {
+            node_id,
+            wire_version,
+            app_version,
+            adapter,
+        } => HandshakeResponseProto {
+            result: Some(handshake_response_proto::Result::Accepted(
+                HandshakeAcceptedProto {
+                    node_id: node_id.0.clone(),
+                    wire_version: wire_version.to_string(),
+                    app_version: app_version.clone(),
+                    adapter: adapter.clone(),
+                },
+            )),
+        },
+        HandshakeResponse::Rejected {
+            node_id,
+            wire_version,
+            reason,
+            detail,
+        } => HandshakeResponseProto {
+            result: Some(handshake_response_proto::Result::Rejected(
+                HandshakeRejectedProto {
+                    node_id: node_id.0.clone(),
+                    wire_version: wire_version.to_string(),
+                    reason: rejection_reason_to_proto(*reason) as i32,
+                    detail: detail.clone(),
+                },
+            )),
+        },
+    };
+    proto.encode_to_vec()
+}
+
+/// Decode a [`HandshakeResponse`] from protobuf bytes.
+pub fn decode_handshake_response(bytes: &[u8]) -> Result<HandshakeResponse, SerializationError> {
+    check_size(bytes, MAX_SYSTEM_MSG_SIZE, "HandshakeResponse")?;
+    let proto = HandshakeResponseProto::decode(bytes)
+        .map_err(|e| SerializationError::new(format!("decode HandshakeResponse: {e}")))?;
+    match proto.result {
+        Some(handshake_response_proto::Result::Accepted(a)) => {
+            if a.node_id.is_empty() {
+                return Err(SerializationError::new(
+                    "HandshakeAccepted: node_id must not be empty",
+                ));
+            }
+            let wire_version =
+                crate::version::WireVersion::parse(&a.wire_version).map_err(|e| {
+                    SerializationError::new(format!(
+                        "HandshakeAccepted: invalid wire_version: {e}"
+                    ))
+                })?;
+            Ok(HandshakeResponse::Accepted {
+                node_id: NodeId(a.node_id),
+                wire_version,
+                app_version: a.app_version,
+                adapter: a.adapter,
+            })
+        }
+        Some(handshake_response_proto::Result::Rejected(r)) => {
+            if r.node_id.is_empty() {
+                return Err(SerializationError::new(
+                    "HandshakeRejected: node_id must not be empty",
+                ));
+            }
+            let wire_version =
+                crate::version::WireVersion::parse(&r.wire_version).map_err(|e| {
+                    SerializationError::new(format!(
+                        "HandshakeRejected: invalid wire_version: {e}"
+                    ))
+                })?;
+            let reason = rejection_reason_from_proto(r.reason)?;
+            Ok(HandshakeResponse::Rejected {
+                node_id: NodeId(r.node_id),
+                wire_version,
+                reason,
+                detail: r.detail,
+            })
+        }
+        None => Err(SerializationError::new(
+            "HandshakeResponse: missing oneof result",
+        )),
+    }
+}
+
+fn rejection_reason_to_proto(reason: RejectionReason) -> RejectionReasonProto {
+    match reason {
+        RejectionReason::IncompatibleProtocol => {
+            RejectionReasonProto::RejectionReasonIncompatibleProtocol
+        }
+        RejectionReason::IncompatibleAdapter => {
+            RejectionReasonProto::RejectionReasonIncompatibleAdapter
+        }
+    }
+}
+
+fn rejection_reason_from_proto(value: i32) -> Result<RejectionReason, SerializationError> {
+    match RejectionReasonProto::try_from(value) {
+        Ok(RejectionReasonProto::RejectionReasonIncompatibleProtocol) => {
+            Ok(RejectionReason::IncompatibleProtocol)
+        }
+        Ok(RejectionReasonProto::RejectionReasonIncompatibleAdapter) => {
+            Ok(RejectionReason::IncompatibleAdapter)
+        }
+        Err(_) => Err(SerializationError::new(format!(
+            "unknown RejectionReason value: {value}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -803,5 +963,118 @@ mod tests {
         let bytes = proto.encode_to_vec();
         let err = decode_wire_envelope(&bytes).unwrap_err();
         assert!(err.message.contains("UUID"), "error: {}", err.message);
+    }
+
+    // -- Handshake encode/decode tests --
+
+    use crate::system_actors::{HandshakeRequest, HandshakeResponse, RejectionReason};
+    use crate::version::WireVersion;
+
+    fn test_handshake_request() -> HandshakeRequest {
+        HandshakeRequest {
+            node_id: NodeId("node-a".into()),
+            wire_version: WireVersion::parse("0.2.0").unwrap(),
+            app_version: Some("1.0.0".into()),
+            adapter: "ractor".into(),
+        }
+    }
+
+    #[test]
+    fn handshake_request_roundtrip() {
+        let req = test_handshake_request();
+        let bytes = encode_handshake_request(&req);
+        let decoded = decode_handshake_request(&bytes).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn handshake_request_no_app_version() {
+        let req = HandshakeRequest {
+            node_id: NodeId("node-b".into()),
+            wire_version: WireVersion::parse("0.3.0").unwrap(),
+            app_version: None,
+            adapter: "kameo".into(),
+        };
+        let bytes = encode_handshake_request(&req);
+        let decoded = decode_handshake_request(&bytes).unwrap();
+        assert_eq!(decoded.app_version, None);
+        assert_eq!(decoded.adapter, "kameo");
+    }
+
+    #[test]
+    fn handshake_request_rejects_empty_node_id() {
+        let req = HandshakeRequest {
+            node_id: NodeId(String::new()),
+            wire_version: WireVersion::parse("0.2.0").unwrap(),
+            app_version: None,
+            adapter: "ractor".into(),
+        };
+        let bytes = encode_handshake_request(&req);
+        let err = decode_handshake_request(&bytes).unwrap_err();
+        assert!(err.message.contains("node_id"));
+    }
+
+    #[test]
+    fn handshake_response_accepted_roundtrip() {
+        let resp = HandshakeResponse::Accepted {
+            node_id: NodeId("node-b".into()),
+            wire_version: WireVersion::parse("0.2.0").unwrap(),
+            app_version: Some("2.0.0".into()),
+            adapter: "ractor".into(),
+        };
+        let bytes = encode_handshake_response(&resp);
+        let decoded = decode_handshake_response(&bytes).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn handshake_response_rejected_protocol_roundtrip() {
+        let resp = HandshakeResponse::Rejected {
+            node_id: NodeId("node-b".into()),
+            wire_version: WireVersion::parse("1.0.0").unwrap(),
+            reason: RejectionReason::IncompatibleProtocol,
+            detail: "different MAJOR".into(),
+        };
+        let bytes = encode_handshake_response(&resp);
+        let decoded = decode_handshake_response(&bytes).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn handshake_response_rejected_adapter_roundtrip() {
+        let resp = HandshakeResponse::Rejected {
+            node_id: NodeId("node-b".into()),
+            wire_version: WireVersion::parse("0.2.0").unwrap(),
+            reason: RejectionReason::IncompatibleAdapter,
+            detail: "kameo vs ractor".into(),
+        };
+        let bytes = encode_handshake_response(&resp);
+        let decoded = decode_handshake_response(&bytes).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn handshake_response_missing_result() {
+        let proto = HandshakeResponseProto { result: None };
+        let bytes = proto.encode_to_vec();
+        let err = decode_handshake_response(&bytes).unwrap_err();
+        assert!(err.message.contains("missing oneof"));
+    }
+
+    #[test]
+    fn handshake_response_accepted_empty_node_id() {
+        let proto = HandshakeResponseProto {
+            result: Some(handshake_response_proto::Result::Accepted(
+                HandshakeAcceptedProto {
+                    node_id: String::new(),
+                    wire_version: "0.2.0".into(),
+                    app_version: None,
+                    adapter: "ractor".into(),
+                },
+            )),
+        };
+        let bytes = proto.encode_to_vec();
+        let err = decode_handshake_response(&bytes).unwrap_err();
+        assert!(err.message.contains("node_id"));
     }
 }
