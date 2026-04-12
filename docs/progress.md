@@ -303,7 +303,7 @@ However, **remote actor calls may fail** depending on whether the application me
 
 **Output:** Design document `docs/version-compatibility.md`
 
-**Status:** 🔲 Not started
+**Status:** ✅ Done
 
 ### Documentation Created This Session
 - `docs/cluster-behavior.md` — K8s/EKS/VMSS autoscale, simultaneous restart, graceful shutdown, split-brain
