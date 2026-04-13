@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::node::NodeId;
 use crate::remote::WireEnvelope;
+use crate::system_actors::{HandshakeRequest, HandshakeResponse};
 
 // ---------------------------------------------------------------------------
 // TransportError
@@ -77,6 +78,24 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Disconnect from a remote node.
     async fn disconnect(&self, node: &NodeId) -> Result<(), TransportError>;
+
+    /// Perform a version handshake with a remote node.
+    ///
+    /// Called by the runtime after [`connect`](Self::connect) to verify wire
+    /// protocol compatibility before any application messages are exchanged.
+    /// The implementation should exchange [`HandshakeRequest`] /
+    /// [`HandshakeResponse`] with the remote node and return the response.
+    ///
+    /// The default implementation returns an error indicating that the
+    /// transport does not support handshakes. Adapters should override this
+    /// once they implement the handshake protocol.
+    async fn handshake(
+        &self,
+        _node: &NodeId,
+        _request: HandshakeRequest,
+    ) -> Result<HandshakeResponse, TransportError> {
+        Err(TransportError::new("transport does not support handshake"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +113,9 @@ pub struct InMemoryTransport {
     local_node: NodeId,
     /// Set of nodes we are "connected" to.
     connected: Arc<Mutex<std::collections::HashSet<NodeId>>>,
+    /// Handshake info for each node, shared between linked transports.
+    /// Populated via [`set_handshake_info`](Self::set_handshake_info).
+    handshake_info: Arc<Mutex<HashMap<NodeId, HandshakeRequest>>>,
 }
 
 impl InMemoryTransport {
@@ -104,6 +126,7 @@ impl InMemoryTransport {
             pending: Arc::new(Mutex::new(HashMap::new())),
             local_node,
             connected: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            handshake_info: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -149,6 +172,39 @@ impl InMemoryTransport {
         // Mark each other as connected.
         self.connected.lock().await.insert(other.local_node.clone());
         other.connected.lock().await.insert(self.local_node.clone());
+
+        // Share handshake info between linked transports.
+        let self_info: Vec<_> = {
+            let info = self.handshake_info.lock().await;
+            info.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let other_info: Vec<_> = {
+            let info = other.handshake_info.lock().await;
+            info.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        {
+            let mut info = self.handshake_info.lock().await;
+            for (node, req) in other_info {
+                info.insert(node, req);
+            }
+        }
+        {
+            let mut info = other.handshake_info.lock().await;
+            for (node, req) in self_info {
+                info.insert(node, req);
+            }
+        }
+    }
+
+    /// Register this node's handshake information for version negotiation.
+    ///
+    /// Must be called before [`handshake`](Transport::handshake) can validate
+    /// against a peer. Call this before [`link`](Self::link) — info is copied
+    /// (not shared) during link, so post-link updates are not visible to
+    /// already-linked transports.
+    pub async fn set_handshake_info(&self, request: HandshakeRequest) {
+        let node = request.node_id.clone();
+        self.handshake_info.lock().await.insert(node, request);
     }
 
     /// Submit a reply for a pending `send_request` call identified by its
@@ -233,6 +289,18 @@ impl Transport for InMemoryTransport {
     async fn disconnect(&self, node: &NodeId) -> Result<(), TransportError> {
         self.connected.lock().await.remove(node);
         Ok(())
+    }
+
+    async fn handshake(
+        &self,
+        node: &NodeId,
+        request: HandshakeRequest,
+    ) -> Result<HandshakeResponse, TransportError> {
+        let info = self.handshake_info.lock().await;
+        let remote_info = info.get(node).ok_or_else(|| {
+            TransportError::new(format!("no handshake info registered for {node}"))
+        })?;
+        Ok(crate::system_actors::validate_handshake(remote_info, &request))
     }
 }
 
@@ -461,5 +529,145 @@ mod tests {
     async fn transport_error_display() {
         let err = TransportError::new("connection refused");
         assert_eq!(format!("{err}"), "transport error: connection refused");
+    }
+
+    // -- Handshake tests --
+
+    use crate::version::WireVersion;
+
+    fn test_handshake_req(node: &str, wire: &str, adapter: &str) -> HandshakeRequest {
+        HandshakeRequest {
+            node_id: NodeId(node.into()),
+            wire_version: WireVersion::parse(wire).unwrap(),
+            app_version: None,
+            adapter: adapter.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_compatible_accepted() {
+        let t1 = InMemoryTransport::new(NodeId("node-1".into()));
+        let t2 = InMemoryTransport::new(NodeId("node-2".into()));
+
+        t1.set_handshake_info(test_handshake_req("node-1", "0.2.0", "ractor"))
+            .await;
+        t2.set_handshake_info(test_handshake_req("node-2", "0.2.0", "ractor"))
+            .await;
+
+        let _rx1 = t1.register_node(NodeId("node-1".into())).await;
+        let _rx2 = t2.register_node(NodeId("node-2".into())).await;
+        t1.link(&t2).await;
+
+        let req = test_handshake_req("node-1", "0.2.0", "ractor");
+        let resp = t1.handshake(&NodeId("node-2".into()), req).await.unwrap();
+        match resp {
+            HandshakeResponse::Accepted { node_id, .. } => {
+                // Response should come from the remote node (node-2), not the caller
+                assert_eq!(node_id, NodeId("node-2".into()));
+            }
+            _ => panic!("expected Accepted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_incompatible_protocol_rejected() {
+        let t1 = InMemoryTransport::new(NodeId("node-1".into()));
+        let t2 = InMemoryTransport::new(NodeId("node-2".into()));
+
+        t1.set_handshake_info(test_handshake_req("node-1", "0.2.0", "ractor"))
+            .await;
+        t2.set_handshake_info(test_handshake_req("node-2", "1.0.0", "ractor"))
+            .await;
+
+        let _rx1 = t1.register_node(NodeId("node-1".into())).await;
+        let _rx2 = t2.register_node(NodeId("node-2".into())).await;
+        t1.link(&t2).await;
+
+        let req = test_handshake_req("node-1", "0.2.0", "ractor");
+        let resp = t1.handshake(&NodeId("node-2".into()), req).await.unwrap();
+        assert!(matches!(
+            resp,
+            HandshakeResponse::Rejected {
+                reason: crate::system_actors::RejectionReason::IncompatibleProtocol,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_incompatible_adapter_rejected() {
+        let t1 = InMemoryTransport::new(NodeId("node-1".into()));
+        let t2 = InMemoryTransport::new(NodeId("node-2".into()));
+
+        t1.set_handshake_info(test_handshake_req("node-1", "0.2.0", "ractor"))
+            .await;
+        t2.set_handshake_info(test_handshake_req("node-2", "0.2.0", "kameo"))
+            .await;
+
+        let _rx1 = t1.register_node(NodeId("node-1".into())).await;
+        let _rx2 = t2.register_node(NodeId("node-2".into())).await;
+        t1.link(&t2).await;
+
+        let req = test_handshake_req("node-1", "0.2.0", "ractor");
+        let resp = t1.handshake(&NodeId("node-2".into()), req).await.unwrap();
+        assert!(matches!(
+            resp,
+            HandshakeResponse::Rejected {
+                reason: crate::system_actors::RejectionReason::IncompatibleAdapter,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_no_info_returns_error() {
+        let t1 = InMemoryTransport::new(NodeId("node-1".into()));
+
+        let req = test_handshake_req("node-1", "0.2.0", "ractor");
+        let result = t1.handshake(&NodeId("node-unknown".into()), req).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("no handshake info"));
+    }
+
+    #[tokio::test]
+    async fn handshake_default_trait_returns_error() {
+        // Verify the default Transport::handshake returns an error
+        struct MinimalTransport;
+
+        #[async_trait]
+        impl Transport for MinimalTransport {
+            async fn send(
+                &self,
+                _: &NodeId,
+                _: WireEnvelope,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn send_request(
+                &self,
+                _: &NodeId,
+                _: WireEnvelope,
+            ) -> Result<WireEnvelope, TransportError> {
+                Err(TransportError::new("not supported"))
+            }
+            async fn is_reachable(&self, _: &NodeId) -> bool {
+                false
+            }
+            async fn connect(&self, _: &NodeId) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn disconnect(&self, _: &NodeId) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let t = MinimalTransport;
+        let req = test_handshake_req("node-1", "0.2.0", "test");
+        let result = t.handshake(&NodeId("node-2".into()), req).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .contains("does not support handshake"));
     }
 }
