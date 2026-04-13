@@ -12,6 +12,68 @@ pub enum ClusterEvent {
     NodeJoined(NodeId),
     /// A node has left the cluster (gracefully or due to failure).
     NodeLeft(NodeId),
+    /// A node attempted to join but was rejected during the version handshake.
+    ///
+    /// This event is emitted when a connecting node fails the compatibility
+    /// check (different wire protocol version or adapter) or when the
+    /// handshake transport call itself fails. The rejected node does **not**
+    /// appear in the cluster's node list.
+    NodeRejected {
+        /// The node that was rejected.
+        node_id: NodeId,
+        /// Why the node was rejected.
+        reason: NodeRejectionReason,
+        /// Human-readable detail message.
+        detail: String,
+    },
+}
+
+/// Reason a node was rejected during cluster join.
+///
+/// This is the **cluster-level** rejection reason, used in
+/// [`ClusterEvent::NodeRejected`]. It is distinct from
+/// [`RejectionReason`](crate::system_actors::RejectionReason), which is
+/// the handshake-level (wire protocol) reason. Use the [`From`]
+/// implementation to convert handshake rejections into cluster events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum NodeRejectionReason {
+    /// The remote node's wire protocol MAJOR version differs (Category 1).
+    IncompatibleProtocol,
+    /// The remote node uses a different actor framework adapter.
+    IncompatibleAdapter,
+    /// The transport-level handshake call failed (timeout, network error,
+    /// or the remote node did not respond).
+    ConnectionFailed,
+}
+
+impl std::fmt::Display for NodeRejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeRejectionReason::IncompatibleProtocol => {
+                write!(f, "incompatible wire protocol")
+            }
+            NodeRejectionReason::IncompatibleAdapter => {
+                write!(f, "incompatible adapter")
+            }
+            NodeRejectionReason::ConnectionFailed => {
+                write!(f, "connection failed")
+            }
+        }
+    }
+}
+
+impl From<crate::system_actors::RejectionReason> for NodeRejectionReason {
+    fn from(reason: crate::system_actors::RejectionReason) -> Self {
+        match reason {
+            crate::system_actors::RejectionReason::IncompatibleProtocol => {
+                NodeRejectionReason::IncompatibleProtocol
+            }
+            crate::system_actors::RejectionReason::IncompatibleAdapter => {
+                NodeRejectionReason::IncompatibleAdapter
+            }
+        }
+    }
 }
 
 /// Opaque handle returned by [`ClusterEvents::subscribe`], used to cancel
@@ -276,5 +338,113 @@ mod tests {
     fn subscription_id_from_raw() {
         let id = SubscriptionId::from_raw(42);
         assert_eq!(id, SubscriptionId(42));
+    }
+
+    // -- NodeRejected / NodeRejectionReason tests --
+
+    #[test]
+    fn node_rejected_event_construction() {
+        let event = ClusterEvent::NodeRejected {
+            node_id: NodeId("bad-node".into()),
+            reason: NodeRejectionReason::IncompatibleProtocol,
+            detail: "wire 1.0 vs 0.2".into(),
+        };
+        match &event {
+            ClusterEvent::NodeRejected {
+                node_id,
+                reason,
+                detail,
+            } => {
+                assert_eq!(node_id, &NodeId("bad-node".into()));
+                assert_eq!(*reason, NodeRejectionReason::IncompatibleProtocol);
+                assert!(detail.contains("1.0"));
+            }
+            _ => panic!("expected NodeRejected"),
+        }
+    }
+
+    #[test]
+    fn node_rejected_emitted_to_subscribers() {
+        let mut emitter = ClusterEventEmitter::new();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        emitter.subscribe(Box::new(move |event| {
+            captured_clone.lock().unwrap().push(event);
+        }));
+
+        emitter.emit(ClusterEvent::NodeRejected {
+            node_id: NodeId("rejected-node".into()),
+            reason: NodeRejectionReason::IncompatibleAdapter,
+            detail: "kameo vs ractor".into(),
+        });
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ClusterEvent::NodeRejected {
+                reason: NodeRejectionReason::IncompatibleAdapter,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn node_rejection_reason_from_handshake_rejection() {
+        use crate::system_actors::RejectionReason;
+
+        let protocol: NodeRejectionReason = RejectionReason::IncompatibleProtocol.into();
+        assert_eq!(protocol, NodeRejectionReason::IncompatibleProtocol);
+
+        let adapter: NodeRejectionReason = RejectionReason::IncompatibleAdapter.into();
+        assert_eq!(adapter, NodeRejectionReason::IncompatibleAdapter);
+    }
+
+    #[test]
+    fn node_rejection_reason_display() {
+        assert_eq!(
+            NodeRejectionReason::IncompatibleProtocol.to_string(),
+            "incompatible wire protocol"
+        );
+        assert_eq!(
+            NodeRejectionReason::IncompatibleAdapter.to_string(),
+            "incompatible adapter"
+        );
+        assert_eq!(
+            NodeRejectionReason::ConnectionFailed.to_string(),
+            "connection failed"
+        );
+    }
+
+    #[test]
+    fn node_rejection_reason_connection_failed() {
+        let event = ClusterEvent::NodeRejected {
+            node_id: NodeId("unreachable".into()),
+            reason: NodeRejectionReason::ConnectionFailed,
+            detail: "transport error: connection refused".into(),
+        };
+        assert!(matches!(
+            event,
+            ClusterEvent::NodeRejected {
+                reason: NodeRejectionReason::ConnectionFailed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn node_rejected_equality() {
+        let a = ClusterEvent::NodeRejected {
+            node_id: NodeId("n1".into()),
+            reason: NodeRejectionReason::IncompatibleProtocol,
+            detail: "test".into(),
+        };
+        let b = ClusterEvent::NodeRejected {
+            node_id: NodeId("n1".into()),
+            reason: NodeRejectionReason::IncompatibleProtocol,
+            detail: "test".into(),
+        };
+        assert_eq!(a, b);
     }
 }
