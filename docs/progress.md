@@ -4,7 +4,7 @@
 
 ---
 
-## Current Status (PR #130)
+## Current Status (PR #145)
 - Phase 3: ✅ Complete (features, examples, conformance, batching, E2E tests)
 - Phase 4: ✅ Complete — R1-R6, R3b, R6b-c, S1-S4, SA1-SA10, SE1-SE6, C1-C5, P1-P3 all done
 - Phase 6: ✅ Complete (supervision, pools, timers, on_reply, AM1-AM7, AP7-AP8 all done)
@@ -24,10 +24,51 @@
 - E2E: ✅ 60 tests (20 per adapter) — spawn/tell/ask, stop, partition/heal, errors, watch, crash, concurrent, large payloads, multi-actor, rapid lifecycle, slow handlers, cancellation/timeout, inter-actor forwarding, state snapshots
 - SE6: ✅ Complete (protobuf system serialization)
 - NA10: ✅ Complete (transport routing)
-- Zero clippy warnings, 875+ tests, all workspace tests pass
+- PUB5-IMPL: ✅ Complete (version-compatibility implementation — Phases 1-5)
+- Zero clippy warnings, 900+ tests, all workspace tests pass
 - Build: `cargo clippy --workspace --exclude dactor-test-harness --all-targets --all-features -- -D warnings`
 - Test: `cargo test --workspace --exclude dactor-test-harness --features test-support`
 - E2E: `cargo test -p dactor-ractor --test e2e_tests --features test-harness` (+ kameo, coerce)
+
+### Session 2026-04-12/14 Summary (PRs #141-#145)
+- **Phase 1** (#141): Wire protocol version constant — `DACTOR_WIRE_VERSION`, `WireVersion` type with `FromStr`/`Display`/`Ord`, `ParseWireVersionError`, `is_compatible()` (dactor wire-version policy: same MAJOR = compatible), 29 unit tests
+- **Phase 2** (#142): Handshake protocol types — `HandshakeRequest`, `HandshakeResponse` (Accepted|Rejected enum), `RejectionReason`, `validate_handshake()`, protobuf definitions (HandshakeRequestProto/ResponseProto with oneof), `Transport::handshake()` with InMemoryTransport impl, 25 tests
+- **Phase 3** (#143): NodeRejected ClusterEvent — `ClusterEvent::NodeRejected { node_id, reason, detail }`, `NodeRejectionReason` enum (IncompatibleProtocol, IncompatibleAdapter, ConnectionFailed), `From<RejectionReason>` conversion, `#[non_exhaustive]` on both enums, 6 tests
+- **Phase 4** (#144): Application version in ClusterState — `PeerVersionInfo` struct, extended `ClusterState` with `wire_version`/`app_version`/`peer_versions`, `#[non_exhaustive]` on ClusterState, `ClusterState::new()` constructor, `peer_version()` lookup, MockCluster `state_for()` deterministic API, 4 tests
+- **Phase 5** (#145): MessageVersionHandler playbook — task-oriented guide (`docs/message-version-handler-playbook.md`) with pitfalls/examples/best practices, 10 integration tests covering v1→v2→v3 migration chains, downgrade rejection, handler skip scenarios
+
+### Key Design Decisions Made This Session
+- Wire version is independent of Cargo.toml crate version (frozen protocol constant)
+- Compatibility policy is "dactor wire-version policy" (same MAJOR = compatible), not generic semver
+- HandshakeResponse uses Accepted/Rejected enum (not bool+Option) to prevent invalid states
+- Rust types use WireVersion (not String) — conversion at proto boundary only
+- Default Transport::handshake() returns error (not accept-all) for adapter safety
+- RejectionReason (handshake-level) is separate from NodeRejectionReason (cluster-level) to avoid coupling
+- ConnectionFailed is cluster-level only (local transport failure, not a remote rejection)
+- #[non_exhaustive] on ClusterEvent, NodeRejectionReason, and ClusterState for future extensibility
+- ClusterState::new() constructor with DACTOR_WIRE_VERSION defaults; fields still pub for flexibility
+- peer_versions excludes local node; nodes includes it (documented invariant)
+- Playbook uses build_wire_envelope (not convenience builders which hardcode version: None)
+- Handler dispatch keys must match std::any::type_name::<M>() from standard builders
+
+### Multi-Model Review Process
+Every PR was reviewed by 4 AI models (GPT-5.4, Gemini/Goldeneye, Claude Haiku 4.5, Claude Sonnet 4.5). Key bugs caught:
+- validate_handshake arg order swapped in InMemoryTransport (response had caller's info, not remote's)
+- decode_handshake_response missing empty-field validation for wire_version/adapter
+- InMemoryTransport handshake_info doc claimed sharing but only copied at link time
+- MockCluster::state() used HashMap::keys()[0] as local node (nondeterministic)
+- Playbook showed build_tell_envelope with version param that doesn't exist (4/4 consensus)
+- Serde alias is one-way during rolling upgrades (new→old traffic breaks)
+- Plus-sign prefix accepted by parser (defense-in-depth fix)
+- #[non_exhaustive] added to prevent future enum/struct literal breakage
+
+### PUB5 Implementation Complete
+All 5 phases of the version-compatibility implementation plan (from `docs/version-compatibility.md`) have been implemented:
+- ✅ Phase 1: Wire Protocol Version Constant (PR #141)
+- ✅ Phase 2: Handshake Protocol in Transport Trait (PR #142)
+- ✅ Phase 3: NodeRejected ClusterEvent (PR #143)
+- ✅ Phase 4: Application Version in Runtime Configuration (PR #144)
+- ✅ Phase 5: MessageVersionHandler Playbook (PR #145)
 
 ### Session 2026-04-06/07 Summary (PRs #111-#129)
 - **NA10** (#111): Transport routing — SystemMessageRouter trait, route_system_envelope for all 3 adapters, wire protocol stability tests (31 new tests)
@@ -303,7 +344,7 @@ However, **remote actor calls may fail** depending on whether the application me
 
 **Output:** Design document `docs/version-compatibility.md`
 
-**Status:** ✅ Done
+**Status:** ✅ Done (design doc + implementation PRs #141-#145)
 
 ### Documentation Created This Session
 - `docs/cluster-behavior.md` — K8s/EKS/VMSS autoscale, simultaneous restart, graceful shutdown, split-brain
@@ -311,6 +352,9 @@ However, **remote actor calls may fail** depending on whether the application me
 - `dactor-kameo/docs/implementation.md` — kameo adapter architecture + limitations
 - `dactor-coerce/docs/implementation.md` — coerce adapter architecture + parity gaps
 - `dactor-mock/docs/implementation.md` — mock cluster testing patterns
+
+### Documentation Created 2026-04-12/14 Session
+- `docs/message-version-handler-playbook.md` — task-oriented migration guide with pitfalls and best practices
 
 ---
 
