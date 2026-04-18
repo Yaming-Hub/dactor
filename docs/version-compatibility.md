@@ -48,6 +48,34 @@ All three are bad.  The dactor version compatibility design eliminates (1)
 and (3) through explicit version tracking and migration, and turns (2) into
 a clear, actionable error.
 
+### Architectural Principle: dactor as Abstraction Layer
+
+dactor is an **abstraction layer** for actor frameworks, not a networking
+framework. All transport-level logic — TCP connections, gRPC channels,
+address resolution, connection lifecycle — belongs to the **actual
+provider/adapter**, not to dactor core.
+
+**What dactor provides:**
+- Trait definitions (`Transport`, `ClusterDiscovery`, `ActorRef`, etc.)
+- Wire format types (`WireEnvelope`, `HandshakeRequest`, `HandshakeResponse`)
+- Protocol semantics (`validate_handshake`, `RejectionReason`)
+- System actor types for remote operations (spawn, watch, cancel, handshake)
+- Version comparison logic (`WireVersion`, `DACTOR_WIRE_VERSION`)
+
+**What adapters/providers implement:**
+- Connection management (when/how to establish and tear down connections)
+- Transport implementation (how `WireEnvelope`s are sent over the wire)
+- Address resolution (mapping `NodeId` to network endpoints)
+- Handshake execution (sending `HandshakeRequest` to a remote node's
+  system actor and processing the response)
+
+**Handshake via system actors:** Version negotiation is performed through
+the normal system actor messaging path, not via a dedicated transport
+method. When a node connects, the adapter sends a `HandshakeRequest`
+`WireEnvelope` to the remote node's handshake system actor. If the
+handshake actor fails or returns `Rejected`, the connection is refused
+and a `ClusterEvent::NodeRejected` is emitted.
+
 ### Two Fundamental Upgrade Categories
 
 Every upgrade falls into one of two categories:

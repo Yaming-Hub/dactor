@@ -335,12 +335,12 @@ impl DiscoveredPeer {
     /// identities (e.g., DNS resolution). The address is used as both
     /// the identity and the endpoint.
     ///
-    /// **Important:** When using this with [`try_connect_peer`](crate::cluster::perform_handshake),
-    /// the remote node must be configured with a `node_id` that matches
-    /// this address string exactly. If the remote node uses a different
-    /// `node_id` (e.g., `"my-node"` instead of `"10.0.0.1:9000"`), the
-    /// handshake will fail with a node identity mismatch. For such cases,
-    /// use [`DiscoveredPeer::new`] with an explicit `node_id` instead.
+    /// **Important:** When using this for handshake validation, the remote
+    /// node must be configured with a `node_id` that matches this address
+    /// string exactly. If the remote node uses a different `node_id`
+    /// (e.g., `"my-node"` instead of `"10.0.0.1:9000"`), the handshake
+    /// will fail with a node identity mismatch. For such cases, use
+    /// [`DiscoveredPeer::new`] with an explicit `node_id` instead.
     pub fn from_address(address: impl Into<String>) -> Self {
         let addr = address.into();
         Self {
@@ -355,9 +355,9 @@ impl DiscoveredPeer {
 pub trait ClusterDiscovery: Send + Sync + 'static {
     /// Discover peers to connect to.
     ///
-    /// Returns a list of [`DiscoveredPeer`]s. The runtime will compare this
-    /// against currently connected peers and attempt to connect new ones
-    /// via [`try_connect_peer`](crate::cluster::perform_handshake).
+    /// Returns a list of [`DiscoveredPeer`]s. The adapter runtime compares
+    /// this against currently connected peers and connects new ones via
+    /// the handshake system actor.
     async fn discover(&self) -> Result<Vec<DiscoveredPeer>, DiscoveryError>;
 }
 
