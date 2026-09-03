@@ -388,8 +388,7 @@ impl Message for DisconnectPeer {
 #[async_trait::async_trait]
 impl Handler<DisconnectPeer> for NodeDirectoryActor {
     async fn handle(&mut self, msg: DisconnectPeer, _ctx: &mut ActorContext) {
-        self.directory
-            .set_status(&msg.0, PeerStatus::Disconnected);
+        self.directory.set_status(&msg.0, PeerStatus::Disconnected);
     }
 }
 

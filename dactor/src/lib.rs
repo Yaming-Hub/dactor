@@ -24,11 +24,11 @@
 
 /// Core actor traits and types (Actor, ActorRef, Handler, etc.).
 pub mod actor;
-/// Broadcast messaging for actor groups (BroadcastRef, tell, ask).
-pub mod broadcast;
 /// Batched transport sender for reducing per-message overhead (requires `serde` feature).
 #[cfg(feature = "serde")]
 pub mod batched_transport;
+/// Broadcast messaging for actor groups (BroadcastRef, tell, ask).
+pub mod broadcast;
 /// Circuit breaker interceptor for fault isolation.
 pub mod circuit_breaker;
 /// Clock abstraction for deterministic testing.
@@ -60,8 +60,6 @@ pub mod outbound_queue;
 pub mod persistence;
 /// Actor pool routing and configuration.
 pub mod pool;
-/// Virtual actor pool with single-threaded routing task.
-pub mod virtual_pool;
 /// Protobuf serialization for system messages and wire envelope framing.
 pub mod proto;
 /// Named actor registry for service location.
@@ -90,6 +88,8 @@ pub mod transport;
 pub mod type_registry;
 /// Wire protocol version for cluster compatibility checks.
 pub mod version;
+/// Virtual actor pool with single-threaded routing task.
+pub mod virtual_pool;
 /// Envelope-level interceptor for incoming remote messages.
 pub mod wire_interceptor;
 /// Worker reference for distributed actor pools (local + remote).
@@ -114,14 +114,13 @@ pub mod prelude {
 pub use actor::cancel_after;
 pub use actor::ReduceHandler;
 pub use actor::{Actor, ActorContext, ActorError, ActorRef, SpawnConfig};
-pub use actor::{AskReply, Handler, ExpandHandler, TransformHandler};
+pub use actor::{AskReply, ExpandHandler, Handler, TransformHandler};
 pub use async_trait::async_trait;
-pub use broadcast::{BroadcastReceipt, BroadcastRef, BroadcastTellResult, BroadcastTellOutcome};
-pub use group::ProcessingGroup;
 #[cfg(feature = "serde")]
 pub use batched_transport::{
     is_batch_envelope, unpack_batch, BatchedTransportSender, WireEnvelopeBatch, BATCH_MESSAGE_TYPE,
 };
+pub use broadcast::{BroadcastReceipt, BroadcastRef, BroadcastTellOutcome, BroadcastTellResult};
 pub use circuit_breaker::{CircuitBreakerInterceptor, CircuitState};
 pub use clock::{Clock, SystemClock};
 pub use cluster::{
@@ -134,13 +133,14 @@ pub use dead_letter::{
 };
 pub use errors::{ActorSendError, ClusterError, GroupError, RuntimeError};
 pub use errors::{ErrorAction, ErrorCode, NotSupportedError};
+pub use group::ProcessingGroup;
+pub use interceptor::{apply_handler_wrappers, collect_handler_wrappers, HandlerWrapper};
 pub use interceptor::{
     intercept_outbound_stream_item, Disposition, InboundContext, InboundInterceptor,
     InterceptResult, Outcome, SendMode,
 };
 pub use interceptor::{notify_drop, DropNotice, DropObserver};
 pub use interceptor::{OutboundContext, OutboundInterceptor};
-pub use interceptor::{collect_handler_wrappers, apply_handler_wrappers, HandlerWrapper};
 pub use mailbox::{MailboxConfig, MessageComparer, OverflowStrategy, StrictPriorityComparer};
 pub use message::Message;
 pub use message::{HeaderValue, Headers, MessageId, Priority, RuntimeHeaders};
@@ -160,15 +160,14 @@ pub use persistence::{
     SnapshotEntry, SnapshotStorage, StateStorage, StorageProvider,
 };
 pub use pool::{Keyed, PoolConfig, PoolRef, PoolRouting};
-pub use virtual_pool::VirtualPoolRef;
 pub use registry::ActorRegistry;
 #[cfg(feature = "serde")]
 pub use remote::{build_ask_envelope, build_tell_envelope, build_wire_envelope, JsonSerializer};
 pub use remote::{receive_envelope_body, receive_envelope_body_versioned};
 pub use remote::{
     ClusterDiscovery, ClusterState, DiscoveredPeer, DiscoveryError, HeaderRegistry,
-    MessageSerializer, MessageVersionHandler, PeerVersionInfo, RemoteMessage,
-    SerializationError, StaticSeeds, WireEnvelope, WireHeaders,
+    MessageSerializer, MessageVersionHandler, PeerVersionInfo, RemoteMessage, SerializationError,
+    StaticSeeds, WireEnvelope, WireHeaders,
 };
 pub use remote_ref::{
     ActorRefEnvelope, ActorRefTypeMismatch, RemoteActorRef, RemoteActorRefBuilder,
@@ -178,17 +177,17 @@ pub use stream::{BoxStream, StreamSendError, StreamSender};
 pub use supervision::ChildTerminated;
 pub use supervision::{AllForOne, OneForOne, RestForOne, SupervisionAction, SupervisionStrategy};
 pub use system_actors::{
-    CancelManager, CancelRequest, CancelResponse, NodeDirectory, PeerInfo, PeerStatus,
-    SpawnManager, SpawnRequest, SpawnResponse, SystemActorConfig, UnwatchRequest, WatchManager,
-    WatchNotification, WatchRequest,
+    is_system_message_type, SYSTEM_MSG_TYPE_CANCEL, SYSTEM_MSG_TYPE_CONNECT_PEER,
+    SYSTEM_MSG_TYPE_DISCONNECT_PEER, SYSTEM_MSG_TYPE_SPAWN, SYSTEM_MSG_TYPE_UNWATCH,
+    SYSTEM_MSG_TYPE_WATCH,
 };
 pub use system_actors::{
     validate_handshake, verify_peer_identity, HandshakeRequest, HandshakeResponse, RejectionReason,
 };
 pub use system_actors::{
-    is_system_message_type, SYSTEM_MSG_TYPE_CANCEL, SYSTEM_MSG_TYPE_CONNECT_PEER,
-    SYSTEM_MSG_TYPE_DISCONNECT_PEER, SYSTEM_MSG_TYPE_SPAWN, SYSTEM_MSG_TYPE_UNWATCH,
-    SYSTEM_MSG_TYPE_WATCH,
+    CancelManager, CancelRequest, CancelResponse, NodeDirectory, PeerInfo, PeerStatus,
+    SpawnManager, SpawnRequest, SpawnResponse, SystemActorConfig, UnwatchRequest, WatchManager,
+    WatchNotification, WatchRequest,
 };
 pub use system_router::{RoutingError, RoutingOutcome, SystemMessageRouter};
 pub use throttle::ActorRateLimiter;
@@ -200,12 +199,13 @@ pub use transport::{InMemoryTransport, Transport, TransportError, TransportRegis
 pub use type_registry::JsonActorFactory;
 pub use type_registry::TypeRegistry;
 pub use type_registry::{ActorFactory, ErasedActorFactory};
+pub use version::{ParseWireVersionError, WireVersion, DACTOR_WIRE_VERSION};
+pub use virtual_pool::VirtualPoolRef;
 pub use wire_interceptor::{
     MaxBodySizeInterceptor, RateLimitWireInterceptor, WireDisposition, WireInterceptor,
     WireInterceptorPipeline, WireProcessResult, WireRejectError,
 };
 pub use worker_ref::WorkerRef;
-pub use version::{DACTOR_WIRE_VERSION, ParseWireVersionError, WireVersion};
 
 // Backward-compatible re-export of TestClock (feature-gated)
 #[cfg(feature = "test-support")]

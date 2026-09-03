@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dactor::actor::{
-    cancel_after, Actor, ActorContext, ActorRef, ReduceHandler, Handler, ExpandHandler,
+    cancel_after, Actor, ActorContext, ActorRef, ExpandHandler, Handler, ReduceHandler,
 };
 use dactor::circuit_breaker::CircuitBreakerInterceptor;
 use dactor::dead_letter::CollectingDeadLetterHandler;
@@ -140,7 +140,10 @@ async fn main() {
                 Duration::from_secs(60), // within 60s window
                 Duration::from_secs(10), // 10s cooldown
             )));
-        let w = runtime.spawn_with_options::<TaskProcessor>(&format!("worker-{i}"), i, opts).await.unwrap();
+        let w = runtime
+            .spawn_with_options::<TaskProcessor>(&format!("worker-{i}"), i, opts)
+            .await
+            .unwrap();
         workers.push(w);
     }
     let pool = PoolRef::new(workers.clone(), PoolRouting::RoundRobin);
@@ -243,4 +246,3 @@ async fn main() {
 
     println!("\n=== Done ===");
 }
-

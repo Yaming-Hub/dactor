@@ -71,7 +71,10 @@ async fn na10_coerce_route_spawn_request_success() {
         .expect("routing should succeed");
 
     match outcome {
-        RoutingOutcome::SpawnCompleted { request_id, actor_id } => {
+        RoutingOutcome::SpawnCompleted {
+            request_id,
+            actor_id,
+        } => {
             assert_eq!(request_id, "req-1");
             assert_eq!(actor_id.node.0, "coerce-node");
         }
@@ -224,10 +227,8 @@ async fn na10_coerce_route_connect_disconnect_peer() {
     let runtime = setup_runtime().await;
 
     // Connect peer
-    let body = dactor::proto::encode_connect_peer(
-        &NodeId("peer-node-1".into()),
-        Some("10.0.0.1:4697"),
-    );
+    let body =
+        dactor::proto::encode_connect_peer(&NodeId("peer-node-1".into()), Some("10.0.0.1:4697"));
     let envelope = make_envelope(SYSTEM_MSG_TYPE_CONNECT_PEER, body);
 
     let outcome = runtime
@@ -284,7 +285,10 @@ async fn na10_coerce_route_unknown_message_type_rejected() {
 
     let result = runtime.route_system_envelope(envelope).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().message.contains("unknown system message type"));
+    assert!(result
+        .unwrap_err()
+        .message
+        .contains("unknown system message type"));
 }
 
 #[tokio::test]
@@ -331,5 +335,8 @@ async fn na10_coerce_route_without_system_actors_fails() {
 
     let result = runtime.route_system_envelope(envelope).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().message.contains("system actors not started"));
+    assert!(result
+        .unwrap_err()
+        .message
+        .contains("system actors not started"));
 }

@@ -10,11 +10,15 @@ struct SlowActor;
 impl Actor for SlowActor {
     type Args = ();
     type Deps = ();
-    fn create(_: (), _: ()) -> Self { SlowActor }
+    fn create(_: (), _: ()) -> Self {
+        SlowActor
+    }
 }
 
 struct Stop;
-impl Message for Stop { type Reply = (); }
+impl Message for Stop {
+    type Reply = ();
+}
 
 #[async_trait::async_trait]
 impl Handler<Stop> for SlowActor {
@@ -80,7 +84,10 @@ async fn jh3_await_all_waits_for_all_actors() {
 #[tokio::test]
 async fn jh_cleanup_finished_removes_stopped_actors() {
     let runtime = KameoRuntime::new();
-    let actor = runtime.spawn::<SlowActor>("cleanup-test", ()).await.unwrap();
+    let actor = runtime
+        .spawn::<SlowActor>("cleanup-test", ())
+        .await
+        .unwrap();
     assert_eq!(runtime.active_handle_count(), 1);
 
     actor.stop();
@@ -98,7 +105,9 @@ struct PanickingActor;
 impl Actor for PanickingActor {
     type Args = ();
     type Deps = ();
-    fn create(_: (), _: ()) -> Self { PanickingActor }
+    fn create(_: (), _: ()) -> Self {
+        PanickingActor
+    }
 
     async fn on_stop(&mut self) {
         panic!("intentional on_stop panic");
@@ -113,7 +122,10 @@ impl Handler<Stop> for PanickingActor {
 #[tokio::test]
 async fn jh4_panic_propagated_through_await_stop() {
     let runtime = KameoRuntime::new();
-    let actor = runtime.spawn::<PanickingActor>("panic-actor", ()).await.unwrap();
+    let actor = runtime
+        .spawn::<PanickingActor>("panic-actor", ())
+        .await
+        .unwrap();
     let actor_id = actor.id();
 
     actor.stop();

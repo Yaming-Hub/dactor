@@ -184,17 +184,20 @@ async fn main() {
     runtime.add_outbound_interceptor(Box::new(HeaderStampInterceptor));
 
     // Spawn the actor with per-actor inbound interceptors via SpawnOptions.
-    let greeter = runtime.spawn_with_options::<Greeter>(
-        "greeter",
-        (),
-        SpawnOptions {
-            interceptors: vec![
-                Box::new(LoggingInterceptor { log: log.clone() }),
-                Box::new(TimingInterceptor::new()),
-            ],
-            mailbox: MailboxConfig::Unbounded,
-        },
-    ).await.unwrap();
+    let greeter = runtime
+        .spawn_with_options::<Greeter>(
+            "greeter",
+            (),
+            SpawnOptions {
+                interceptors: vec![
+                    Box::new(LoggingInterceptor { log: log.clone() }),
+                    Box::new(TimingInterceptor::new()),
+                ],
+                mailbox: MailboxConfig::Unbounded,
+            },
+        )
+        .await
+        .unwrap();
 
     // Send a request-reply message — interceptors will fire on both sides.
     println!("--- Sending ask(SayHello) ---");

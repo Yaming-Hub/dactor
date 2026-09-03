@@ -105,7 +105,11 @@ async fn make_pool(
     for i in 0..size {
         let ctr = Arc::new(AtomicU64::new(0));
         counters.push(ctr.clone());
-        workers.push(rt.spawn::<Worker>(&format!("w-{i}"), (i as u64, ctr)).await.unwrap());
+        workers.push(
+            rt.spawn::<Worker>(&format!("w-{i}"), (i as u64, ctr))
+                .await
+                .unwrap(),
+        );
     }
     (PoolRef::new(workers, routing), counters)
 }

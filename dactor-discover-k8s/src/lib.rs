@@ -120,26 +120,16 @@ impl KubernetesDiscovery {
 
         let mut addresses = Vec::new();
         for pod in pod_list.items {
-            let pod_name = pod
-                .metadata
-                .name
-                .as_deref()
-                .unwrap_or("<unknown>");
+            let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
 
-            let phase = pod
-                .status
-                .as_ref()
-                .and_then(|s| s.phase.as_deref());
+            let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
 
             if phase != Some("Running") {
                 tracing::debug!(pod = pod_name, ?phase, "skipping non-running pod");
                 continue;
             }
 
-            let ip = pod
-                .status
-                .as_ref()
-                .and_then(|s| s.pod_ip.as_deref());
+            let ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
 
             match ip {
                 Some(ip) => {
@@ -177,7 +167,12 @@ impl ClusterDiscovery for KubernetesDiscovery {
     async fn discover(&self) -> Result<Vec<dactor::DiscoveredPeer>, DiscoveryError> {
         self.discover_async()
             .await
-            .map(|addrs| addrs.into_iter().map(dactor::DiscoveredPeer::from_address).collect())
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .map(dactor::DiscoveredPeer::from_address)
+                    .collect()
+            })
             .map_err(|e| DiscoveryError::new(e.to_string()))
     }
 }
@@ -280,11 +275,16 @@ impl ClusterDiscovery for HeadlessServiceDiscovery {
         })
         .await
         .map_err(|e| DiscoveryError::new(format!("DNS lookup task failed: {e}")))?
-        .map_err(|e| DiscoveryError::new(format!(
-            "DNS resolution failed for {}: {e}", self.dns_name()
-        )))?;
+        .map_err(|e| {
+            DiscoveryError::new(format!(
+                "DNS resolution failed for {}: {e}",
+                self.dns_name()
+            ))
+        })?;
 
-        Ok(addrs.map(|a| dactor::DiscoveredPeer::from_address(a.to_string())).collect())
+        Ok(addrs
+            .map(|a| dactor::DiscoveredPeer::from_address(a.to_string()))
+            .collect())
     }
 }
 

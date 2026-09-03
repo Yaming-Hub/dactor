@@ -242,10 +242,7 @@ impl TestNodeService for TestNode {
         let req = request.into_inner();
 
         // Check for active fault injection
-        if self
-            .fault_injector
-            .has_fault("partition", &req.actor_name)
-        {
+        if self.fault_injector.has_fault("partition", &req.actor_name) {
             return Ok(Response::new(TellActorResponse {
                 success: false,
                 error: "partition: message delivery blocked".to_string(),
@@ -278,10 +275,7 @@ impl TestNodeService for TestNode {
         let req = request.into_inner();
 
         // Check for active fault injection
-        if self
-            .fault_injector
-            .has_fault("partition", &req.actor_name)
-        {
+        if self.fault_injector.has_fault("partition", &req.actor_name) {
             return Ok(Response::new(AskActorResponse {
                 success: false,
                 payload: Vec::new(),
@@ -290,7 +284,12 @@ impl TestNodeService for TestNode {
         }
 
         match handler
-            .ask_actor(&req.actor_name, &req.message_type, &req.payload, req.timeout_ms)
+            .ask_actor(
+                &req.actor_name,
+                &req.message_type,
+                &req.payload,
+                req.timeout_ms,
+            )
             .await
         {
             Ok(payload) => Ok(Response::new(AskActorResponse {

@@ -3,7 +3,7 @@
 //! Run with: cargo run --example batch_streaming --features test-support
 
 use async_trait::async_trait;
-use dactor::actor::{Actor, ActorContext, ActorRef, ReduceHandler, ExpandHandler};
+use dactor::actor::{Actor, ActorContext, ActorRef, ExpandHandler, ReduceHandler};
 use dactor::message::Message;
 use dactor::stream::{BatchConfig, StreamReceiver, StreamSender};
 use dactor::TestRuntime;
@@ -117,4 +117,3 @@ async fn main() {
 
     println!("\n=== Done ===");
 }
-

@@ -172,7 +172,8 @@ async fn conformance_transform_batched() {
 #[tokio::test]
 async fn conformance_transform_none_batch() {
     let runtime = KameoRuntime::new();
-    test_transform_with_none_batch(|name, init| runtime.spawn::<ConformanceDoubler>(name, init)).await;
+    test_transform_with_none_batch(|name, init| runtime.spawn::<ConformanceDoubler>(name, init))
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +434,10 @@ mod interceptor_tests {
         };
 
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn_with_options::<Echo>("echo-inbound-called", (), options).await.unwrap();
+        let actor = runtime
+            .spawn_with_options::<Echo>("echo-inbound-called", (), options)
+            .await
+            .unwrap();
 
         // Send a tell
         actor.tell(Fire(1)).unwrap();
@@ -452,7 +456,10 @@ mod interceptor_tests {
         let mut runtime = KameoRuntime::new();
         runtime.add_outbound_interceptor(Box::new(interceptor));
 
-        let actor = runtime.spawn::<Echo>("echo-outbound-called", ()).await.unwrap();
+        let actor = runtime
+            .spawn::<Echo>("echo-outbound-called", ())
+            .await
+            .unwrap();
 
         actor.tell(Fire(1)).unwrap();
         actor.tell(Fire(2)).unwrap();
@@ -471,7 +478,10 @@ mod interceptor_tests {
         };
 
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn_with_options::<Echo>("echo-reject-ask", (), options).await.unwrap();
+        let actor = runtime
+            .spawn_with_options::<Echo>("echo-reject-ask", (), options)
+            .await
+            .unwrap();
 
         let reply = actor.ask(Ping("hi".into()), None).unwrap();
         let result = reply.await;
@@ -496,7 +506,10 @@ mod interceptor_tests {
         };
 
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn_with_options::<Echo>("echo-on-complete", (), options).await.unwrap();
+        let actor = runtime
+            .spawn_with_options::<Echo>("echo-on-complete", (), options)
+            .await
+            .unwrap();
 
         // Send an ask— on_complete should see AskSuccess with the String reply
         let reply = actor.ask(Ping("test".into()), None).unwrap().await.unwrap();
@@ -515,7 +528,10 @@ mod interceptor_tests {
         let mut runtime = KameoRuntime::new();
         runtime.add_outbound_interceptor(Box::new(OutboundRejectInterceptor));
 
-        let actor = runtime.spawn::<Echo>("echo-outbound-reject", ()).await.unwrap();
+        let actor = runtime
+            .spawn::<Echo>("echo-outbound-reject", ())
+            .await
+            .unwrap();
 
         let reply = actor.ask(Ping("hi".into()), None).unwrap();
         let result = reply.await;
@@ -543,7 +559,10 @@ mod interceptor_tests {
             interceptors: vec![Box::new(inbound)],
             ..Default::default()
         };
-        let actor = runtime.spawn_with_options::<Echo>("echo-both-pipelines", (), options).await.unwrap();
+        let actor = runtime
+            .spawn_with_options::<Echo>("echo-both-pipelines", (), options)
+            .await
+            .unwrap();
 
         let reply = actor.ask(Ping("x".into()), None).unwrap().await.unwrap();
         assert_eq!(reply, "pong:x");
@@ -564,7 +583,10 @@ mod interceptor_tests {
         };
 
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn_with_options::<Echo>("echo-reject-tell", (), options).await.unwrap();
+        let actor = runtime
+            .spawn_with_options::<Echo>("echo-reject-tell", (), options)
+            .await
+            .unwrap();
 
         // Tell with rejectionshould not error (fire-and-forget has no error path)
         actor.tell(Fire(1)).unwrap();
@@ -627,7 +649,10 @@ mod lifecycle_tests {
     async fn test_on_start_called_before_messages() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn::<LifecycleActor>("lifecycle-start", events.clone()).await.unwrap();
+        let actor = runtime
+            .spawn::<LifecycleActor>("lifecycle-start", events.clone())
+            .await
+            .unwrap();
 
         actor.tell(Greet).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -642,7 +667,10 @@ mod lifecycle_tests {
     async fn test_on_stop_called_after_stop() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn::<LifecycleActor>("lifecycle-stop", events.clone()).await.unwrap();
+        let actor = runtime
+            .spawn::<LifecycleActor>("lifecycle-stop", events.clone())
+            .await
+            .unwrap();
 
         // Let on_start finish
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -710,14 +738,17 @@ mod lifecycle_tests {
         let error_count = Arc::new(AtomicU64::new(0));
         let handle_count = Arc::new(AtomicU64::new(0));
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn::<PanicActor>(
-            "panic-resume",
-            (
-                ErrorAction::Resume,
-                error_count.clone(),
-                handle_count.clone(),
-            ),
-        ).await.unwrap();
+        let actor = runtime
+            .spawn::<PanicActor>(
+                "panic-resume",
+                (
+                    ErrorAction::Resume,
+                    error_count.clone(),
+                    handle_count.clone(),
+                ),
+            )
+            .await
+            .unwrap();
 
         // Cause a panic
         actor.tell(DoPanic).unwrap();
@@ -737,10 +768,13 @@ mod lifecycle_tests {
         let error_count = Arc::new(AtomicU64::new(0));
         let handle_count = Arc::new(AtomicU64::new(0));
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn::<PanicActor>(
-            "panic-stop",
-            (ErrorAction::Stop, error_count.clone(), handle_count.clone()),
-        ).await.unwrap();
+        let actor = runtime
+            .spawn::<PanicActor>(
+                "panic-stop",
+                (ErrorAction::Stop, error_count.clone(), handle_count.clone()),
+            )
+            .await
+            .unwrap();
 
         // Cause a panic
         actor.tell(DoPanic).unwrap();
@@ -819,7 +853,10 @@ mod stream_tests {
     #[tokio::test]
     async fn test_stream_returns_items() {
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn::<Streamer>("streamer-items", ()).await.unwrap();
+        let actor = runtime
+            .spawn::<Streamer>("streamer-items", ())
+            .await
+            .unwrap();
 
         let stream = actor.expand(StreamN(5), 8, None, None).unwrap();
         let items: Vec<u32> = stream.collect().await;
@@ -829,7 +866,10 @@ mod stream_tests {
     #[tokio::test]
     async fn test_stream_empty() {
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn::<Streamer>("streamer-empty", ()).await.unwrap();
+        let actor = runtime
+            .spawn::<Streamer>("streamer-empty", ())
+            .await
+            .unwrap();
 
         let stream = actor.expand(StreamEmpty, 8, None, None).unwrap();
         let items: Vec<u32> = stream.collect().await;
@@ -839,7 +879,10 @@ mod stream_tests {
     #[tokio::test]
     async fn test_stream_consumer_drops_early() {
         let runtime = KameoRuntime::new();
-        let actor = runtime.spawn::<Streamer>("streamer-drop", ()).await.unwrap();
+        let actor = runtime
+            .spawn::<Streamer>("streamer-drop", ())
+            .await
+            .unwrap();
 
         // Request a streamof 1000 items but only take 2
         let stream = actor.expand(StreamN(1000), 1, None, None).unwrap();
@@ -1060,7 +1103,10 @@ mod watch_tests {
         let runtime = KameoRuntime::new();
         let terminated = Arc::new(AtomicBool::new(false));
 
-        let watcher = runtime.spawn::<Watcher>("watch-watcher-1", terminated.clone()).await.unwrap();
+        let watcher = runtime
+            .spawn::<Watcher>("watch-watcher-1", terminated.clone())
+            .await
+            .unwrap();
         let worker = runtime.spawn::<Worker>("watch-worker-1", ()).await.unwrap();
 
         runtime.watch(&watcher, worker.id());
@@ -1084,8 +1130,14 @@ mod watch_tests {
         let runtime = KameoRuntime::new();
         let terminated = Arc::new(AtomicBool::new(false));
 
-        let watcher = runtime.spawn::<Watcher>("unwatch-watcher-1", terminated.clone()).await.unwrap();
-        let worker = runtime.spawn::<Worker>("unwatch-worker-1", ()).await.unwrap();
+        let watcher = runtime
+            .spawn::<Watcher>("unwatch-watcher-1", terminated.clone())
+            .await
+            .unwrap();
+        let worker = runtime
+            .spawn::<Worker>("unwatch-worker-1", ())
+            .await
+            .unwrap();
 
         let watcher_id = watcher.id();
         let worker_id = worker.id();
@@ -1147,7 +1199,10 @@ mod mailbox_tests {
             mailbox: MailboxConfig::bounded(10, OverflowStrategy::RejectWithError),
         };
 
-        let actor = runtime.spawn_with_options::<Worker>("bounded-worker", (), options).await.unwrap();
+        let actor = runtime
+            .spawn_with_options::<Worker>("bounded-worker", (), options)
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(actor.is_alive());
@@ -1164,12 +1219,16 @@ mod mailbox_tests {
     impl Actor for SlowWorker {
         type Args = ();
         type Deps = ();
-        fn create(_: (), _: ()) -> Self { SlowWorker }
+        fn create(_: (), _: ()) -> Self {
+            SlowWorker
+        }
     }
 
     #[derive(Clone)]
     struct SlowPing;
-    impl Message for SlowPing { type Reply = (); }
+    impl Message for SlowPing {
+        type Reply = ();
+    }
 
     #[async_trait]
     impl Handler<SlowPing> for SlowWorker {
@@ -1240,4 +1299,3 @@ mod mailbox_tests {
         assert!(!actor.is_alive(), "should not be alive after stop");
     }
 }
-

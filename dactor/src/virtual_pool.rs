@@ -154,7 +154,7 @@ async fn router_loop<A: Actor, R: ActorRef<A>>(
     workers: Vec<R>,
     routing: PoolRouting,
     alive: Arc<AtomicBool>,
-){
+) {
     let mut counter: u64 = 0;
 
     while let Some(cmd) = rx.recv().await {
@@ -194,7 +194,11 @@ fn select_worker_index<A: Actor, R: ActorRef<A>>(
             (splitmix64(raw) % len) as usize
         }
         PoolRouting::LeastLoaded => {
-            let min_load = workers.iter().map(|w| w.pending_messages()).min().unwrap_or(0);
+            let min_load = workers
+                .iter()
+                .map(|w| w.pending_messages())
+                .min()
+                .unwrap_or(0);
             let candidates: Vec<usize> = workers
                 .iter()
                 .enumerate()
@@ -382,8 +386,7 @@ impl<A: Actor, R: ActorRef<A>> ActorRef<A> for VirtualPoolRef<A, R> {
             .try_send(RouterCommand::Op(op))
             .map_err(|_| ActorSendError("virtual pool router stopped or full".into()))?;
 
-        let (final_tx, final_rx) =
-            tokio::sync::oneshot::channel::<Result<Reply, RuntimeError>>();
+        let (final_tx, final_rx) = tokio::sync::oneshot::channel::<Result<Reply, RuntimeError>>();
 
         tokio::spawn(async move {
             match bridge_rx.await {
@@ -589,10 +592,7 @@ mod tests {
     async fn ask_returns_correct_reply() {
         let rt = TestRuntime::new();
         let ctr = Arc::new(AtomicU64::new(0));
-        let worker = rt
-            .spawn::<VPoolWorker>("solo", (42, ctr))
-            .await
-            .unwrap();
+        let worker = rt.spawn::<VPoolWorker>("solo", (42, ctr)).await.unwrap();
         let pool = VirtualPoolRef::new(vec![worker], PoolRouting::RoundRobin);
 
         let id = pool.ask(WhoAreYou, None).unwrap().await.unwrap();
@@ -648,8 +648,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let workers: Vec<crate::test_support::test_runtime::TestActorRef<VPoolWorker>> =
-                vec![];
+            let workers: Vec<crate::test_support::test_runtime::TestActorRef<VPoolWorker>> = vec![];
             VirtualPoolRef::new(workers, PoolRouting::RoundRobin);
         });
     }

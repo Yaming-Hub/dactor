@@ -185,7 +185,10 @@ async fn query_imds(client: &reqwest::Client) -> Result<ImdsResponse, AzureDisco
 
 /// Get the current VM's subscription ID from IMDS.
 pub async fn current_subscription_id() -> Option<String> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap_or_default();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
     query_imds(&client)
         .await
         .ok()
@@ -194,7 +197,10 @@ pub async fn current_subscription_id() -> Option<String> {
 
 /// Get the current VM's resource group name from IMDS.
 pub async fn current_resource_group() -> Option<String> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap_or_default();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
     query_imds(&client)
         .await
         .ok()
@@ -203,9 +209,7 @@ pub async fn current_resource_group() -> Option<String> {
 
 /// Returns the IMDS instance metadata URL for reference / diagnostics.
 pub fn imds_instance_url() -> String {
-    format!(
-        "{IMDS_BASE}/metadata/instance?api-version={IMDS_API_VERSION}"
-    )
+    format!("{IMDS_BASE}/metadata/instance?api-version={IMDS_API_VERSION}")
 }
 
 // ---------------------------------------------------------------------------
@@ -271,9 +275,7 @@ impl VmssDiscovery {
 
     /// Resolve the subscription ID, resource group, and VMSS name — either
     /// from explicit config or by querying IMDS.
-    async fn resolve_vmss_info(
-        &self,
-    ) -> Result<(String, String, String), AzureDiscoveryError> {
+    async fn resolve_vmss_info(&self) -> Result<(String, String, String), AzureDiscoveryError> {
         if let (Some(sub), Some(rg), Some(vmss)) = (
             self.config.subscription_id.clone(),
             self.config.resource_group.clone(),
@@ -300,21 +302,21 @@ impl VmssDiscovery {
             .resource_group
             .clone()
             .unwrap_or(imds.compute.resource_group_name);
-        let vmss = self.config.vmss_name.clone().or(imds.compute.vmss_name).ok_or_else(
-            || {
-                AzureDiscoveryError::ImdsError(
-                    "current VM is not part of a VMSS".to_string(),
-                )
-            },
-        )?;
+        let vmss = self
+            .config
+            .vmss_name
+            .clone()
+            .or(imds.compute.vmss_name)
+            .ok_or_else(|| {
+                AzureDiscoveryError::ImdsError("current VM is not part of a VMSS".to_string())
+            })?;
 
         Ok((sub, rg, vmss))
     }
 
     /// Discover peer addresses from the VMSS.
     pub async fn discover_instances(&self) -> Result<Vec<String>, AzureDiscoveryError> {
-        let (subscription_id, resource_group, vmss_name) =
-            self.resolve_vmss_info().await?;
+        let (subscription_id, resource_group, vmss_name) = self.resolve_vmss_info().await?;
 
         let token = acquire_managed_identity_token(&self.client).await?;
 
@@ -370,7 +372,12 @@ impl ClusterDiscovery for VmssDiscovery {
     async fn discover(&self) -> Result<Vec<dactor::DiscoveredPeer>, DiscoveryError> {
         self.discover_instances()
             .await
-            .map(|addrs| addrs.into_iter().map(dactor::DiscoveredPeer::from_address).collect())
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .map(dactor::DiscoveredPeer::from_address)
+                    .collect()
+            })
             .map_err(|e| DiscoveryError::new(e.to_string()))
     }
 }
@@ -419,7 +426,10 @@ impl VmssDiscoveryBuilder {
     pub fn build(self) -> VmssDiscovery {
         VmssDiscovery {
             config: self.config,
-            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap_or_default(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -582,16 +592,9 @@ impl AzureTagDiscovery {
         nic_id: &str,
         token: &str,
     ) -> Result<String, AzureDiscoveryError> {
-        let url = format!(
-            "https://management.azure.com{nic_id}?api-version={ARM_API_VERSION_NIC}"
-        );
+        let url = format!("https://management.azure.com{nic_id}?api-version={ARM_API_VERSION_NIC}");
 
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await?;
+        let resp = self.client.get(&url).bearer_auth(token).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -611,9 +614,7 @@ impl AzureTagDiscovery {
             .first()
             .and_then(|c| c.properties.private_ip_address.clone())
             .ok_or_else(|| {
-                AzureDiscoveryError::ArmApiError(
-                    "NIC has no private IP configuration".to_string(),
-                )
+                AzureDiscoveryError::ArmApiError("NIC has no private IP configuration".to_string())
             })
     }
 }
@@ -623,7 +624,12 @@ impl ClusterDiscovery for AzureTagDiscovery {
     async fn discover(&self) -> Result<Vec<dactor::DiscoveredPeer>, DiscoveryError> {
         self.discover_by_tag()
             .await
-            .map(|addrs| addrs.into_iter().map(dactor::DiscoveredPeer::from_address).collect())
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .map(dactor::DiscoveredPeer::from_address)
+                    .collect()
+            })
             .map_err(|e| DiscoveryError::new(e.to_string()))
     }
 }
@@ -672,7 +678,10 @@ impl AzureTagDiscoveryBuilder {
     pub fn build(self) -> AzureTagDiscovery {
         AzureTagDiscovery {
             config: self.config,
-            client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap_or_default(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -722,14 +731,8 @@ mod tests {
             discovery.config().subscription_id.as_deref(),
             Some("sub-123")
         );
-        assert_eq!(
-            discovery.config().resource_group.as_deref(),
-            Some("my-rg")
-        );
-        assert_eq!(
-            discovery.config().vmss_name.as_deref(),
-            Some("my-vmss")
-        );
+        assert_eq!(discovery.config().resource_group.as_deref(), Some("my-rg"));
+        assert_eq!(discovery.config().vmss_name.as_deref(), Some("my-vmss"));
     }
 
     #[test]

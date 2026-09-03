@@ -195,8 +195,14 @@ mod tests {
         };
         assert!(matches!(spawn_fail, RoutingOutcome::SpawnFailed { .. }));
 
-        assert!(matches!(RoutingOutcome::Acknowledged, RoutingOutcome::Acknowledged));
-        assert!(matches!(RoutingOutcome::CancelAcknowledged, RoutingOutcome::CancelAcknowledged));
+        assert!(matches!(
+            RoutingOutcome::Acknowledged,
+            RoutingOutcome::Acknowledged
+        ));
+        assert!(matches!(
+            RoutingOutcome::CancelAcknowledged,
+            RoutingOutcome::CancelAcknowledged
+        ));
 
         let not_found = RoutingOutcome::CancelNotFound {
             reason: "no such request".into(),
