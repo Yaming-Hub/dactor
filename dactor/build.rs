@@ -3,15 +3,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=PROTOC");
 
     let protoc_was_set = std::env::var_os("PROTOC").is_some();
-    if !protoc_was_set {
-        let protoc = protoc_bin_vendored::protoc_bin_path().map_err(|e| {
+    let protoc = if let Some(protoc) = std::env::var_os("PROTOC") {
+        std::path::PathBuf::from(protoc)
+    } else {
+        protoc_bin_vendored::protoc_bin_path().map_err(|e| {
             std::io::Error::other(format!(
                 "Failed to locate vendored protoc: {e}\nIf needed, set PROTOC to a valid protoc binary path."
             ))
-        })?;
-        std::env::set_var("PROTOC", protoc);
-    }
-    prost_build::compile_protos(&["proto/system.proto"], &["proto/"]).map_err(|e| {
+        })?
+    };
+
+    let mut config = prost_build::Config::new();
+    config.protoc_executable(protoc);
+    config.compile_protos(&["proto/system.proto"], &["proto/"]).map_err(|e| {
         let hint = if protoc_was_set {
             "If you set PROTOC explicitly, ensure it points to a valid protoc binary."
         } else {
