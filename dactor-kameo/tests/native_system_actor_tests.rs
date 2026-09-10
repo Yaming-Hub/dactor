@@ -50,10 +50,7 @@ async fn na5_spawn_manager_handles_request() {
             assert_eq!(*val, 42);
 
             // Verify spawned actors list
-            let spawned = actor_ref
-                .ask(GetSpawnedActors)
-                .await
-                .expect("ask failed");
+            let spawned = actor_ref.ask(GetSpawnedActors).await.expect("ask failed");
             assert_eq!(spawned.len(), 1);
             assert_eq!(spawned[0], actor_id);
         }
@@ -133,8 +130,14 @@ async fn na5_spawn_manager_register_factory() {
 async fn na6_watch_manager_watch_and_notify() {
     let actor_ref = WatchManagerActor::spawn_with_mailbox((), kameo::mailbox::unbounded());
 
-    let target = ActorId { node: NodeId("n1".into()), local: 1 };
-    let watcher = ActorId { node: NodeId("n2".into()), local: 10 };
+    let target = ActorId {
+        node: NodeId("n1".into()),
+        local: 1,
+    };
+    let watcher = ActorId {
+        node: NodeId("n2".into()),
+        local: 10,
+    };
 
     actor_ref
         .ask(RemoteWatch {
@@ -163,8 +166,14 @@ async fn na6_watch_manager_watch_and_notify() {
 async fn na6_watch_manager_unwatch() {
     let actor_ref = WatchManagerActor::spawn_with_mailbox((), kameo::mailbox::unbounded());
 
-    let target = ActorId { node: NodeId("n1".into()), local: 1 };
-    let watcher = ActorId { node: NodeId("n2".into()), local: 10 };
+    let target = ActorId {
+        node: NodeId("n1".into()),
+        local: 1,
+    };
+    let watcher = ActorId {
+        node: NodeId("n2".into()),
+        local: 10,
+    };
 
     actor_ref
         .ask(RemoteWatch {
@@ -272,10 +281,7 @@ async fn na8_node_directory_connect_disconnect() {
         .await
         .expect("disconnect failed");
 
-    let connected = actor_ref
-        .ask(IsConnected(peer))
-        .await
-        .expect("ask failed");
+    let connected = actor_ref.ask(IsConnected(peer)).await.expect("ask failed");
     assert!(!connected);
 }
 

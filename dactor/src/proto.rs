@@ -80,7 +80,9 @@ fn actor_id_to_proto(id: &ActorId) -> ActorIdProto {
 
 fn actor_id_from_proto(proto: &ActorIdProto) -> Result<ActorId, SerializationError> {
     if proto.node_id.is_empty() {
-        return Err(SerializationError::new("ActorId: node_id must not be empty"));
+        return Err(SerializationError::new(
+            "ActorId: node_id must not be empty",
+        ));
     }
     Ok(ActorId {
         node: NodeId(proto.node_id.clone()),
@@ -119,10 +121,14 @@ pub fn decode_spawn_request(bytes: &[u8]) -> Result<SpawnRequest, SerializationE
     let proto = SpawnRequestProto::decode(bytes)
         .map_err(|e| SerializationError::new(format!("decode SpawnRequest: {e}")))?;
     if proto.type_name.is_empty() {
-        return Err(SerializationError::new("SpawnRequest: type_name must not be empty"));
+        return Err(SerializationError::new(
+            "SpawnRequest: type_name must not be empty",
+        ));
     }
     if proto.request_id.is_empty() {
-        return Err(SerializationError::new("SpawnRequest: request_id must not be empty"));
+        return Err(SerializationError::new(
+            "SpawnRequest: request_id must not be empty",
+        ));
     }
     Ok(SpawnRequest {
         type_name: proto.type_name,
@@ -240,9 +246,7 @@ pub fn encode_watch_notification(notif: WatchNotification) -> Vec<u8> {
 }
 
 /// Decode a [`WatchNotification`] from protobuf bytes.
-pub fn decode_watch_notification(
-    bytes: &[u8],
-) -> Result<WatchNotification, SerializationError> {
+pub fn decode_watch_notification(bytes: &[u8]) -> Result<WatchNotification, SerializationError> {
     check_size(bytes, MAX_SYSTEM_MSG_SIZE, "WatchNotification")?;
     let proto = WatchNotificationProto::decode(bytes)
         .map_err(|e| SerializationError::new(format!("decode WatchNotification: {e}")))?;
@@ -290,9 +294,7 @@ pub fn encode_cancel_response(resp: CancelResponse) -> Vec<u8> {
         },
         CancelResponse::NotFound { reason } => CancelResponseProto {
             result: Some(cancel_response_proto::Result::NotFound(
-                CancelNotFoundProto {
-                    reason,
-                },
+                CancelNotFoundProto { reason },
             )),
         },
     };
@@ -305,9 +307,7 @@ pub fn decode_cancel_response(bytes: &[u8]) -> Result<CancelResponse, Serializat
     let proto = CancelResponseProto::decode(bytes)
         .map_err(|e| SerializationError::new(format!("decode CancelResponse: {e}")))?;
     match proto.result {
-        Some(cancel_response_proto::Result::Acknowledged(_)) => {
-            Ok(CancelResponse::Acknowledged)
-        }
+        Some(cancel_response_proto::Result::Acknowledged(_)) => Ok(CancelResponse::Acknowledged),
         Some(cancel_response_proto::Result::NotFound(nf)) => {
             Ok(CancelResponse::NotFound { reason: nf.reason })
         }
@@ -333,14 +333,14 @@ pub fn encode_connect_peer(node_id: &NodeId, address: Option<&str>) -> Vec<u8> {
 /// Decode a connect-peer message from protobuf bytes.
 ///
 /// Returns `(node_id, optional_address)`.
-pub fn decode_connect_peer(
-    bytes: &[u8],
-) -> Result<(NodeId, Option<String>), SerializationError> {
+pub fn decode_connect_peer(bytes: &[u8]) -> Result<(NodeId, Option<String>), SerializationError> {
     check_size(bytes, MAX_SYSTEM_MSG_SIZE, "ConnectPeer")?;
     let proto = ConnectPeerProto::decode(bytes)
         .map_err(|e| SerializationError::new(format!("decode ConnectPeer: {e}")))?;
     if proto.node_id.is_empty() {
-        return Err(SerializationError::new("ConnectPeer: node_id must not be empty"));
+        return Err(SerializationError::new(
+            "ConnectPeer: node_id must not be empty",
+        ));
     }
     Ok((NodeId(proto.node_id), proto.address))
 }
@@ -359,7 +359,9 @@ pub fn decode_disconnect_peer(bytes: &[u8]) -> Result<NodeId, SerializationError
     let proto = DisconnectPeerProto::decode(bytes)
         .map_err(|e| SerializationError::new(format!("decode DisconnectPeer: {e}")))?;
     if proto.node_id.is_empty() {
-        return Err(SerializationError::new("DisconnectPeer: node_id must not be empty"));
+        return Err(SerializationError::new(
+            "DisconnectPeer: node_id must not be empty",
+        ));
     }
     Ok(NodeId(proto.node_id))
 }
@@ -399,10 +401,9 @@ pub fn decode_handshake_request(bytes: &[u8]) -> Result<HandshakeRequest, Serial
             "HandshakeRequest: adapter must not be empty",
         ));
     }
-    let wire_version =
-        crate::version::WireVersion::parse(&proto.wire_version).map_err(|e| {
-            SerializationError::new(format!("HandshakeRequest: invalid wire_version: {e}"))
-        })?;
+    let wire_version = crate::version::WireVersion::parse(&proto.wire_version).map_err(|e| {
+        SerializationError::new(format!("HandshakeRequest: invalid wire_version: {e}"))
+    })?;
     Ok(HandshakeRequest {
         node_id: NodeId(proto.node_id),
         wire_version,
@@ -472,9 +473,7 @@ pub fn decode_handshake_response(bytes: &[u8]) -> Result<HandshakeResponse, Seri
             }
             let wire_version =
                 crate::version::WireVersion::parse(&a.wire_version).map_err(|e| {
-                    SerializationError::new(format!(
-                        "HandshakeAccepted: invalid wire_version: {e}"
-                    ))
+                    SerializationError::new(format!("HandshakeAccepted: invalid wire_version: {e}"))
                 })?;
             Ok(HandshakeResponse::Accepted {
                 node_id: NodeId(a.node_id),
@@ -496,9 +495,7 @@ pub fn decode_handshake_response(bytes: &[u8]) -> Result<HandshakeResponse, Seri
             }
             let wire_version =
                 crate::version::WireVersion::parse(&r.wire_version).map_err(|e| {
-                    SerializationError::new(format!(
-                        "HandshakeRejected: invalid wire_version: {e}"
-                    ))
+                    SerializationError::new(format!("HandshakeRejected: invalid wire_version: {e}"))
                 })?;
             let reason = rejection_reason_from_proto(r.reason)?;
             Ok(HandshakeResponse::Rejected {
@@ -806,10 +803,7 @@ mod tests {
         assert_eq!(decoded.body, original.body);
         assert_eq!(decoded.request_id, original.request_id);
         assert_eq!(decoded.version, Some(2));
-        assert_eq!(
-            decoded.headers.get("trace-id"),
-            Some(b"abc-123".as_slice())
-        );
+        assert_eq!(decoded.headers.get("trace-id"), Some(b"abc-123".as_slice()));
     }
 
     #[test]
@@ -851,7 +845,10 @@ mod tests {
                 version: None,
             };
             let decoded = decode_wire_envelope(&encode_wire_envelope(&env)).unwrap();
-            assert_eq!(decoded.send_mode, mode, "SendMode roundtrip failed for {mode:?}");
+            assert_eq!(
+                decoded.send_mode, mode,
+                "SendMode roundtrip failed for {mode:?}"
+            );
         }
     }
 

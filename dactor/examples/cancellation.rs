@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dactor::actor::{cancel_after, Actor, ActorContext, ActorRef, Handler, ExpandHandler};
+use dactor::actor::{cancel_after, Actor, ActorContext, ActorRef, ExpandHandler, Handler};
 use dactor::message::Message;
 use dactor::stream::StreamSender;
 use dactor::TestRuntime;
@@ -123,7 +123,10 @@ async fn main() {
 
     // --- Part 2: ctx.cancelled() inside a handler ---
     println!("--- Handler with ctx.cancelled() ---");
-    let worker = runtime.spawn::<CancellableWorker>("worker", ()).await.unwrap();
+    let worker = runtime
+        .spawn::<CancellableWorker>("worker", ())
+        .await
+        .unwrap();
 
     let token = cancel_after(Duration::from_millis(50));
     let result = worker.ask(Ping, Some(token)).unwrap().await.unwrap();
@@ -133,4 +136,3 @@ async fn main() {
 
     println!("=== Done ===");
 }
-

@@ -113,7 +113,10 @@ mod tests {
     async fn send_after_delivers_message() {
         let count = Arc::new(AtomicU64::new(0));
         let rt = TestRuntime::new();
-        let actor = rt.spawn::<TickCounter>("ticker", count.clone()).await.unwrap();
+        let actor = rt
+            .spawn::<TickCounter>("ticker", count.clone())
+            .await
+            .unwrap();
 
         send_after::<TickCounter, Tick, _>(&actor, Tick, Duration::from_millis(50));
 
@@ -130,7 +133,10 @@ mod tests {
     async fn send_interval_delivers_multiple_messages() {
         let count = Arc::new(AtomicU64::new(0));
         let rt = TestRuntime::new();
-        let actor = rt.spawn::<TickCounter>("ticker", count.clone()).await.unwrap();
+        let actor = rt
+            .spawn::<TickCounter>("ticker", count.clone())
+            .await
+            .unwrap();
 
         let cancel = CancellationToken::new();
         send_interval::<TickCounter, Tick, _, _>(
@@ -158,7 +164,10 @@ mod tests {
     async fn send_interval_stops_when_actor_stops() {
         let count = Arc::new(AtomicU64::new(0));
         let rt = TestRuntime::new();
-        let actor = rt.spawn::<TickCounter>("ticker", count.clone()).await.unwrap();
+        let actor = rt
+            .spawn::<TickCounter>("ticker", count.clone())
+            .await
+            .unwrap();
 
         let cancel = CancellationToken::new();
         let handle = send_interval::<TickCounter, Tick, _, _>(

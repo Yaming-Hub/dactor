@@ -31,9 +31,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dactor::actor::{Actor, ActorContext, ActorRef, Handler};
-use dactor::interceptor::{
-    Disposition, InboundContext, InboundInterceptor, Outcome,
-};
+use dactor::interceptor::{Disposition, InboundContext, InboundInterceptor, Outcome};
 use dactor::mailbox::{MailboxConfig, OverflowStrategy};
 use dactor::message::{Headers, Message, RuntimeHeaders};
 use dactor::pool::{PoolRef, PoolRouting};
@@ -156,7 +154,12 @@ impl Actor for MetricsActor {
     type Args = ();
     type Deps = ();
     fn create(_: (), _: ()) -> Self {
-        Self { submitted: 0, completed: 0, retried: 0, dead_lettered: 0 }
+        Self {
+            submitted: 0,
+            completed: 0,
+            retried: 0,
+            dead_lettered: 0,
+        }
     }
 }
 
@@ -209,7 +212,9 @@ impl Actor for DeadLetterCollector {
     type Args = ();
     type Deps = ();
     fn create(_: (), _: ()) -> Self {
-        Self { collected: Vec::new() }
+        Self {
+            collected: Vec::new(),
+        }
     }
 
     async fn on_start(&mut self, ctx: &mut ActorContext) {
@@ -263,7 +268,11 @@ impl Actor for Worker {
     type Args = (usize, TestActorRef<Dispatcher>);
     type Deps = ();
     fn create(args: Self::Args, _: ()) -> Self {
-        Self { id: args.0, dispatcher: args.1, processed: 0 }
+        Self {
+            id: args.0,
+            dispatcher: args.1,
+            processed: 0,
+        }
     }
 
     async fn on_start(&mut self, ctx: &mut ActorContext) {
@@ -271,7 +280,10 @@ impl Actor for Worker {
     }
 
     async fn on_stop(&mut self) {
-        println!("  [Worker-{}] stopped — processed {} tasks", self.id, self.processed);
+        println!(
+            "  [Worker-{}] stopped — processed {} tasks",
+            self.id, self.processed
+        );
     }
 
     fn on_error(&mut self, _error: &dactor::ActorError) -> ErrorAction {
@@ -284,7 +296,10 @@ impl Handler<ProcessTask> for Worker {
     async fn handle(&mut self, msg: ProcessTask, _ctx: &mut ActorContext) {
         println!(
             "  [Worker-{}] processing task={} attempt={}/{}",
-            self.id, msg.id, msg.attempt, msg.max_retries + 1
+            self.id,
+            msg.id,
+            msg.attempt,
+            msg.max_retries + 1
         );
 
         // Simulate work
@@ -295,14 +310,17 @@ impl Handler<ProcessTask> for Worker {
         match outcome {
             Ok(result) => {
                 self.processed += 1;
-                println!("  [Worker-{}] ✓ task={} result=\"{}\"", self.id, msg.id, result);
-                let _ = self.dispatcher.tell(TaskCompleted {
-                    id: msg.id,
-                    result,
-                });
+                println!(
+                    "  [Worker-{}] ✓ task={} result=\"{}\"",
+                    self.id, msg.id, result
+                );
+                let _ = self.dispatcher.tell(TaskCompleted { id: msg.id, result });
             }
             Err(error) => {
-                println!("  [Worker-{}] ✗ task={} error=\"{}\"", self.id, msg.id, error);
+                println!(
+                    "  [Worker-{}] ✗ task={} error=\"{}\"",
+                    self.id, msg.id, error
+                );
                 let _ = self.dispatcher.tell(TaskFailed {
                     id: msg.id,
                     payload: msg.payload,
@@ -347,7 +365,10 @@ struct Dispatcher {
 
 #[async_trait]
 impl Actor for Dispatcher {
-    type Args = (TestActorRef<DeadLetterCollector>, TestActorRef<MetricsActor>);
+    type Args = (
+        TestActorRef<DeadLetterCollector>,
+        TestActorRef<MetricsActor>,
+    );
     type Deps = ();
     fn create(args: Self::Args, _: ()) -> Self {
         Self {
@@ -403,7 +424,10 @@ impl Handler<SubmitTask> for Dispatcher {
 #[async_trait]
 impl Handler<TaskCompleted> for Dispatcher {
     async fn handle(&mut self, msg: TaskCompleted, _ctx: &mut ActorContext) {
-        println!("  [Dispatcher] task={} completed result=\"{}\"", msg.id, msg.result);
+        println!(
+            "  [Dispatcher] task={} completed result=\"{}\"",
+            msg.id, msg.result
+        );
         let _ = self.metrics.tell(RecordMetric(MetricEvent::Completed));
     }
 }
@@ -560,28 +584,43 @@ async fn main() {
 
     let tasks: Vec<(&str, &str, TaskPriority, u32)> = vec![
         // Easy tasks — always succeed (10 tasks)
-        ("task-01", "easy:send-email",        TaskPriority::High,   2),
-        ("task-02", "easy:resize-image",      TaskPriority::Normal, 2),
-        ("task-03", "easy:generate-report",   TaskPriority::Low,    2),
+        ("task-01", "easy:send-email", TaskPriority::High, 2),
+        ("task-02", "easy:resize-image", TaskPriority::Normal, 2),
+        ("task-03", "easy:generate-report", TaskPriority::Low, 2),
         ("task-04", "easy:send-notification", TaskPriority::Normal, 2),
-        ("task-05", "easy:update-cache",      TaskPriority::High,   2),
-        ("task-06", "easy:sync-data",         TaskPriority::Normal, 2),
-        ("task-07", "easy:log-analytics",     TaskPriority::Low,    2),
-        ("task-08", "easy:compress-file",     TaskPriority::Normal, 2),
-        ("task-09", "easy:validate-input",    TaskPriority::High,   2),
-        ("task-10", "easy:render-template",   TaskPriority::Normal, 2),
+        ("task-05", "easy:update-cache", TaskPriority::High, 2),
+        ("task-06", "easy:sync-data", TaskPriority::Normal, 2),
+        ("task-07", "easy:log-analytics", TaskPriority::Low, 2),
+        ("task-08", "easy:compress-file", TaskPriority::Normal, 2),
+        ("task-09", "easy:validate-input", TaskPriority::High, 2),
+        ("task-10", "easy:render-template", TaskPriority::Normal, 2),
         // Hard tasks — fail once, then succeed (5 tasks)
-        ("task-11", "hard:process-payment",   TaskPriority::High,   3),
-        ("task-12", "hard:upload-file",       TaskPriority::Normal, 3),
-        ("task-13", "hard:call-api",          TaskPriority::Normal, 3),
-        ("task-14", "hard:index-document",    TaskPriority::Low,    3),
-        ("task-15", "hard:transform-data",    TaskPriority::High,   3),
+        ("task-11", "hard:process-payment", TaskPriority::High, 3),
+        ("task-12", "hard:upload-file", TaskPriority::Normal, 3),
+        ("task-13", "hard:call-api", TaskPriority::Normal, 3),
+        ("task-14", "hard:index-document", TaskPriority::Low, 3),
+        ("task-15", "hard:transform-data", TaskPriority::High, 3),
         // Impossible tasks — always fail (5 tasks)
-        ("task-16", "impossible:bad-endpoint",     TaskPriority::Normal, 2),
-        ("task-17", "impossible:corrupt-data",     TaskPriority::High,   2),
-        ("task-18", "impossible:missing-resource", TaskPriority::Normal, 1),
-        ("task-19", "impossible:auth-expired",     TaskPriority::Low,    2),
-        ("task-20", "impossible:quota-exceeded",   TaskPriority::Normal, 1),
+        (
+            "task-16",
+            "impossible:bad-endpoint",
+            TaskPriority::Normal,
+            2,
+        ),
+        ("task-17", "impossible:corrupt-data", TaskPriority::High, 2),
+        (
+            "task-18",
+            "impossible:missing-resource",
+            TaskPriority::Normal,
+            1,
+        ),
+        ("task-19", "impossible:auth-expired", TaskPriority::Low, 2),
+        (
+            "task-20",
+            "impossible:quota-exceeded",
+            TaskPriority::Normal,
+            1,
+        ),
     ];
 
     for (id, payload, priority, max_retries) in &tasks {
@@ -631,10 +670,16 @@ async fn main() {
     let registry = runtime.metrics().unwrap();
     let rt_metrics = registry.runtime_metrics();
     println!("\n  Runtime metrics:");
-    println!("    Total messages processed: {}", rt_metrics.total_messages);
+    println!(
+        "    Total messages processed: {}",
+        rt_metrics.total_messages
+    );
     println!("    Total errors:             {}", rt_metrics.total_errors);
     println!("    Active actors:            {}", rt_metrics.actor_count);
-    println!("    Message rate:             {:.1}/s", rt_metrics.message_rate);
+    println!(
+        "    Message rate:             {:.1}/s",
+        rt_metrics.message_rate
+    );
 
     // Interceptor log summary
     {

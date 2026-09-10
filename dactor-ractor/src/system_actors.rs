@@ -141,9 +141,7 @@ pub enum WatchManagerMsg {
         reply: oneshot::Sender<Vec<WatchNotification>>,
     },
     /// Query watched count.
-    GetWatchedCount {
-        reply: oneshot::Sender<usize>,
-    },
+    GetWatchedCount { reply: oneshot::Sender<usize> },
 }
 
 /// Native ractor actor wrapping [`WatchManager`].
@@ -206,9 +204,7 @@ pub enum CancelManagerMsg {
     /// Clean up after a request completes normally.
     Complete { request_id: String },
     /// Query active count.
-    GetActiveCount {
-        reply: oneshot::Sender<usize>,
-    },
+    GetActiveCount { reply: oneshot::Sender<usize> },
 }
 
 /// Native ractor actor wrapping [`CancelManager`].
@@ -271,13 +267,9 @@ pub enum NodeDirectoryMsg {
         reply: oneshot::Sender<bool>,
     },
     /// Query peer count.
-    GetPeerCount {
-        reply: oneshot::Sender<usize>,
-    },
+    GetPeerCount { reply: oneshot::Sender<usize> },
     /// Query connected count.
-    GetConnectedCount {
-        reply: oneshot::Sender<usize>,
-    },
+    GetConnectedCount { reply: oneshot::Sender<usize> },
     /// Query peer info (address, status).
     GetPeerInfo {
         peer_id: NodeId,

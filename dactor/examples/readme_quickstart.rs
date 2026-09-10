@@ -41,7 +41,10 @@ impl Handler<GetCount> for Counter {
 #[tokio::main]
 async fn main() {
     let runtime = TestRuntime::new();
-    let counter = runtime.spawn::<Counter>("counter", Counter { count: 0 }).await.unwrap();
+    let counter = runtime
+        .spawn::<Counter>("counter", Counter { count: 0 })
+        .await
+        .unwrap();
 
     counter.tell(Increment(5)).unwrap();
     counter.tell(Increment(3)).unwrap();

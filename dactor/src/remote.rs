@@ -244,10 +244,8 @@ impl ClusterState {
             local_node,
             nodes,
             is_leader: false,
-            wire_version: crate::version::WireVersion::parse(
-                crate::version::DACTOR_WIRE_VERSION,
-            )
-            .expect("DACTOR_WIRE_VERSION must be valid"),
+            wire_version: crate::version::WireVersion::parse(crate::version::DACTOR_WIRE_VERSION)
+                .expect("DACTOR_WIRE_VERSION must be valid"),
             app_version: None,
             peer_versions: std::collections::HashMap::new(),
         }
@@ -358,7 +356,7 @@ pub trait ClusterDiscovery: Send + Sync + 'static {
     /// Returns a list of [`DiscoveredPeer`]s. The runtime will compare this
     /// against currently connected peers and attempt to connect new ones
     /// via [`verify_peer_identity`](crate::verify_peer_identity) and
-    /// [`connect_peer`] on the adapter runtime.
+    /// `connect_peer` on the adapter runtime.
     async fn discover(&self) -> Result<Vec<DiscoveredPeer>, DiscoveryError>;
 }
 
@@ -375,7 +373,10 @@ impl StaticSeeds {
     /// (via [`DiscoveredPeer::from_address`]).
     pub fn new(addresses: Vec<String>) -> Self {
         Self {
-            peers: addresses.into_iter().map(DiscoveredPeer::from_address).collect(),
+            peers: addresses
+                .into_iter()
+                .map(DiscoveredPeer::from_address)
+                .collect(),
         }
     }
 
@@ -986,7 +987,9 @@ mod tests {
         // When no MessageVersionHandler is registered, version mismatch
         // falls through to deserialize the body as-is (relies on serde defaults).
         let mut registry = crate::type_registry::TypeRegistry::new();
-        registry.register("test::NoHandler", |bytes: &[u8]| Ok(Box::new(bytes.to_vec())));
+        registry.register("test::NoHandler", |bytes: &[u8]| {
+            Ok(Box::new(bytes.to_vec()))
+        });
 
         let version_handlers: std::collections::HashMap<String, Box<dyn MessageVersionHandler>> =
             std::collections::HashMap::new();
@@ -1006,13 +1009,8 @@ mod tests {
         };
 
         // Receiver expects v2 but has no handler — body passes through
-        let any = receive_envelope_body_versioned(
-            &envelope,
-            &registry,
-            &version_handlers,
-            Some(2),
-        )
-        .unwrap();
+        let any = receive_envelope_body_versioned(&envelope, &registry, &version_handlers, Some(2))
+            .unwrap();
         let val = any.downcast::<Vec<u8>>().unwrap();
         assert_eq!(*val, vec![10, 20]);
     }
@@ -1022,7 +1020,9 @@ mod tests {
         // When the MessageVersionHandler cannot migrate (returns None),
         // the call should fail with a clear error.
         let mut registry = crate::type_registry::TypeRegistry::new();
-        registry.register("test::FailMigrate", |bytes: &[u8]| Ok(Box::new(bytes.to_vec())));
+        registry.register("test::FailMigrate", |bytes: &[u8]| {
+            Ok(Box::new(bytes.to_vec()))
+        });
 
         struct RejectingMigrator;
         impl MessageVersionHandler for RejectingMigrator {
@@ -1074,7 +1074,9 @@ mod tests {
         // When the sender doesn't set a version (None), no migration is attempted
         // regardless of the receiver's expected version — even if a handler exists.
         let mut registry = crate::type_registry::TypeRegistry::new();
-        registry.register("test::OptionalVersion", |bytes: &[u8]| Ok(Box::new(bytes.to_vec())));
+        registry.register("test::OptionalVersion", |bytes: &[u8]| {
+            Ok(Box::new(bytes.to_vec()))
+        });
 
         // Register a panicking handler to prove it's never called
         struct PanicMigrator;
@@ -1122,7 +1124,9 @@ mod tests {
     fn test_version_none_on_both_sides_skips_migration() {
         // When neither side specifies a version, no migration is attempted.
         let mut registry = crate::type_registry::TypeRegistry::new();
-        registry.register("test::NoVersion", |bytes: &[u8]| Ok(Box::new(bytes.to_vec())));
+        registry.register("test::NoVersion", |bytes: &[u8]| {
+            Ok(Box::new(bytes.to_vec()))
+        });
 
         let version_handlers: std::collections::HashMap<String, Box<dyn MessageVersionHandler>> =
             std::collections::HashMap::new();
@@ -1157,7 +1161,9 @@ mod tests {
         // When receiver has no version expectation (None) but sender has a
         // version, no migration is attempted — even if a handler exists.
         let mut registry = crate::type_registry::TypeRegistry::new();
-        registry.register("test::ReceiverNone", |bytes: &[u8]| Ok(Box::new(bytes.to_vec())));
+        registry.register("test::ReceiverNone", |bytes: &[u8]| {
+            Ok(Box::new(bytes.to_vec()))
+        });
 
         struct PanicMigrator;
         impl MessageVersionHandler for PanicMigrator {

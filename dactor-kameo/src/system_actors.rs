@@ -365,8 +365,7 @@ impl kameo::message::Message<DisconnectPeer> for NodeDirectoryActor {
         msg: DisconnectPeer,
         _ctx: &mut kameo::message::Context<Self, Self::Reply>,
     ) {
-        self.directory
-            .set_status(&msg.0, PeerStatus::Disconnected);
+        self.directory.set_status(&msg.0, PeerStatus::Disconnected);
     }
 }
 

@@ -12,16 +12,17 @@ use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use dactor::actor::{
-    Actor, ActorContext, ActorError, ActorRef, AskReply, ReduceHandler, Handler, ExpandHandler,
+    Actor, ActorContext, ActorError, ActorRef, AskReply, ExpandHandler, Handler, ReduceHandler,
     TransformHandler,
 };
 use dactor::dead_letter::{DeadLetterEvent, DeadLetterHandler, DeadLetterReason};
-use dactor::dispatch::{AskDispatch, Dispatch, ReduceDispatch, ExpandDispatch, TransformDispatch, TypedDispatch};
+use dactor::dispatch::{
+    AskDispatch, Dispatch, ExpandDispatch, ReduceDispatch, TransformDispatch, TypedDispatch,
+};
 use dactor::errors::{ActorSendError, ErrorAction, RuntimeError};
 use dactor::interceptor::{
-    collect_handler_wrappers, apply_handler_wrappers,
-    Disposition, DropObserver, InboundContext, InboundInterceptor, OutboundInterceptor, Outcome,
-    SendMode,
+    apply_handler_wrappers, collect_handler_wrappers, Disposition, DropObserver, InboundContext,
+    InboundInterceptor, OutboundInterceptor, Outcome, SendMode,
 };
 use dactor::mailbox::MailboxConfig;
 use dactor::message::{Headers, Message, RuntimeHeaders};
@@ -113,10 +114,9 @@ impl<A: Actor + Send + Sync + 'static> CoerceActor for CoerceDactorActor<A> {
         self.ctx.set_cancellation_token(None);
 
         // Run on_stop with panic catching so we can propagate errors
-        let stop_result =
-            std::panic::AssertUnwindSafe(self.actor.on_stop())
-                .catch_unwind()
-                .await;
+        let stop_result = std::panic::AssertUnwindSafe(self.actor.on_stop())
+            .catch_unwind()
+            .await;
         let stop_err = match stop_result {
             Ok(()) => None,
             Err(_panic) => Some("actor panicked in on_stop".to_string()),
@@ -268,14 +268,15 @@ impl<A: Actor + Send + Sync + 'static> CoerceHandler<DactorMsg<A>> for CoerceDac
         let result = if needs_wrap {
             let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
 
-            let inner: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> = Box::pin(async {
-                let r = std::panic::AssertUnwindSafe(
-                    dispatch.dispatch(&mut self.actor, &mut self.ctx),
-                )
-                .catch_unwind()
-                .await;
-                let _ = result_tx.send(r);
-            });
+            let inner: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
+                Box::pin(async {
+                    let r = std::panic::AssertUnwindSafe(
+                        dispatch.dispatch(&mut self.actor, &mut self.ctx),
+                    )
+                    .catch_unwind()
+                    .await;
+                    let _ = result_tx.send(r);
+                });
 
             let wrapped = apply_handler_wrappers(wrappers, inner);
 
@@ -296,9 +297,10 @@ impl<A: Actor + Send + Sync + 'static> CoerceHandler<DactorMsg<A>> for CoerceDac
 
             match result_rx.try_recv() {
                 Ok(r) => r,
-                Err(_) => Err(Box::new(
-                    "interceptor wrap_handler did not await the handler future",
-                ) as Box<dyn std::any::Any + Send>),
+                Err(_) => Err(
+                    Box::new("interceptor wrap_handler did not await the handler future")
+                        as Box<dyn std::any::Any + Send>,
+                ),
             }
         } else {
             if let Some(ref token) = cancel_token {
@@ -515,11 +517,7 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
             } else {
                 DeadLetterReason::ActorStopped
             };
-            self.notify_dead_letter(
-                std::any::type_name::<M>(),
-                SendMode::Tell,
-                reason,
-            );
+            self.notify_dead_letter(std::any::type_name::<M>(), SendMode::Tell, reason);
             e
         })
     }
@@ -575,11 +573,7 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
             } else {
                 DeadLetterReason::ActorStopped
             };
-            self.notify_dead_letter(
-                std::any::type_name::<M>(),
-                SendMode::Ask,
-                reason,
-            );
+            self.notify_dead_letter(std::any::type_name::<M>(), SendMode::Ask, reason);
             e
         })?;
         Ok(AskReply::new(rx))
@@ -672,12 +666,12 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
                 ))
             }
             None => Ok(wrap_stream_with_interception(
-                    rx,
-                    buffer,
-                    pipeline,
-                    std::any::type_name::<M>(),
-                    SendMode::Expand,
-                )),
+                rx,
+                buffer,
+                pipeline,
+                std::any::type_name::<M>(),
+                SendMode::Expand,
+            )),
         }
     }
 
@@ -748,11 +742,8 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
         let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(buffer);
         let receiver = StreamReceiver::new(item_rx);
         let sender = StreamSender::new(output_tx);
-        let dispatch: Box<dyn Dispatch<A>> = Box::new(TransformDispatch::new(
-            receiver,
-            sender,
-            cancel.clone(),
-        ));
+        let dispatch: Box<dyn Dispatch<A>> =
+            Box::new(TransformDispatch::new(receiver, sender, cancel.clone()));
         self.send_dispatch(dispatch)?;
 
         let pipeline = self.outbound_pipeline();
@@ -766,8 +757,7 @@ impl<A: Actor + Send + Sync + 'static> ActorRef<A> for CoerceActorRef<A> {
 
         match batch_config {
             Some(batch_config) => {
-                let (batch_tx, batch_rx) =
-                    tokio::sync::mpsc::channel::<Vec<OutputItem>>(buffer);
+                let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<OutputItem>>(buffer);
                 let reader = BatchReader::new(batch_rx);
                 let batch_delay = batch_config.max_delay;
                 tokio::spawn(async move {
@@ -862,8 +852,10 @@ pub struct CoerceSystemActorRefs {
 impl CoerceSystemActorRefs {
     /// Get the spawn manager ref (round-robin if pooled).
     pub fn spawn_manager(&self) -> &LocalActorRef<crate::system_actors::SpawnManagerActor> {
-        let idx = self.spawn_manager_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            as usize % self.spawn_managers.len();
+        let idx = self
+            .spawn_manager_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize
+            % self.spawn_managers.len();
         &self.spawn_managers[idx]
     }
 }
@@ -906,7 +898,8 @@ pub struct CoerceRuntime {
     system_actors: Option<CoerceSystemActorRefs>,
     /// Stop notification receivers for await_stop(), keyed by ActorId.
     #[allow(clippy::type_complexity)]
-    stop_receivers: Arc<Mutex<HashMap<ActorId, tokio::sync::oneshot::Receiver<Result<(), String>>>>>,
+    stop_receivers:
+        Arc<Mutex<HashMap<ActorId, tokio::sync::oneshot::Receiver<Result<(), String>>>>>,
     /// Application version for this node (informational, used in handshake).
     app_version: Option<String>,
 }
@@ -1107,7 +1100,11 @@ impl CoerceRuntime {
     }
 
     /// Spawn an actor with `Deps = ()`.
-    pub async fn spawn<A>(&self, name: &str, args: A::Args) -> Result<CoerceActorRef<A>, dactor::errors::RuntimeError>
+    pub async fn spawn<A>(
+        &self,
+        name: &str,
+        args: A::Args,
+    ) -> Result<CoerceActorRef<A>, dactor::errors::RuntimeError>
     where
         A: Actor<Deps = ()> + Send + Sync + 'static,
     {
@@ -1115,7 +1112,12 @@ impl CoerceRuntime {
     }
 
     /// Spawn an actor with explicit dependencies.
-    pub async fn spawn_with_deps<A>(&self, name: &str, args: A::Args, deps: A::Deps) -> Result<CoerceActorRef<A>, dactor::errors::RuntimeError>
+    pub async fn spawn_with_deps<A>(
+        &self,
+        name: &str,
+        args: A::Args,
+        deps: A::Deps,
+    ) -> Result<CoerceActorRef<A>, dactor::errors::RuntimeError>
     where
         A: Actor + Send + Sync + 'static,
     {
@@ -1183,8 +1185,7 @@ impl CoerceRuntime {
         // Set up optional bounded mailbox channel
         let bounded_tx = match mailbox {
             MailboxConfig::Bounded { capacity, overflow } => {
-                let (btx, mut brx) =
-                    tokio::sync::mpsc::channel::<DactorMsg<A>>(capacity);
+                let (btx, mut brx) = tokio::sync::mpsc::channel::<DactorMsg<A>>(capacity);
                 let fwd_ref = coerce_ref.clone();
                 tokio::spawn(async move {
                     while let Some(msg) = brx.recv().await {
@@ -1292,12 +1293,10 @@ impl CoerceRuntime {
         if let Some(ref actors) = self.system_actors {
             for worker in &actors.spawn_managers {
                 let f = factory.clone();
-                let _ = worker.notify(
-                    crate::system_actors::RegisterFactory {
-                        type_name: type_name.clone(),
-                        factory: Box::new(move |bytes: &[u8]| f(bytes)),
-                    },
-                );
+                let _ = worker.notify(crate::system_actors::RegisterFactory {
+                    type_name: type_name.clone(),
+                    factory: Box::new(move |bytes: &[u8]| f(bytes)),
+                });
             }
         }
     }
@@ -1503,7 +1502,10 @@ impl CoerceRuntime {
         };
         let mut first_error = None;
         for (_, rx) in receivers {
-            let result = rx.await.map_err(|e| format!("stop notifier dropped: {e}")).and_then(|r| r);
+            let result = rx
+                .await
+                .map_err(|e| format!("stop notifier dropped: {e}"))
+                .and_then(|r| r);
             if let Err(e) = result {
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -1658,10 +1660,7 @@ impl dactor::system_router::SystemMessageRouter for CoerceRuntime {
                     .map_err(|e| RoutingError::new(format!("decode ConnectPeer: {e}")))?;
 
                 refs.node_directory
-                    .notify(crate::system_actors::ConnectPeer {
-                        peer_id,
-                        address,
-                    })
+                    .notify(crate::system_actors::ConnectPeer { peer_id, address })
                     .map_err(|e| RoutingError::new(format!("NodeDirectory notify: {e}")))?;
 
                 Ok(RoutingOutcome::Acknowledged)
@@ -1684,4 +1683,3 @@ impl dactor::system_router::SystemMessageRouter for CoerceRuntime {
         }
     }
 }
-

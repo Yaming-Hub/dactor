@@ -307,11 +307,7 @@ impl CommandHandler for CoerceCommandHandler {
         };
 
         if timeout_ms > 0 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                ask_fut,
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), ask_fut).await
             {
                 Ok(result) => result,
                 Err(_) => Err("ask timed out".into()),
@@ -359,7 +355,10 @@ impl CommandHandler for CoerceCommandHandler {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         self.live_count.fetch_sub(1, Ordering::Relaxed);
-        Err(format!("actor '{}' did not terminate within 1s", actor_name))
+        Err(format!(
+            "actor '{}' did not terminate within 1s",
+            actor_name
+        ))
     }
 
     async fn watch_actor(&self, watcher_name: &str, target_name: &str) -> Result<(), String> {
@@ -372,7 +371,10 @@ impl CommandHandler for CoerceCommandHandler {
         }
         drop(actors);
         let mut watches = self.watches.lock().await;
-        if watches.iter().any(|(w, t)| w == watcher_name && t == target_name) {
+        if watches
+            .iter()
+            .any(|(w, t)| w == watcher_name && t == target_name)
+        {
             return Ok(());
         }
         watches.push((watcher_name.to_string(), target_name.to_string()));

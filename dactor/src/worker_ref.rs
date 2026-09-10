@@ -24,8 +24,7 @@
 //! ```
 
 use crate::actor::{
-    Actor, ActorRef, AskReply, ExpandHandler, Handler, ReduceHandler,
-    TransformHandler,
+    Actor, ActorRef, AskReply, ExpandHandler, Handler, ReduceHandler, TransformHandler,
 };
 use crate::errors::ActorSendError;
 use crate::message::Message;
@@ -266,8 +265,7 @@ mod tests {
     #[test]
     fn worker_ref_is_local_and_is_remote() {
         let remote = make_remote_ref();
-        let worker: WorkerRef<Counter, RemoteActorRef<Counter>> =
-            WorkerRef::Remote(remote);
+        let worker: WorkerRef<Counter, RemoteActorRef<Counter>> = WorkerRef::Remote(remote);
         assert!(worker.is_remote());
         assert!(!worker.is_local());
     }
@@ -275,8 +273,7 @@ mod tests {
     #[test]
     fn worker_ref_delegates_id_and_name() {
         let remote = make_remote_ref();
-        let worker: WorkerRef<Counter, RemoteActorRef<Counter>> =
-            WorkerRef::Remote(remote.clone());
+        let worker: WorkerRef<Counter, RemoteActorRef<Counter>> = WorkerRef::Remote(remote.clone());
         assert_eq!(worker.id(), remote.id());
         assert_eq!(worker.name(), remote.name());
     }
@@ -291,10 +288,7 @@ mod tests {
         let w1_check = w1.clone();
         let w2_check = w2.clone();
 
-        let workers = vec![
-            WorkerRef::Local(w1),
-            WorkerRef::Local(w2),
-        ];
+        let workers = vec![WorkerRef::Local(w1), WorkerRef::Local(w2)];
         let pool = PoolRef::new(workers, PoolRouting::RoundRobin);
 
         // Tell goes to w1 (round-robin index 0)
@@ -317,10 +311,7 @@ mod tests {
         let w1 = rt.spawn::<Counter>("ask-c1", 100).await.unwrap();
         let w2 = rt.spawn::<Counter>("ask-c2", 200).await.unwrap();
 
-        let workers = vec![
-            WorkerRef::Local(w1),
-            WorkerRef::Local(w2),
-        ];
+        let workers = vec![WorkerRef::Local(w1), WorkerRef::Local(w2)];
         let pool = PoolRef::new(workers, PoolRouting::RoundRobin);
 
         // First ask goes to w1 (100)
@@ -339,10 +330,7 @@ mod tests {
         let local_check = local.clone();
         let remote = make_remote_ref();
 
-        let workers = vec![
-            WorkerRef::Local(local),
-            WorkerRef::Remote(remote),
-        ];
+        let workers = vec![WorkerRef::Local(local), WorkerRef::Remote(remote)];
         let pool = PoolRef::new(workers, PoolRouting::RoundRobin);
 
         assert!(pool.is_alive());
@@ -369,8 +357,7 @@ mod tests {
     #[test]
     fn worker_ref_pending_messages_delegates() {
         let remote = make_remote_ref();
-        let worker: WorkerRef<Counter, RemoteActorRef<Counter>> =
-            WorkerRef::Remote(remote);
+        let worker: WorkerRef<Counter, RemoteActorRef<Counter>> = WorkerRef::Remote(remote);
         // RemoteActorRef returns 0 by default
         assert_eq!(worker.pending_messages(), 0);
     }

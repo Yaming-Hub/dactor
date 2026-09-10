@@ -304,7 +304,10 @@ impl InMemoryTransport {
         let remote_info = info.get(node).ok_or_else(|| {
             TransportError::new(format!("no handshake info registered for {node}"))
         })?;
-        Ok(crate::system_actors::validate_handshake(remote_info, &request))
+        Ok(crate::system_actors::validate_handshake(
+            remote_info,
+            &request,
+        ))
     }
 }
 

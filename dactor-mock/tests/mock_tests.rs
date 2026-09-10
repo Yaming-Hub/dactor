@@ -20,7 +20,11 @@ async fn test_create_cluster() {
 async fn test_spawn_on_node() {
     let cluster = MockCluster::new(&["node-1"]);
     let node = cluster.node("node-1");
-    let actor = node.runtime.spawn::<ConformanceCounter>("counter", 0).await.unwrap();
+    let actor = node
+        .runtime
+        .spawn::<ConformanceCounter>("counter", 0)
+        .await
+        .unwrap();
     assert!(actor.is_alive());
     assert_eq!(actor.id().node, NodeId("node-1".into()));
 }
@@ -29,7 +33,11 @@ async fn test_spawn_on_node() {
 async fn test_tell_ask_on_node() {
     let cluster = MockCluster::new(&["node-1"]);
     let node = cluster.node("node-1");
-    let actor = node.runtime.spawn::<ConformanceCounter>("counter", 0).await.unwrap();
+    let actor = node
+        .runtime
+        .spawn::<ConformanceCounter>("counter", 0)
+        .await
+        .unwrap();
 
     actor.tell(Increment(5)).unwrap();
     actor.tell(Increment(3)).unwrap();
@@ -258,7 +266,11 @@ async fn test_mock_cluster_watch() {
     let node = cluster.node("node-1");
 
     let terminated = Arc::new(AtomicBool::new(false));
-    let watcher = node.runtime.spawn::<Watcher>("watcher", terminated.clone()).await.unwrap();
+    let watcher = node
+        .runtime
+        .spawn::<Watcher>("watcher", terminated.clone())
+        .await
+        .unwrap();
     let worker = node.runtime.spawn::<Worker>("worker", ()).await.unwrap();
 
     let worker_id = worker.id();
@@ -279,7 +291,11 @@ async fn test_mock_cluster_unwatch() {
     let node = cluster.node("node-1");
 
     let terminated = Arc::new(AtomicBool::new(false));
-    let watcher = node.runtime.spawn::<Watcher>("watcher", terminated.clone()).await.unwrap();
+    let watcher = node
+        .runtime
+        .spawn::<Watcher>("watcher", terminated.clone())
+        .await
+        .unwrap();
     let worker = node.runtime.spawn::<Worker>("worker", ()).await.unwrap();
 
     let worker_id = worker.id();

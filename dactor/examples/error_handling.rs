@@ -82,7 +82,9 @@ async fn main() {
     println!("=== Error Handling Example ===\n");
 
     let runtime = TestRuntime::new();
-    let actor = runtime.spawn::<Validator>("validator", ()).await
+    let actor = runtime
+        .spawn::<Validator>("validator", ())
+        .await
         .expect("spawn should succeed — demonstrates RuntimeError::SpawnFailed on failure");
 
     // --- Success case ---

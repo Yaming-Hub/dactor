@@ -13,16 +13,17 @@ use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use dactor::actor::{
-    Actor, ActorContext, ActorError, ActorRef, AskReply, ReduceHandler, Handler, ExpandHandler,
+    Actor, ActorContext, ActorError, ActorRef, AskReply, ExpandHandler, Handler, ReduceHandler,
     TransformHandler,
 };
 use dactor::dead_letter::{DeadLetterEvent, DeadLetterHandler, DeadLetterReason};
-use dactor::dispatch::{AskDispatch, Dispatch, ReduceDispatch, ExpandDispatch, TransformDispatch, TypedDispatch};
+use dactor::dispatch::{
+    AskDispatch, Dispatch, ExpandDispatch, ReduceDispatch, TransformDispatch, TypedDispatch,
+};
 use dactor::errors::{ActorSendError, ErrorAction, RuntimeError};
 use dactor::interceptor::{
-    collect_handler_wrappers, apply_handler_wrappers,
-    Disposition, DropObserver, InboundContext, InboundInterceptor, OutboundInterceptor, Outcome,
-    SendMode,
+    apply_handler_wrappers, collect_handler_wrappers, Disposition, DropObserver, InboundContext,
+    InboundInterceptor, OutboundInterceptor, Outcome, SendMode,
 };
 use dactor::mailbox::MailboxConfig;
 use dactor::message::{Headers, Message, RuntimeHeaders};
@@ -227,14 +228,15 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
         let result = if needs_wrap {
             let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
 
-            let inner: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> = Box::pin(async {
-                let r = std::panic::AssertUnwindSafe(
-                    dispatch.dispatch(&mut state.actor, &mut state.ctx),
-                )
-                .catch_unwind()
-                .await;
-                let _ = result_tx.send(r);
-            });
+            let inner: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
+                Box::pin(async {
+                    let r = std::panic::AssertUnwindSafe(
+                        dispatch.dispatch(&mut state.actor, &mut state.ctx),
+                    )
+                    .catch_unwind()
+                    .await;
+                    let _ = result_tx.send(r);
+                });
 
             let wrapped = apply_handler_wrappers(wrappers, inner);
 
@@ -255,15 +257,17 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
 
             match result_rx.try_recv() {
                 Ok(r) => r,
-                Err(_) => Err(Box::new(
-                    "interceptor wrap_handler did not await the handler future",
-                ) as Box<dyn std::any::Any + Send>),
+                Err(_) => Err(
+                    Box::new("interceptor wrap_handler did not await the handler future")
+                        as Box<dyn std::any::Any + Send>,
+                ),
             }
         } else {
             if let Some(ref token) = cancel_token {
-                let dispatch_fut =
-                    std::panic::AssertUnwindSafe(dispatch.dispatch(&mut state.actor, &mut state.ctx))
-                        .catch_unwind();
+                let dispatch_fut = std::panic::AssertUnwindSafe(
+                    dispatch.dispatch(&mut state.actor, &mut state.ctx),
+                )
+                .catch_unwind();
                 tokio::select! {
                     biased;
                     r = dispatch_fut => r,
@@ -346,11 +350,10 @@ impl<A: Actor + 'static> ractor::Actor for RactorDactorActor<A> {
 
         // Run on_stop with panic catching so panics propagate as errors
         // through await_stop() instead of aborting the ractor task.
-        let on_stop_panicked =
-            std::panic::AssertUnwindSafe(state.actor.on_stop())
-                .catch_unwind()
-                .await
-                .is_err();
+        let on_stop_panicked = std::panic::AssertUnwindSafe(state.actor.on_stop())
+            .catch_unwind()
+            .await
+            .is_err();
         if on_stop_panicked && state.stop_reason.is_none() {
             state.stop_reason = Some("actor panicked in on_stop".to_string());
         }
@@ -686,12 +689,12 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
                 ))
             }
             None => Ok(wrap_stream_with_interception(
-                    rx,
-                    buffer,
-                    pipeline,
-                    std::any::type_name::<M>(),
-                    SendMode::Expand,
-                )),
+                rx,
+                buffer,
+                pipeline,
+                std::any::type_name::<M>(),
+                SendMode::Expand,
+            )),
         }
     }
 
@@ -762,11 +765,8 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
         let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(buffer);
         let receiver = StreamReceiver::new(item_rx);
         let sender = StreamSender::new(output_tx);
-        let dispatch: Box<dyn Dispatch<A>> = Box::new(TransformDispatch::new(
-            receiver,
-            sender,
-            cancel.clone(),
-        ));
+        let dispatch: Box<dyn Dispatch<A>> =
+            Box::new(TransformDispatch::new(receiver, sender, cancel.clone()));
         self.send_dispatch(dispatch)?;
 
         let pipeline = self.outbound_pipeline();
@@ -780,8 +780,7 @@ impl<A: Actor + 'static> ActorRef<A> for RactorActorRef<A> {
 
         match batch_config {
             Some(batch_config) => {
-                let (batch_tx, batch_rx) =
-                    tokio::sync::mpsc::channel::<Vec<OutputItem>>(buffer);
+                let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<OutputItem>>(buffer);
                 let reader = BatchReader::new(batch_rx);
                 let batch_delay = batch_config.max_delay;
                 tokio::spawn(async move {
@@ -897,7 +896,8 @@ pub struct RactorRuntime {
     system_actors: Option<RactorSystemActorRefs>,
     /// Stop notification receivers for await_stop(), keyed by ActorId.
     #[allow(clippy::type_complexity)]
-    stop_receivers: Arc<Mutex<HashMap<ActorId, tokio::sync::oneshot::Receiver<Result<(), String>>>>>,
+    stop_receivers:
+        Arc<Mutex<HashMap<ActorId, tokio::sync::oneshot::Receiver<Result<(), String>>>>>,
     /// Application version for this node (informational, used in handshake).
     app_version: Option<String>,
 }
@@ -946,14 +946,21 @@ impl<M: ractor::Message> SystemActorPool<M> {
 
     /// Send a message to the next worker via round-robin.
     pub fn cast(&self, msg: M) -> Result<(), ractor::MessagingErr<M>> {
-        let idx = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            as usize % self.workers.len();
+        let idx = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize
+            % self.workers.len();
         self.workers[idx].cast(msg)
     }
 
     /// Number of workers in the pool.
     pub fn len(&self) -> usize {
         self.workers.len()
+    }
+
+    /// Returns `true` if the pool has no workers.
+    pub fn is_empty(&self) -> bool {
+        self.workers.is_empty()
     }
 
     /// Access all worker refs (for broadcasting to all workers).
@@ -1034,7 +1041,8 @@ impl RactorRuntime {
     /// Uses default configuration (unbounded mailboxes, no pooling).
     /// For custom configuration, use [`start_system_actors_with_config()`].
     pub async fn start_system_actors(&mut self) {
-        self.start_system_actors_with_config(dactor::SystemActorConfig::default()).await;
+        self.start_system_actors_with_config(dactor::SystemActorConfig::default())
+            .await;
     }
 
     /// Spawn native ractor system actors with custom configuration.
@@ -1060,10 +1068,7 @@ impl RactorRuntime {
     ///
     /// runtime.start_system_actors_with_config(config).await;
     /// ```
-    pub async fn start_system_actors_with_config(
-        &mut self,
-        config: dactor::SystemActorConfig,
-    ) {
+    pub async fn start_system_actors_with_config(&mut self, config: dactor::SystemActorConfig) {
         use crate::system_actors::*;
 
         // --- SpawnManager (optionally pooled) ---
@@ -1072,9 +1077,16 @@ impl RactorRuntime {
 
         for _ in 0..pool_size {
             let (spawn_ref, _) = ractor::Actor::spawn(
-                None, SpawnManagerActor,
-                (self.node_id.clone(), TypeRegistry::new(), self.next_local.clone()),
-            ).await.expect("failed to spawn SpawnManagerActor");
+                None,
+                SpawnManagerActor,
+                (
+                    self.node_id.clone(),
+                    TypeRegistry::new(),
+                    self.next_local.clone(),
+                ),
+            )
+            .await
+            .expect("failed to spawn SpawnManagerActor");
             spawn_refs.push(spawn_ref);
         }
 
@@ -1085,17 +1097,17 @@ impl RactorRuntime {
         };
 
         // --- Control-plane actors (never pooled) ---
-        let (watch_ref, _) = ractor::Actor::spawn(
-            None, WatchManagerActor, (),
-        ).await.expect("failed to spawn WatchManagerActor");
+        let (watch_ref, _) = ractor::Actor::spawn(None, WatchManagerActor, ())
+            .await
+            .expect("failed to spawn WatchManagerActor");
 
-        let (cancel_ref, _) = ractor::Actor::spawn(
-            None, CancelManagerActor, (),
-        ).await.expect("failed to spawn CancelManagerActor");
+        let (cancel_ref, _) = ractor::Actor::spawn(None, CancelManagerActor, ())
+            .await
+            .expect("failed to spawn CancelManagerActor");
 
-        let (node_dir_ref, _) = ractor::Actor::spawn(
-            None, NodeDirectoryActor, (),
-        ).await.expect("failed to spawn NodeDirectoryActor");
+        let (node_dir_ref, _) = ractor::Actor::spawn(None, NodeDirectoryActor, ())
+            .await
+            .expect("failed to spawn NodeDirectoryActor");
 
         self.system_actors = Some(RactorSystemActorRefs {
             spawn_manager,
@@ -1150,19 +1162,30 @@ impl RactorRuntime {
     }
 
     /// Spawn an actor with `Deps = ()`.
-    pub async fn spawn<A>(&self, name: &str, args: A::Args) -> Result<RactorActorRef<A>, dactor::errors::RuntimeError>
+    pub async fn spawn<A>(
+        &self,
+        name: &str,
+        args: A::Args,
+    ) -> Result<RactorActorRef<A>, dactor::errors::RuntimeError>
     where
         A: Actor<Deps = ()> + 'static,
     {
-        self.spawn_internal::<A>(name, args, (), Vec::new(), MailboxConfig::Unbounded).await
+        self.spawn_internal::<A>(name, args, (), Vec::new(), MailboxConfig::Unbounded)
+            .await
     }
 
     /// Spawn an actor with explicit dependencies.
-    pub async fn spawn_with_deps<A>(&self, name: &str, args: A::Args, deps: A::Deps) -> Result<RactorActorRef<A>, dactor::errors::RuntimeError>
+    pub async fn spawn_with_deps<A>(
+        &self,
+        name: &str,
+        args: A::Args,
+        deps: A::Deps,
+    ) -> Result<RactorActorRef<A>, dactor::errors::RuntimeError>
     where
         A: Actor + 'static,
     {
-        self.spawn_internal::<A>(name, args, deps, Vec::new(), MailboxConfig::Unbounded).await
+        self.spawn_internal::<A>(name, args, deps, Vec::new(), MailboxConfig::Unbounded)
+            .await
     }
 
     /// Spawn an actor with spawn options (including inbound interceptors and mailbox config).
@@ -1175,7 +1198,8 @@ impl RactorRuntime {
     where
         A: Actor<Deps = ()> + 'static,
     {
-        self.spawn_internal::<A>(name, args, (), options.interceptors, options.mailbox).await
+        self.spawn_internal::<A>(name, args, (), options.interceptors, options.mailbox)
+            .await
     }
 
     async fn spawn_internal<A>(
@@ -1212,9 +1236,10 @@ impl RactorRuntime {
             stop_notifier: Some(stop_tx),
         };
 
-        let (actor_ref, _join_handle) = ractor::Actor::spawn(Some(name.to_string()), wrapper, spawn_args)
-            .await
-            .map_err(|e| dactor::errors::RuntimeError::SpawnFailed(e.to_string()))?;
+        let (actor_ref, _join_handle) =
+            ractor::Actor::spawn(Some(name.to_string()), wrapper, spawn_args)
+                .await
+                .map_err(|e| dactor::errors::RuntimeError::SpawnFailed(e.to_string()))?;
 
         // Set up optional bounded mailbox channel
         let bounded_tx = match mailbox {
@@ -1234,7 +1259,10 @@ impl RactorRuntime {
         };
 
         // Store stop receiver for await_stop()
-        self.stop_receivers.lock().unwrap().insert(actor_id.clone(), stop_rx);
+        self.stop_receivers
+            .lock()
+            .unwrap()
+            .insert(actor_id.clone(), stop_rx);
 
         Ok(RactorActorRef {
             id: actor_id,
@@ -1326,26 +1354,23 @@ impl RactorRuntime {
                 SystemActorHandle::Single(r) => {
                     let (tx, _rx) = tokio::sync::oneshot::channel();
                     let f = factory;
-                    let _ = r.cast(
-                        crate::system_actors::SpawnManagerMsg::RegisterFactory {
-                            type_name,
-                            factory: Box::new(move |bytes: &[u8]| f(bytes)),
-                            reply: tx,
-                        },
-                    );
+                    let _ = r.cast(crate::system_actors::SpawnManagerMsg::RegisterFactory {
+                        type_name,
+                        factory: Box::new(move |bytes: &[u8]| f(bytes)),
+                        reply: tx,
+                    });
                 }
                 SystemActorHandle::Pool(pool) => {
                     // Broadcast factory registration to all pool workers
                     for worker in pool.workers() {
                         let f = factory.clone();
                         let (tx, _rx) = tokio::sync::oneshot::channel();
-                        let _ = worker.cast(
-                            crate::system_actors::SpawnManagerMsg::RegisterFactory {
+                        let _ =
+                            worker.cast(crate::system_actors::SpawnManagerMsg::RegisterFactory {
                                 type_name: type_name.clone(),
                                 factory: Box::new(move |bytes: &[u8]| f(bytes)),
                                 reply: tx,
-                            },
-                        );
+                            });
                     }
                 }
             }
@@ -1487,13 +1512,16 @@ impl RactorRuntime {
             // Preserve existing address if new address is None
             let resolved_address = address.or_else(|| existing.address.clone());
             self.node_directory.remove_peer(&peer_id);
-            self.node_directory.add_peer(peer_id.clone(), resolved_address);
+            self.node_directory
+                .add_peer(peer_id.clone(), resolved_address);
         } else {
             self.node_directory.add_peer(peer_id.clone(), address);
         }
-        self.node_directory.set_status(&peer_id, PeerStatus::Connected);
+        self.node_directory
+            .set_status(&peer_id, PeerStatus::Connected);
         if !was_connected {
-            self.cluster_events.emit(dactor::ClusterEvent::NodeJoined(peer_id));
+            self.cluster_events
+                .emit(dactor::ClusterEvent::NodeJoined(peer_id));
         }
     }
 
@@ -1502,9 +1530,11 @@ impl RactorRuntime {
     /// Emits a `ClusterEvent::NodeLeft` if the peer was previously connected.
     pub fn disconnect_peer(&mut self, peer_id: &NodeId) {
         let was_connected = self.node_directory.is_connected(peer_id);
-        self.node_directory.set_status(peer_id, PeerStatus::Disconnected);
+        self.node_directory
+            .set_status(peer_id, PeerStatus::Disconnected);
         if was_connected {
-            self.cluster_events.emit(dactor::ClusterEvent::NodeLeft(peer_id.clone()));
+            self.cluster_events
+                .emit(dactor::ClusterEvent::NodeLeft(peer_id.clone()));
         }
     }
 
@@ -1550,7 +1580,10 @@ impl RactorRuntime {
         };
         let mut first_error = None;
         for (_, rx) in receivers {
-            let result = rx.await.map_err(|e| format!("stop notifier dropped: {e}")).and_then(|r| r);
+            let result = rx
+                .await
+                .map_err(|e| format!("stop notifier dropped: {e}"))
+                .and_then(|r| r);
             if let Err(e) = result {
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -1570,7 +1603,10 @@ impl RactorRuntime {
     pub fn cleanup_finished(&self) {
         let mut receivers = self.stop_receivers.lock().unwrap();
         receivers.retain(|_, rx| {
-            matches!(rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty))
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            )
         });
     }
 
@@ -1709,10 +1745,7 @@ impl dactor::system_router::SystemMessageRouter for RactorRuntime {
                     .map_err(|e| RoutingError::new(format!("decode ConnectPeer: {e}")))?;
 
                 refs.node_directory
-                    .cast(crate::system_actors::NodeDirectoryMsg::ConnectPeer {
-                        peer_id,
-                        address,
-                    })
+                    .cast(crate::system_actors::NodeDirectoryMsg::ConnectPeer { peer_id, address })
                     .map_err(|e| RoutingError::new(format!("NodeDirectory mailbox: {e}")))?;
 
                 Ok(RoutingOutcome::Acknowledged)
@@ -1738,4 +1771,3 @@ impl dactor::system_router::SystemMessageRouter for RactorRuntime {
         }
     }
 }
-
