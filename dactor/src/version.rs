@@ -212,19 +212,40 @@ mod tests {
     #[test]
     fn parse_simple() {
         let v: WireVersion = "1.2.3".parse().unwrap();
-        assert_eq!(v, WireVersion { major: 1, minor: 2, patch: 3 });
+        assert_eq!(
+            v,
+            WireVersion {
+                major: 1,
+                minor: 2,
+                patch: 3
+            }
+        );
     }
 
     #[test]
     fn parse_zero() {
         let v: WireVersion = "0.0.0".parse().unwrap();
-        assert_eq!(v, WireVersion { major: 0, minor: 0, patch: 0 });
+        assert_eq!(
+            v,
+            WireVersion {
+                major: 0,
+                minor: 0,
+                patch: 0
+            }
+        );
     }
 
     #[test]
     fn parse_large_numbers() {
         let v: WireVersion = "100.200.300".parse().unwrap();
-        assert_eq!(v, WireVersion { major: 100, minor: 200, patch: 300 });
+        assert_eq!(
+            v,
+            WireVersion {
+                major: 100,
+                minor: 200,
+                patch: 300
+            }
+        );
     }
 
     // -- Parsing invalid versions -------------------------------------------
@@ -297,7 +318,11 @@ mod tests {
 
     #[test]
     fn compatible_same_version() {
-        let v = WireVersion { major: 0, minor: 2, patch: 0 };
+        let v = WireVersion {
+            major: 0,
+            minor: 2,
+            patch: 0,
+        };
         assert!(v.is_compatible(&v));
     }
 
@@ -349,12 +374,10 @@ mod tests {
 
     #[test]
     fn ordering_chain() {
-        let versions: Vec<WireVersion> = vec![
-            "0.2.0", "0.2.1", "0.3.0", "1.0.0",
-        ]
-        .into_iter()
-        .map(|s| s.parse().unwrap())
-        .collect();
+        let versions: Vec<WireVersion> = vec!["0.2.0", "0.2.1", "0.3.0", "1.0.0"]
+            .into_iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
 
         for i in 0..versions.len() - 1 {
             assert!(versions[i] < versions[i + 1]);

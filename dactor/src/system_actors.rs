@@ -504,10 +504,8 @@ impl HandshakeRequest {
     ) -> Self {
         Self {
             node_id,
-            wire_version: crate::version::WireVersion::parse(
-                crate::version::DACTOR_WIRE_VERSION,
-            )
-            .expect("DACTOR_WIRE_VERSION must be valid"),
+            wire_version: crate::version::WireVersion::parse(crate::version::DACTOR_WIRE_VERSION)
+                .expect("DACTOR_WIRE_VERSION must be valid"),
             app_version,
             adapter: adapter.into(),
         }
@@ -622,10 +620,7 @@ pub fn validate_handshake(
 ///
 /// This prevents connecting to the wrong peer when a misconfigured or
 /// spoofed node responds with a different identity.
-pub fn verify_peer_identity(
-    expected: &NodeId,
-    response: &HandshakeResponse,
-) -> Result<(), String> {
+pub fn verify_peer_identity(expected: &NodeId, response: &HandshakeResponse) -> Result<(), String> {
     match response {
         HandshakeResponse::Accepted { node_id, .. } => {
             if node_id != expected {
@@ -1045,33 +1040,27 @@ mod tests {
     #[test]
     fn wire_protocol_constants_are_stable() {
         assert_eq!(
-            SYSTEM_MSG_TYPE_SPAWN,
-            "dactor::system_actors::SpawnRequest",
+            SYSTEM_MSG_TYPE_SPAWN, "dactor::system_actors::SpawnRequest",
             "SYSTEM_MSG_TYPE_SPAWN is a wire protocol value — do not change"
         );
         assert_eq!(
-            SYSTEM_MSG_TYPE_WATCH,
-            "dactor::system_actors::WatchRequest",
+            SYSTEM_MSG_TYPE_WATCH, "dactor::system_actors::WatchRequest",
             "SYSTEM_MSG_TYPE_WATCH is a wire protocol value — do not change"
         );
         assert_eq!(
-            SYSTEM_MSG_TYPE_UNWATCH,
-            "dactor::system_actors::UnwatchRequest",
+            SYSTEM_MSG_TYPE_UNWATCH, "dactor::system_actors::UnwatchRequest",
             "SYSTEM_MSG_TYPE_UNWATCH is a wire protocol value — do not change"
         );
         assert_eq!(
-            SYSTEM_MSG_TYPE_CANCEL,
-            "dactor::system_actors::CancelRequest",
+            SYSTEM_MSG_TYPE_CANCEL, "dactor::system_actors::CancelRequest",
             "SYSTEM_MSG_TYPE_CANCEL is a wire protocol value — do not change"
         );
         assert_eq!(
-            SYSTEM_MSG_TYPE_CONNECT_PEER,
-            "dactor::system_actors::ConnectPeer",
+            SYSTEM_MSG_TYPE_CONNECT_PEER, "dactor::system_actors::ConnectPeer",
             "SYSTEM_MSG_TYPE_CONNECT_PEER is a wire protocol value — do not change"
         );
         assert_eq!(
-            SYSTEM_MSG_TYPE_DISCONNECT_PEER,
-            "dactor::system_actors::DisconnectPeer",
+            SYSTEM_MSG_TYPE_DISCONNECT_PEER, "dactor::system_actors::DisconnectPeer",
             "SYSTEM_MSG_TYPE_DISCONNECT_PEER is a wire protocol value — do not change"
         );
     }

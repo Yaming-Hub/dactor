@@ -245,8 +245,9 @@ impl<'a> std::fmt::Debug for Outcome<'a> {
 /// }
 /// ```
 pub type HandlerWrapper<'a> = Box<
-    dyn FnOnce(Pin<Box<dyn Future<Output = ()> + Send + 'a>>)
-            -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+    dyn FnOnce(
+            Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
         + Send
         + 'a,
 >;

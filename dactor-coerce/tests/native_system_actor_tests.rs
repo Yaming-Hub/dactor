@@ -207,11 +207,7 @@ async fn cp5_watch_manager_unwatch() {
     let count = refs.watch_manager.send(GetWatchedCount).await.unwrap();
     assert_eq!(count, 0);
 
-    let notifications = refs
-        .watch_manager
-        .send(OnTerminated(target))
-        .await
-        .unwrap();
+    let notifications = refs.watch_manager.send(OnTerminated(target)).await.unwrap();
     assert_eq!(notifications.len(), 0);
 }
 

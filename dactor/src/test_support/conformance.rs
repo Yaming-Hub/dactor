@@ -12,13 +12,13 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::{
-    Actor, ActorContext, ActorError, ActorRef, ReduceHandler, Handler, ExpandHandler,
+    Actor, ActorContext, ActorError, ActorRef, ExpandHandler, Handler, ReduceHandler,
     TransformHandler,
 };
-use std::future::Future;
 use crate::errors::{ActorSendError, ErrorAction, RuntimeError};
 use crate::message::Message;
 use crate::stream::{BatchConfig, BoxStream, StreamReceiver, StreamSender};
+use std::future::Future;
 
 // ══════════════════════════════════════════════════════
 // Test Actor Definitions
@@ -918,4 +918,3 @@ where
         "transform with None batch: expected doubled values"
     );
 }
-

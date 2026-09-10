@@ -3,7 +3,7 @@
 //! Run with: cargo run --example streaming --features test-support
 
 use async_trait::async_trait;
-use dactor::actor::{Actor, ActorContext, ActorRef, ReduceHandler, ExpandHandler};
+use dactor::actor::{Actor, ActorContext, ActorRef, ExpandHandler, ReduceHandler};
 use dactor::message::Message;
 use dactor::stream::{StreamReceiver, StreamSender};
 use dactor::TestRuntime;
@@ -93,14 +93,17 @@ async fn main() {
 
     // --- Server-streaming (stream) ---
     println!("--- Server-streaming: LogServer ---");
-    let server = runtime.spawn::<LogServer>(
-        "log-server",
-        vec![
-            "2025-01-01 INFO  boot".into(),
-            "2025-01-01 WARN  slow query".into(),
-            "2025-01-01 ERROR disk full".into(),
-        ],
-    ).await.unwrap();
+    let server = runtime
+        .spawn::<LogServer>(
+            "log-server",
+            vec![
+                "2025-01-01 INFO  boot".into(),
+                "2025-01-01 WARN  slow query".into(),
+                "2025-01-01 ERROR disk full".into(),
+            ],
+        )
+        .await
+        .unwrap();
 
     let mut stream = server.expand(GetLogs, 16, None, None).unwrap();
     while let Some(entry) = stream.next().await {
@@ -122,4 +125,3 @@ async fn main() {
 
     println!("=== Done ===");
 }
-

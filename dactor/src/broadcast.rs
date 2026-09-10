@@ -280,7 +280,11 @@ impl<A: Actor, R: ActorRef<A>> BroadcastRef<A, R> {
                                 Ok(Err(RuntimeError::Send(error))) => {
                                     if let Some(ref handler) = dl {
                                         emit_dead_letter::<M>(
-                                            handler, &id, &name, &error, SendMode::Ask,
+                                            handler,
+                                            &id,
+                                            &name,
+                                            &error,
+                                            SendMode::Ask,
                                         );
                                     }
                                     BroadcastReceipt::SendError {
@@ -302,9 +306,7 @@ impl<A: Actor, R: ActorRef<A>> BroadcastRef<A, R> {
                         }
                         Err(e) => {
                             if let Some(ref handler) = dl {
-                                emit_dead_letter::<M>(
-                                    handler, &id, &name, &e, SendMode::Ask,
-                                );
+                                emit_dead_letter::<M>(handler, &id, &name, &e, SendMode::Ask);
                             }
                             BroadcastReceipt::SendError {
                                 actor_id: id,
@@ -661,9 +663,7 @@ mod tests {
         let group = BroadcastRef::new(vec![fast_ref, slow_ref]);
 
         // 100ms timeout: fast actor should succeed, slow actor should time out
-        let receipts = group
-            .ask(SleepByValue, Duration::from_millis(100))
-            .await;
+        let receipts = group.ask(SleepByValue, Duration::from_millis(100)).await;
 
         assert_eq!(receipts.len(), 2);
 
@@ -671,7 +671,9 @@ mod tests {
         let mut timeout_ids = Vec::new();
         for r in &receipts {
             match r {
-                BroadcastReceipt::Ok { actor_id, reply, .. } => {
+                BroadcastReceipt::Ok {
+                    actor_id, reply, ..
+                } => {
                     assert_eq!(*reply, 10);
                     ok_ids.push(actor_id.clone());
                 }
@@ -779,7 +781,10 @@ mod tests {
             }
         }
         assert!(has_ok, "live actor should reply");
-        assert!(has_send_err, "stopped actor should yield SendError or ReplyError");
+        assert!(
+            has_send_err,
+            "stopped actor should yield SendError or ReplyError"
+        );
     }
 
     // -- BC6: PoolRef::to_broadcast() ---------------------------------------
@@ -841,7 +846,10 @@ mod tests {
             "dead letter from tell should have SendMode::Tell"
         );
         assert!(
-            matches!(events[0].reason, crate::dead_letter::DeadLetterReason::ActorStopped),
+            matches!(
+                events[0].reason,
+                crate::dead_letter::DeadLetterReason::ActorStopped
+            ),
             "stopped actor should produce ActorStopped reason"
         );
         assert!(

@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{Actor, ActorRef, AskReply, ReduceHandler, Handler, ExpandHandler, TransformHandler};
+use crate::actor::{
+    Actor, ActorRef, AskReply, ExpandHandler, Handler, ReduceHandler, TransformHandler,
+};
 use crate::errors::ActorSendError;
 use crate::message::Message;
 #[cfg(feature = "metrics")]
@@ -376,7 +378,8 @@ impl<A: Actor, R: ActorRef<A>> ActorRef<A> for PoolRef<A, R> {
         InputItem: Send + 'static,
         OutputItem: Send + 'static,
     {
-        self.select_worker().transform(input, buffer, batch_config, cancel)
+        self.select_worker()
+            .transform(input, buffer, batch_config, cancel)
     }
 }
 
@@ -401,7 +404,10 @@ impl crate::test_support::test_runtime::TestRuntime {
         pool_size: usize,
         routing: PoolRouting,
         args: A::Args,
-    ) -> Result<PoolRef<A, crate::test_support::test_runtime::TestActorRef<A>>, crate::errors::RuntimeError>
+    ) -> Result<
+        PoolRef<A, crate::test_support::test_runtime::TestActorRef<A>>,
+        crate::errors::RuntimeError,
+    >
     where
         A: Actor<Deps = ()> + 'static,
         A::Args: Clone,
@@ -512,7 +518,10 @@ mod tests {
         for i in 0..size {
             let ctr = Arc::new(AtomicU64::new(0));
             counters.push(ctr.clone());
-            let r = rt.spawn::<PoolWorker>(&format!("w-{}", i), (i as u64, ctr)).await.unwrap();
+            let r = rt
+                .spawn::<PoolWorker>(&format!("w-{}", i), (i as u64, ctr))
+                .await
+                .unwrap();
             workers.push(r);
         }
         (PoolRef::new(workers, routing), counters)
@@ -636,7 +645,10 @@ mod tests {
     async fn spawn_pool_helper() {
         let rt = TestRuntime::new();
         let ctr = Arc::new(AtomicU64::new(0));
-        let pool = rt.spawn_pool::<PoolWorker>("sp", 3, PoolRouting::RoundRobin, (0, ctr.clone())).await.unwrap();
+        let pool = rt
+            .spawn_pool::<PoolWorker>("sp", 3, PoolRouting::RoundRobin, (0, ctr.clone()))
+            .await
+            .unwrap();
 
         assert_eq!(pool.pool_size(), 3);
 
@@ -770,11 +782,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Check that pending_messages is visible
-        let loads: Vec<usize> = pool
-            .workers
-            .iter()
-            .map(|w| w.pending_messages())
-            .collect();
+        let loads: Vec<usize> = pool.workers.iter().map(|w| w.pending_messages()).collect();
         let total_pending: usize = loads.iter().sum();
         assert!(
             total_pending > 0,

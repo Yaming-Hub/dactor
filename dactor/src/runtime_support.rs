@@ -9,14 +9,14 @@ use std::sync::Arc;
 use futures::{FutureExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::errors::ActorSendError;
 use crate::interceptor::{
     intercept_outbound_stream_item, notify_drop, Disposition, DropNotice, DropObserver,
     InterceptResult, OutboundContext, OutboundInterceptor, Outcome, SendMode,
 };
+use crate::mailbox::OverflowStrategy;
 use crate::message::{Headers, RuntimeHeaders};
 use crate::node::ActorId;
-use crate::errors::ActorSendError;
-use crate::mailbox::OverflowStrategy;
 use crate::stream::{BatchConfig, BatchReader, BatchWriter, BoxStream};
 
 // ---------------------------------------------------------------------------
@@ -56,9 +56,7 @@ impl<T: Send + 'static> BoundedMailboxSender<T> {
         match self.tx.try_send(msg) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => match self.overflow {
-                OverflowStrategy::RejectWithError => {
-                    Err(ActorSendError("mailbox full".into()))
-                }
+                OverflowStrategy::RejectWithError => Err(ActorSendError("mailbox full".into())),
                 OverflowStrategy::DropNewest => Ok(()),
                 OverflowStrategy::Block => Err(ActorSendError(
                     "mailbox full (Block not supported in sync tell)".into(),

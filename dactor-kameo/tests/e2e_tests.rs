@@ -163,10 +163,7 @@ async fn t5_kameo_stop_notification() {
     assert_eq!(count, 0);
 
     // Stop the target actor
-    let stop_resp = cluster
-        .stop_actor("watch-node", "target")
-        .await
-        .unwrap();
+    let stop_resp = cluster.stop_actor("watch-node", "target").await.unwrap();
     assert!(stop_resp.success, "stop failed: {}", stop_resp.error);
 
     // Verify we get the actor_stopped event
@@ -184,10 +181,7 @@ async fn t5_kameo_stop_notification() {
         .ask_actor("watch-node", "target", "get_count", b"")
         .await
         .unwrap();
-    assert!(
-        !ask_resp.success,
-        "actor should be gone after stop"
-    );
+    assert!(!ask_resp.success, "actor should be gone after stop");
 
     // Verify actor count dropped
     let info = cluster.get_node_info("watch-node").await.unwrap();
@@ -245,10 +239,7 @@ async fn e2e_partition_heal_recovery() {
         .tell_actor("partition-node", "resilient", "increment", b"5")
         .await
         .unwrap();
-    assert!(
-        !tell_resp.success,
-        "tell should fail during partition"
-    );
+    assert!(!tell_resp.success, "tell should fail during partition");
     assert!(
         tell_resp.error.contains("partition"),
         "error should mention partition"
@@ -375,10 +366,7 @@ async fn e2e_tell_stopped_actor() {
         .tell_actor("tell-stop-node", "stopped-tell", "increment", b"1")
         .await
         .unwrap();
-    assert!(
-        !tell_resp.success,
-        "tell to stopped actor should fail"
-    );
+    assert!(!tell_resp.success, "tell to stopped actor should fail");
 
     cluster.shutdown().await;
 }
@@ -427,10 +415,7 @@ async fn e2e_ask_stopped_actor() {
         .ask_actor("ask-stop-node", "stopped-ask", "get_count", b"")
         .await
         .unwrap();
-    assert!(
-        !ask_resp.success,
-        "ask to stopped actor should fail"
-    );
+    assert!(!ask_resp.success, "ask to stopped actor should fail");
 
     cluster.shutdown().await;
 }
@@ -456,10 +441,7 @@ async fn e2e_tell_unknown_actor() {
         .tell_actor("unknown-node", "nonexistent-actor", "increment", b"1")
         .await
         .unwrap();
-    assert!(
-        !tell_resp.success,
-        "tell to unknown actor should fail"
-    );
+    assert!(!tell_resp.success, "tell to unknown actor should fail");
     assert!(
         tell_resp.error.to_lowercase().contains("not found"),
         "error should mention 'not found', got: {}",
@@ -545,10 +527,7 @@ async fn e2e_graceful_shutdown() {
 
     // Ping should fail after shutdown
     let ping_resp = cluster.ping("shutdown-node", "hello").await;
-    assert!(
-        ping_resp.is_err(),
-        "ping should fail after node shutdown"
-    );
+    assert!(ping_resp.is_err(), "ping should fail after node shutdown");
 
     cluster.shutdown().await;
 }
@@ -834,10 +813,7 @@ async fn e2e_multi_actor_interaction() {
     assert!(found, "actor-c should reach count 230, got {}", count);
 
     // Stop one actor, verify others still work
-    let stop = cluster
-        .stop_actor("multi-node", "actor-b")
-        .await
-        .unwrap();
+    let stop = cluster.stop_actor("multi-node", "actor-b").await.unwrap();
     assert!(stop.success, "stop actor-b failed: {}", stop.error);
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -847,13 +823,19 @@ async fn e2e_multi_actor_interaction() {
         .ask_actor("multi-node", "actor-a", "get_count", b"")
         .await
         .unwrap();
-    assert!(ask.success, "actor-a should still work after actor-b stopped");
+    assert!(
+        ask.success,
+        "actor-a should still work after actor-b stopped"
+    );
 
     let ask = cluster
         .ask_actor("multi-node", "actor-c", "get_count", b"")
         .await
         .unwrap();
-    assert!(ask.success, "actor-c should still work after actor-b stopped");
+    assert!(
+        ask.success,
+        "actor-c should still work after actor-b stopped"
+    );
 
     // actor-b should be gone
     let ask = cluster
@@ -1106,7 +1088,12 @@ async fn e2e_inter_actor_forwarding() {
     // Tell "source" to forward_increment {target: "target", amount: 7}
     let payload = serde_json::json!({"target": "target", "amount": 7}).to_string();
     let tell = cluster
-        .tell_actor("fwd-node", "source", "forward_increment", payload.as_bytes())
+        .tell_actor(
+            "fwd-node",
+            "source",
+            "forward_increment",
+            payload.as_bytes(),
+        )
         .await
         .unwrap();
     assert!(tell.success, "forward_increment failed: {}", tell.error);
@@ -1195,17 +1182,26 @@ async fn e2e_chained_forwarding() {
     }
 
     // Verify all counts: a=0, b=3, c=5
-    let ask = cluster.ask_actor("chain-node", "a", "get_count", b"").await.unwrap();
+    let ask = cluster
+        .ask_actor("chain-node", "a", "get_count", b"")
+        .await
+        .unwrap();
     assert!(ask.success);
     let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
     assert_eq!(count, 0, "a should be 0");
 
-    let ask = cluster.ask_actor("chain-node", "b", "get_count", b"").await.unwrap();
+    let ask = cluster
+        .ask_actor("chain-node", "b", "get_count", b"")
+        .await
+        .unwrap();
     assert!(ask.success);
     let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
     assert_eq!(count, 3, "b should be 3");
 
-    let ask = cluster.ask_actor("chain-node", "c", "get_count", b"").await.unwrap();
+    let ask = cluster
+        .ask_actor("chain-node", "c", "get_count", b"")
+        .await
+        .unwrap();
     assert!(ask.success);
     let count: i64 = serde_json::from_slice(&ask.payload).unwrap();
     assert_eq!(count, 5, "c should be 5");
@@ -1277,7 +1273,10 @@ async fn e2e_actor_state_snapshot() {
         .unwrap();
     assert!(ask.success, "get_state failed: {}", ask.error);
     let state: serde_json::Value = serde_json::from_slice(&ask.payload).unwrap();
-    assert_eq!(state["count"], 5, "count should be 5 after 2 more increments");
+    assert_eq!(
+        state["count"], 5,
+        "count should be 5 after 2 more increments"
+    );
     assert_eq!(state["name"], "snap1", "name should still be snap1");
 
     cluster.shutdown().await;

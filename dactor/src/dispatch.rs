@@ -9,7 +9,7 @@ use std::any::Any;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::actor::{Actor, ActorContext, ReduceHandler, Handler, ExpandHandler, TransformHandler};
+use crate::actor::{Actor, ActorContext, ExpandHandler, Handler, ReduceHandler, TransformHandler};
 use crate::errors::RuntimeError;
 use crate::interceptor::{Disposition, SendMode};
 use crate::message::Message;

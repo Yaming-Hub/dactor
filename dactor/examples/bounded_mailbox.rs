@@ -50,17 +50,20 @@ async fn main() {
 
     // --- RejectWithError strategy ---
     println!("--- Bounded(5) + RejectWithError ---");
-    let reject_actor = runtime.spawn_with_options::<SlowActor>(
-        "reject-actor",
-        (),
-        SpawnOptions {
-            mailbox: MailboxConfig::Bounded {
-                capacity: 5,
-                overflow: OverflowStrategy::RejectWithError,
+    let reject_actor = runtime
+        .spawn_with_options::<SlowActor>(
+            "reject-actor",
+            (),
+            SpawnOptions {
+                mailbox: MailboxConfig::Bounded {
+                    capacity: 5,
+                    overflow: OverflowStrategy::RejectWithError,
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        },
-    ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     // The first message starts processing (occupies the actor task).
     reject_actor.tell(SlowMsg(0)).unwrap();
@@ -85,17 +88,20 @@ async fn main() {
 
     // --- DropNewest strategy ---
     println!("--- Bounded(5) + DropNewest ---");
-    let drop_actor = runtime.spawn_with_options::<SlowActor>(
-        "drop-actor",
-        (),
-        SpawnOptions {
-            mailbox: MailboxConfig::Bounded {
-                capacity: 5,
-                overflow: OverflowStrategy::DropNewest,
+    let drop_actor = runtime
+        .spawn_with_options::<SlowActor>(
+            "drop-actor",
+            (),
+            SpawnOptions {
+                mailbox: MailboxConfig::Bounded {
+                    capacity: 5,
+                    overflow: OverflowStrategy::DropNewest,
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        },
-    ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     // First message starts processing.
     drop_actor.tell(SlowMsg(0)).unwrap();

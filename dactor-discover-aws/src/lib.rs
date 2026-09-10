@@ -98,11 +98,9 @@ impl AutoScalingDiscovery {
             ));
         }
 
-        let mut config_loader =
-            aws_config::defaults(aws_config::BehaviorVersion::latest());
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(region) = &self.config.region {
-            config_loader =
-                config_loader.region(aws_config::Region::new(region.clone()));
+            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
         }
         let sdk_config = config_loader.load().await;
 
@@ -168,7 +166,12 @@ impl ClusterDiscovery for AutoScalingDiscovery {
     async fn discover(&self) -> Result<Vec<dactor::DiscoveredPeer>, DiscoveryError> {
         self.discover_async()
             .await
-            .map(|addrs| addrs.into_iter().map(dactor::DiscoveredPeer::from_address).collect())
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .map(dactor::DiscoveredPeer::from_address)
+                    .collect()
+            })
             .map_err(|e| DiscoveryError::new(e.to_string()))
     }
 }
@@ -279,11 +282,9 @@ impl Ec2TagDiscovery {
             ));
         }
 
-        let mut config_loader =
-            aws_config::defaults(aws_config::BehaviorVersion::latest());
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(region) = &self.config.region {
-            config_loader =
-                config_loader.region(aws_config::Region::new(region.clone()));
+            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
         }
         let sdk_config = config_loader.load().await;
 
@@ -334,7 +335,12 @@ impl ClusterDiscovery for Ec2TagDiscovery {
     async fn discover(&self) -> Result<Vec<dactor::DiscoveredPeer>, DiscoveryError> {
         self.discover_async()
             .await
-            .map(|addrs| addrs.into_iter().map(dactor::DiscoveredPeer::from_address).collect())
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .map(dactor::DiscoveredPeer::from_address)
+                    .collect()
+            })
             .map_err(|e| DiscoveryError::new(e.to_string()))
     }
 }
@@ -437,9 +443,7 @@ mod tests {
 
     #[test]
     fn asg_builder_default_values() {
-        let discovery = AutoScalingDiscovery::builder()
-            .asg_name("test-asg")
-            .build();
+        let discovery = AutoScalingDiscovery::builder().asg_name("test-asg").build();
 
         assert_eq!(discovery.config().asg_name, "test-asg");
         assert_eq!(discovery.config().port, 9000);

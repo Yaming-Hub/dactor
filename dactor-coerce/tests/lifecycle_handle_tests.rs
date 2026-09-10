@@ -10,11 +10,15 @@ struct SlowActor;
 impl Actor for SlowActor {
     type Args = ();
     type Deps = ();
-    fn create(_: (), _: ()) -> Self { SlowActor }
+    fn create(_: (), _: ()) -> Self {
+        SlowActor
+    }
 }
 
 struct Stop;
-impl Message for Stop { type Reply = (); }
+impl Message for Stop {
+    type Reply = ();
+}
 
 #[async_trait::async_trait]
 impl Handler<Stop> for SlowActor {
@@ -24,10 +28,16 @@ impl Handler<Stop> for SlowActor {
 #[tokio::test]
 async fn jh1_join_handle_stored_on_spawn() {
     let runtime = CoerceRuntime::new();
-    let _actor = runtime.spawn::<SlowActor>("lh-stored-a1", ()).await.unwrap();
+    let _actor = runtime
+        .spawn::<SlowActor>("lh-stored-a1", ())
+        .await
+        .unwrap();
     assert_eq!(runtime.active_handle_count(), 1);
 
-    let _actor2 = runtime.spawn::<SlowActor>("lh-stored-a2", ()).await.unwrap();
+    let _actor2 = runtime
+        .spawn::<SlowActor>("lh-stored-a2", ())
+        .await
+        .unwrap();
     assert_eq!(runtime.active_handle_count(), 2);
 }
 
@@ -96,7 +106,9 @@ struct PanickingActor;
 impl Actor for PanickingActor {
     type Args = ();
     type Deps = ();
-    fn create(_: (), _: ()) -> Self { PanickingActor }
+    fn create(_: (), _: ()) -> Self {
+        PanickingActor
+    }
 
     async fn on_stop(&mut self) {
         panic!("intentional on_stop panic");
@@ -111,7 +123,10 @@ impl Handler<Stop> for PanickingActor {
 #[tokio::test]
 async fn jh4_panic_propagated_through_await_stop() {
     let runtime = CoerceRuntime::new();
-    let actor = runtime.spawn::<PanickingActor>("panic-actor", ()).await.unwrap();
+    let actor = runtime
+        .spawn::<PanickingActor>("panic-actor", ())
+        .await
+        .unwrap();
     let actor_id = actor.id();
 
     actor.stop();

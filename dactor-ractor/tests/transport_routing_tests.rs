@@ -37,15 +37,17 @@ async fn setup_runtime() -> RactorRuntime {
     let refs = runtime.system_actor_refs().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     refs.spawn_manager
-        .cast(dactor_ractor::system_actors::SpawnManagerMsg::RegisterFactory {
-            type_name: "test::Widget".into(),
-            factory: Box::new(|bytes: &[u8]| {
-                let val: i32 = serde_json::from_slice(bytes)
-                    .map_err(|e| SerializationError::new(e.to_string()))?;
-                Ok(Box::new(val))
-            }),
-            reply: tx,
-        })
+        .cast(
+            dactor_ractor::system_actors::SpawnManagerMsg::RegisterFactory {
+                type_name: "test::Widget".into(),
+                factory: Box::new(|bytes: &[u8]| {
+                    let val: i32 = serde_json::from_slice(bytes)
+                        .map_err(|e| SerializationError::new(e.to_string()))?;
+                    Ok(Box::new(val))
+                }),
+                reply: tx,
+            },
+        )
         .expect("register factory");
     rx.await.expect("factory registered");
 
@@ -75,7 +77,10 @@ async fn na10_route_spawn_request_success() {
         .expect("routing should succeed");
 
     match outcome {
-        RoutingOutcome::SpawnCompleted { request_id, actor_id } => {
+        RoutingOutcome::SpawnCompleted {
+            request_id,
+            actor_id,
+        } => {
             assert_eq!(request_id, "req-1");
             assert_eq!(actor_id.node, NodeId("test-node".into()));
         }
@@ -165,9 +170,7 @@ async fn na10_route_unwatch_request() {
         watcher: watcher.clone(),
     });
     runtime
-        .route_system_envelope(
-            make_envelope(SYSTEM_MSG_TYPE_WATCH, watch_body),
-        )
+        .route_system_envelope(make_envelope(SYSTEM_MSG_TYPE_WATCH, watch_body))
         .await
         .unwrap();
 
@@ -176,9 +179,7 @@ async fn na10_route_unwatch_request() {
         watcher: watcher.clone(),
     });
     let outcome = runtime
-        .route_system_envelope(
-            make_envelope(SYSTEM_MSG_TYPE_UNWATCH, unwatch_body),
-        )
+        .route_system_envelope(make_envelope(SYSTEM_MSG_TYPE_UNWATCH, unwatch_body))
         .await
         .unwrap();
 
@@ -270,7 +271,8 @@ async fn na10_route_connect_disconnect_peer() {
     let runtime = setup_runtime().await;
 
     // Connect peer
-    let body = dactor::proto::encode_connect_peer(&NodeId("peer-node-1".into()), Some("10.0.0.1:4697"));
+    let body =
+        dactor::proto::encode_connect_peer(&NodeId("peer-node-1".into()), Some("10.0.0.1:4697"));
     let envelope = make_envelope(SYSTEM_MSG_TYPE_CONNECT_PEER, body);
 
     let outcome = runtime
@@ -283,10 +285,12 @@ async fn na10_route_connect_disconnect_peer() {
     let refs = runtime.system_actor_refs().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     refs.node_directory
-        .cast(dactor_ractor::system_actors::NodeDirectoryMsg::IsConnected {
-            peer_id: NodeId("peer-node-1".into()),
-            reply: tx,
-        })
+        .cast(
+            dactor_ractor::system_actors::NodeDirectoryMsg::IsConnected {
+                peer_id: NodeId("peer-node-1".into()),
+                reply: tx,
+            },
+        )
         .unwrap();
     let connected = rx.await.unwrap();
     assert!(connected);
@@ -303,10 +307,12 @@ async fn na10_route_connect_disconnect_peer() {
     // Verify peer was disconnected
     let (tx, rx) = tokio::sync::oneshot::channel();
     refs.node_directory
-        .cast(dactor_ractor::system_actors::NodeDirectoryMsg::IsConnected {
-            peer_id: NodeId("peer-node-1".into()),
-            reply: tx,
-        })
+        .cast(
+            dactor_ractor::system_actors::NodeDirectoryMsg::IsConnected {
+                peer_id: NodeId("peer-node-1".into()),
+                reply: tx,
+            },
+        )
         .unwrap();
     let connected = rx.await.unwrap();
     assert!(!connected);
@@ -324,7 +330,10 @@ async fn na10_route_unknown_message_type_rejected() {
 
     let result = runtime.route_system_envelope(envelope).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().message.contains("unknown system message type"));
+    assert!(result
+        .unwrap_err()
+        .message
+        .contains("unknown system message type"));
 }
 
 #[tokio::test]
@@ -371,5 +380,8 @@ async fn na10_route_without_system_actors_fails() {
 
     let result = runtime.route_system_envelope(envelope).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().message.contains("system actors not started"));
+    assert!(result
+        .unwrap_err()
+        .message
+        .contains("system actors not started"));
 }

@@ -24,10 +24,17 @@ async fn na1_spawn_manager_actor_handles_request() {
     });
 
     let node_id = NodeId("na-node".into());
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, SpawnManagerActor, (node_id.clone(), registry, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1))))
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(
+        None,
+        SpawnManagerActor,
+        (
+            node_id.clone(),
+            registry,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        ),
+    )
+    .await
+    .expect("spawn failed");
 
     let request = SpawnRequest {
         type_name: "test::Counter".into(),
@@ -38,10 +45,7 @@ async fn na1_spawn_manager_actor_handles_request() {
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     actor_ref
-        .cast(SpawnManagerMsg::HandleRequest {
-            request,
-            reply: tx,
-        })
+        .cast(SpawnManagerMsg::HandleRequest { request, reply: tx })
         .expect("send failed");
 
     let result = rx.await.expect("reply dropped");
@@ -66,10 +70,17 @@ async fn na1_spawn_manager_actor_handles_request() {
 async fn na1_spawn_manager_actor_unknown_type() {
     let registry = TypeRegistry::new();
     let node_id = NodeId("na-node".into());
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, SpawnManagerActor, (node_id, registry, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1))))
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(
+        None,
+        SpawnManagerActor,
+        (
+            node_id,
+            registry,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        ),
+    )
+    .await
+    .expect("spawn failed");
 
     let request = SpawnRequest {
         type_name: "nonexistent::Actor".into(),
@@ -80,10 +91,7 @@ async fn na1_spawn_manager_actor_unknown_type() {
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     actor_ref
-        .cast(SpawnManagerMsg::HandleRequest {
-            request,
-            reply: tx,
-        })
+        .cast(SpawnManagerMsg::HandleRequest { request, reply: tx })
         .expect("send failed");
 
     let result = rx.await.expect("reply dropped");
@@ -101,10 +109,17 @@ async fn na1_spawn_manager_actor_unknown_type() {
 async fn na1_spawn_manager_actor_register_factory() {
     let registry = TypeRegistry::new();
     let node_id = NodeId("na-node".into());
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, SpawnManagerActor, (node_id, registry, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1))))
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(
+        None,
+        SpawnManagerActor,
+        (
+            node_id,
+            registry,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        ),
+    )
+    .await
+    .expect("spawn failed");
 
     // Register factory via message — await reply for synchronization
     let (reg_tx, reg_rx) = tokio::sync::oneshot::channel();
@@ -128,10 +143,7 @@ async fn na1_spawn_manager_actor_register_factory() {
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     actor_ref
-        .cast(SpawnManagerMsg::HandleRequest {
-            request,
-            reply: tx,
-        })
+        .cast(SpawnManagerMsg::HandleRequest { request, reply: tx })
         .expect("send failed");
 
     let result = rx.await.expect("reply dropped");
@@ -146,13 +158,18 @@ async fn na1_spawn_manager_actor_register_factory() {
 
 #[tokio::test]
 async fn na2_watch_manager_actor_watch_and_notify() {
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, WatchManagerActor, ())
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(None, WatchManagerActor, ())
+        .await
+        .expect("spawn failed");
 
-    let target = ActorId { node: NodeId("n1".into()), local: 1 };
-    let watcher = ActorId { node: NodeId("n2".into()), local: 10 };
+    let target = ActorId {
+        node: NodeId("n1".into()),
+        local: 1,
+    };
+    let watcher = ActorId {
+        node: NodeId("n2".into()),
+        local: 10,
+    };
 
     // Watch
     actor_ref
@@ -197,13 +214,18 @@ async fn na2_watch_manager_actor_watch_and_notify() {
 
 #[tokio::test]
 async fn na2_watch_manager_actor_unwatch() {
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, WatchManagerActor, ())
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(None, WatchManagerActor, ())
+        .await
+        .expect("spawn failed");
 
-    let target = ActorId { node: NodeId("n1".into()), local: 1 };
-    let watcher = ActorId { node: NodeId("n2".into()), local: 10 };
+    let target = ActorId {
+        node: NodeId("n1".into()),
+        local: 1,
+    };
+    let watcher = ActorId {
+        node: NodeId("n2".into()),
+        local: 10,
+    };
 
     actor_ref
         .cast(WatchManagerMsg::Watch {
@@ -238,10 +260,9 @@ async fn na2_watch_manager_actor_unwatch() {
 
 #[tokio::test]
 async fn na3_cancel_manager_actor_register_and_cancel() {
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, CancelManagerActor, ())
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(None, CancelManagerActor, ())
+        .await
+        .expect("spawn failed");
 
     let token = CancellationToken::new();
     let token_clone = token.clone();
@@ -286,10 +307,9 @@ async fn na3_cancel_manager_actor_register_and_cancel() {
 
 #[tokio::test]
 async fn na3_cancel_manager_actor_complete_cleanup() {
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, CancelManagerActor, ())
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(None, CancelManagerActor, ())
+        .await
+        .expect("spawn failed");
 
     actor_ref
         .cast(CancelManagerMsg::Register {
@@ -323,10 +343,9 @@ async fn na3_cancel_manager_actor_complete_cleanup() {
 
 #[tokio::test]
 async fn na4_node_directory_actor_connect_disconnect() {
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, NodeDirectoryActor, ())
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(None, NodeDirectoryActor, ())
+        .await
+        .expect("spawn failed");
 
     let peer = NodeId("peer-1".into());
 
@@ -379,10 +398,9 @@ async fn na4_node_directory_actor_connect_disconnect() {
 
 #[tokio::test]
 async fn na4_node_directory_actor_reconnect_preserves_address() {
-    let (actor_ref, _handle) =
-        ractor::Actor::spawn(None, NodeDirectoryActor, ())
-            .await
-            .expect("spawn failed");
+    let (actor_ref, _handle) = ractor::Actor::spawn(None, NodeDirectoryActor, ())
+        .await
+        .expect("spawn failed");
 
     let peer = NodeId("peer-1".into());
 
@@ -434,8 +452,11 @@ async fn na4_node_directory_actor_reconnect_preserves_address() {
         })
         .expect("send failed");
     let info = rx.await.unwrap().expect("peer should exist");
-    assert_eq!(info.address.as_deref(), Some("10.0.0.1:4697"),
-        "address should be preserved on reconnect without explicit address");
+    assert_eq!(
+        info.address.as_deref(),
+        Some("10.0.0.1:4697"),
+        "address should be preserved on reconnect without explicit address"
+    );
 
     actor_ref.stop(None);
 }

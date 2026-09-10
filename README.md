@@ -157,8 +157,7 @@ features, from your first actor to distributed clusters.
 
 ## Building & Testing
 
-**Prerequisite:** `protoc` compiler — `brew install protobuf` (macOS),
-`apt install protobuf-compiler` (Linux), or `choco install protoc` (Windows).
+Protocol Buffer compilation uses a vendored `protoc`; no system installation is required.
 
 ```bash
 # Run all tests
