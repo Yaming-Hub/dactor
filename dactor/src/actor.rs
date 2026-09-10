@@ -225,8 +225,9 @@ pub trait ReduceHandler<InputItem: Send + 'static, Reply: Send + 'static>: Actor
 ///
 /// Receives items from an input stream and produces items to an output stream.
 /// For each input item, the handler may push zero or more output items via the
-/// [`StreamSender`]. When the input stream ends, [`on_transform_complete`] is
-/// called to allow final items to be emitted.
+/// [`StreamSender`]. When the input stream ends,
+/// [`TransformHandler::on_transform_complete`] is called to allow final items
+/// to be emitted.
 ///
 /// Generic parameters:
 /// - `InputItem` — the type of items the caller streams to the actor.

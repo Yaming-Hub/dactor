@@ -12,7 +12,9 @@
 //! ```
 //!
 //! The router task receives type-erased closures ("ops") through a bounded
-//! mpsc channel (default capacity [`DEFAULT_ROUTER_CAPACITY`]), selects a
+//! mpsc channel (default capacity
+//! [`DEFAULT_ROUTER_CAPACITY`](crate::virtual_pool::DEFAULT_ROUTER_CAPACITY)),
+//! selects a
 //! worker using the configured [`PoolRouting`] strategy, and invokes the
 //! closure with the chosen worker reference.
 //!

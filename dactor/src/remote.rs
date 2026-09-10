@@ -356,7 +356,7 @@ pub trait ClusterDiscovery: Send + Sync + 'static {
     /// Returns a list of [`DiscoveredPeer`]s. The runtime will compare this
     /// against currently connected peers and attempt to connect new ones
     /// via [`verify_peer_identity`](crate::verify_peer_identity) and
-    /// [`connect_peer`] on the adapter runtime.
+    /// `connect_peer` on the adapter runtime.
     async fn discover(&self) -> Result<Vec<DiscoveredPeer>, DiscoveryError>;
 }
 
