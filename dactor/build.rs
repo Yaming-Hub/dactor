@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::path::PathBuf::from(protoc)
     } else {
         protoc_bin_vendored::protoc_bin_path().map_err(|e| {
-            std::io::Error::other(format!(
+            std::io::Error::new(std::io::ErrorKind::Other, format!(
                 "Failed to locate vendored protoc: {e}\nIf needed, set PROTOC to a valid protoc binary path."
             ))
         })?
@@ -24,7 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 "If you did not set PROTOC, this is likely a .proto syntax or import issue."
             };
-            std::io::Error::other(format!("Failed to compile proto/system.proto: {e}\n{hint}"))
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to compile proto/system.proto: {e}\n{hint}"),
+            )
         })?;
     Ok(())
 }
